@@ -33,7 +33,7 @@ jobs:
         run: npm run build
         env:
           VITE_BASE_PATH: /
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://avon-exams-thumbnail-facts.trycloudflare.com' }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://tract-baseline-junior-yearly.trycloudflare.com' }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || 'local-key-to-bypass-auth' }}
 
       - name: Create 404.html for SPA routing
