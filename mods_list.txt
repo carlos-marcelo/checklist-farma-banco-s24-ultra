@@ -1,0 +1,11 @@
+M  App.tsx
+M  components/Layout/Header.tsx
+M  components/Layout/Sidebar.tsx
+ M components/auditoria/AuditModule.tsx
+ M components/preVencidos/PVRegistration.tsx
+ M components/preVencidos/PreVencidosManager.tsx
+M  components/preVencidos/SetupView.tsx
+M  index.html
+ M supabaseService.ts
+?? mods.txt
+?? mods_list.txt
