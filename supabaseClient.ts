@@ -2,23 +2,51 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://placeholder.supabase.co';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'placeholder-key';
+const supabaseHost = (() => {
+  try {
+    return new URL(supabaseUrl).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+})();
 
-// When pointing Supabase JS directly to raw PostgREST on localhost (no /rest/v1 proxy),
-// rewrite REST calls so `from('table')` still works locally.
+const isLikelyLocalPostgrest =
+  supabaseHost === 'localhost' ||
+  supabaseHost === '127.0.0.1' ||
+  supabaseAnonKey === 'local-key-to-bypass-auth';
+
+const useDirectPostgrest =
+  import.meta.env.VITE_SUPABASE_DIRECT_POSTGREST === 'true' || isLikelyLocalPostgrest;
+
+const stripAuthHeaders =
+  import.meta.env.VITE_SUPABASE_STRIP_AUTH_HEADERS === 'true' || isLikelyLocalPostgrest;
+
+// When pointing Supabase JS directly to raw PostgREST (no /rest/v1 proxy),
+// rewrite REST calls so `from('table')` still works.
 const localPostgrestCompatFetch: typeof fetch = (input, init) => {
   const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
   let rewrittenUrl = rawUrl;
-  const isLocalPostgrest = rawUrl.startsWith('http://localhost:3000/');
 
-  if (rawUrl.startsWith('http://localhost:3000/rest/v1/')) {
-    rewrittenUrl = rawUrl.replace('http://localhost:3000/rest/v1/', 'http://localhost:3000/');
-  } else if (rawUrl === 'http://localhost:3000/rest/v1') {
-    rewrittenUrl = 'http://localhost:3000';
+  if (useDirectPostgrest) {
+    try {
+      const parsed = new URL(rawUrl);
+      const restPrefix = '/rest/v1';
+
+      if (parsed.pathname === restPrefix) {
+        parsed.pathname = '/';
+      } else if (parsed.pathname.startsWith(`${restPrefix}/`)) {
+        parsed.pathname = parsed.pathname.replace(`${restPrefix}/`, '/');
+      }
+
+      rewrittenUrl = parsed.toString();
+    } catch {
+      rewrittenUrl = rawUrl;
+    }
   }
 
   const headers = new Headers(init?.headers);
-  if (isLocalPostgrest) {
-    // Local PostgREST in this setup is used without JWT validation.
+  if (stripAuthHeaders) {
+    // Local/raw PostgREST setups can run without JWT validation.
     headers.delete('authorization');
     headers.delete('apikey');
   }
