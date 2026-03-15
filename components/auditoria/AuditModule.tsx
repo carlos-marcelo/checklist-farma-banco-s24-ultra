@@ -255,7 +255,7 @@ const parseHierarchyCell = (value: unknown, fallbackName: string) => {
 
     const numericId = parseSheetNumericCode(raw);
     const name = raw
-        .replace(/^\s*\d[\d.,]*\s*[-:/.]*\s*/, '')
+        .replace(/^\s*\d[\d.,]*\s*(?:-|:|\/|\.)*\s*/, '')
         .replace(/\s+/g, ' ')
         .trim();
 
@@ -1415,29 +1415,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const loadGlobalAuditBases = async () => {
             setIsLoadingGlobalBases(true);
             try {
-                const keysToFetch = [
+                const staticKeys = [
                     ...GROUP_UPLOAD_IDS.map(groupId => GROUP_GLOBAL_BASE_KEYS[groupId]),
                     AUDIT_DEPT_IDS_GLOBAL_KEY,
-                    AUDIT_CAT_IDS_GLOBAL_KEY,
-                    ...(selectedFilial ? [buildSharedStockModuleKey(selectedFilial)] : [])
+                    AUDIT_CAT_IDS_GLOBAL_KEY
                 ];
-                const stockModuleKey = selectedFilial ? buildSharedStockModuleKey(selectedFilial) : '';
-                const files = [];
-                for (const key of keysToFetch) {
-                    if (cancelled) break;
-                    const file = await CadastrosBaseService.getGlobalBaseFileCached(
-                        companyId,
-                        key,
-                        key === stockModuleKey ? { forceFresh: true } : undefined
-                    );
-                    files.push(file);
-                }
+
+                // Carrega em paralelo para reduzir o tempo de espera do setup.
+                const staticFiles = await Promise.all(
+                    staticKeys.map(key => CadastrosBaseService.getGlobalBaseFileCached(companyId, key))
+                );
                 if (cancelled) return;
 
-                const byKey = new Map();
-                files.forEach(file => {
-                    if (file) byKey.set(file.module_key, file);
+                const stockModuleKey = selectedFilial ? buildSharedStockModuleKey(selectedFilial) : '';
+                const stockMeta = stockModuleKey
+                    ? await CadastrosBaseService.getGlobalBaseFileCached(companyId, stockModuleKey, { forceFresh: true })
+                    : null;
+                if (cancelled) return;
+
+                const byKey = new Map<string, DbGlobalBaseFile>();
+                staticFiles.forEach(file => {
+                    if (file) byKey.set(file.module_key, file as DbGlobalBaseFile);
                 });
+                if (stockMeta) {
+                    byKey.set(stockMeta.module_key, stockMeta as DbGlobalBaseFile);
+                }
+
                 const nextGroupFiles = createInitialGroupFiles();
                 const nextGroupMeta = createInitialGroupMeta();
 
@@ -1452,7 +1455,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
                 const deptMeta = byKey.get(AUDIT_DEPT_IDS_GLOBAL_KEY) || null;
                 const catMeta = byKey.get(AUDIT_CAT_IDS_GLOBAL_KEY) || null;
-                const stockMeta = selectedFilial ? (byKey.get(buildSharedStockModuleKey(selectedFilial)) || null) : null;
 
                 setGlobalGroupFiles(nextGroupFiles);
                 setGlobalGroupMeta(nextGroupMeta);
@@ -1460,8 +1462,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 setGlobalCatIdsMeta(catMeta);
                 setGlobalDeptIdsFile(deptMeta ? decodeGlobalFileToBrowserFile(deptMeta) : null);
                 setGlobalCatIdsFile(catMeta ? decodeGlobalFileToBrowserFile(catMeta) : null);
-                setGlobalStockMeta(stockMeta);
-                setGlobalStockFile(stockMeta ? decodeGlobalFileToBrowserFile(stockMeta) : null);
+                setGlobalStockMeta(stockMeta as DbGlobalBaseFile | null);
+                setGlobalStockFile(stockMeta ? decodeGlobalFileToBrowserFile(stockMeta as DbGlobalBaseFile) : null);
             } catch (error) {
                 console.error('Erro ao carregar bases globais da auditoria:', error);
                 if (!cancelled) {
@@ -2764,7 +2766,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     const deptIdNow = parseSheetNumericCode(row[5]); // F
                     if (deptIdNow !== null) lastDeptId = String(deptIdNow);
                     const deptNameNowRaw = String(row[7] ?? '').trim(); // H
-                    if (deptNameNowRaw) lastDeptName = deptNameNowRaw.replace(/^\s*[-:/.]+\s*/, '').trim();
+                    if (deptNameNowRaw) lastDeptName = deptNameNowRaw.replace(/^\s*(?:-|:|\/|\.)+\s*/, '').trim();
                     const reduced = normalizeBarcode(row[2]); // C
                     if (!reduced) return;
                     deptReportByReduced[reduced] = {
@@ -2784,7 +2786,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     const catIdNow = parseSheetNumericCode(row[5]); // F
                     if (catIdNow !== null) lastCatId = String(catIdNow);
                     const catNameNowRaw = String(row[7] ?? '').trim(); // H
-                    if (catNameNowRaw) lastCatName = catNameNowRaw.replace(/^\s*[-:/.]+\s*/, '').trim();
+                    if (catNameNowRaw) lastCatName = catNameNowRaw.replace(/^\s*(?:-|:|\/|\.)+\s*/, '').trim();
                     const reduced = normalizeBarcode(row[2]); // C
                     if (!reduced) return;
                     const deptName = String(row[19] ?? '').trim(); // T

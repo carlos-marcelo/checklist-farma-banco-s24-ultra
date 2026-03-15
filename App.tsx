@@ -4675,24 +4675,24 @@ const App: React.FC = () => {
         setDashboardAuditsError(null);
         try {
             const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates)).filter(Boolean);
-            let query = supabase
+            let metadataQuery = supabase
                 .from('audit_sessions')
-                .select('id, branch, audit_number, status, progress, data, user_email, created_at, updated_at')
+                .select('id, branch, audit_number, status, progress, user_email, created_at, updated_at')
                 .eq('status', 'open')
                 .order('updated_at', { ascending: false })
                 .limit(300);
 
             if (queryBranches.length > 0) {
-                query = query.in('branch', queryBranches);
+                metadataQuery = metadataQuery.in('branch', queryBranches);
             }
 
-            const { data, error } = await query;
-            if (error) throw error;
+            const { data: metadataRowsRaw, error: metadataError } = await metadataQuery;
+            if (metadataError) throw metadataError;
 
-            const rows = (data || []) as SupabaseService.DbAuditSession[];
-            const scopedRows = currentUser.role === 'MASTER'
-                ? rows
-                : rows.filter(session => {
+            const metadataRows = (metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>;
+            const scopedMetadata = currentUser.role === 'MASTER'
+                ? metadataRows
+                : metadataRows.filter(session => {
                     const currentBranch = String(currentUser.filial || '').trim();
                     if (!currentBranch) return false;
                     const sessionRaw = String(session.branch || '').trim();
@@ -4700,7 +4700,60 @@ const App: React.FC = () => {
                     return normalizeBranchLabel(sessionRaw) === normalizeBranchLabel(currentBranch);
                 });
 
-            setDashboardAuditSessions(scopedRows);
+            // Reduz carga: manter só a sessão aberta mais recente por filial antes de buscar o JSON pesado.
+            const latestByBranch = new Map<string, typeof scopedMetadata[number]>();
+            scopedMetadata.forEach((session) => {
+                const branchLabel = normalizeBranchLabel(session.branch);
+                const prev = latestByBranch.get(branchLabel);
+                if (!prev) {
+                    latestByBranch.set(branchLabel, session);
+                    return;
+                }
+                const prevAudit = Number(prev.audit_number || 0);
+                const curAudit = Number(session.audit_number || 0);
+                if (curAudit > prevAudit) {
+                    latestByBranch.set(branchLabel, session);
+                    return;
+                }
+                if (curAudit < prevAudit) return;
+                const prevTs = Date.parse(String(prev.updated_at || prev.created_at || '')) || 0;
+                const curTs = Date.parse(String(session.updated_at || session.created_at || '')) || 0;
+                if (curTs > prevTs) {
+                    latestByBranch.set(branchLabel, session);
+                }
+            });
+
+            const latestMetadata = Array.from(latestByBranch.values()).filter(s => !!s.id);
+            const detailIds = latestMetadata.map(s => String(s.id));
+
+            if (detailIds.length === 0) {
+                setDashboardAuditSessions([]);
+                setDashboardAuditsFetchedAt(new Date().toISOString());
+                return;
+            }
+
+            const chunkSize = 30;
+            const detailBatches: string[][] = [];
+            for (let i = 0; i < detailIds.length; i += chunkSize) {
+                detailBatches.push(detailIds.slice(i, i + chunkSize));
+            }
+
+            const detailResults = await Promise.all(detailBatches.map(async (batch) => {
+                const { data: detailRows, error: detailError } = await supabase
+                    .from('audit_sessions')
+                    .select('id, branch, audit_number, status, progress, data, user_email, created_at, updated_at')
+                    .in('id', batch);
+                if (detailError) throw detailError;
+                return (detailRows || []) as SupabaseService.DbAuditSession[];
+            }));
+
+            const detailedRows = detailResults.flat();
+            const detailsById = new Map(detailedRows.map(row => [String(row.id), row]));
+            const resolvedRows = latestMetadata
+                .map((meta) => detailsById.get(String(meta.id)))
+                .filter((row): row is SupabaseService.DbAuditSession => Boolean(row));
+
+            setDashboardAuditSessions(resolvedRows);
             setDashboardAuditsFetchedAt(new Date().toISOString());
         } catch (error) {
             console.error('Erro ao carregar sessões abertas de auditoria para o dashboard:', error);
