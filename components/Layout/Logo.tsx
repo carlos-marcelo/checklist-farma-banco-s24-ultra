@@ -3,7 +3,7 @@ import { AppConfig } from '../../types';
 
 // Custom MF Shield Logo
 export const MFLogo = ({ className = "w-12 h-12" }: { className?: string }) => (
-    <img src="/logos/mf-shield.svg" alt="MF Shield" className={className} loading="lazy" />
+    <img src={`${import.meta.env.BASE_URL}logos/mf-shield.svg`} alt="MF Shield" className={className} loading="lazy" />
 );
 
 // Logo Component (Dynamic Dual Display)
