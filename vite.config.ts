@@ -4,9 +4,10 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, '.', '');
+    const basePath = env.VITE_BASE_PATH || '/';
     return {
-      // Base para domínio próprio marcelo.far.br
-      base: '/',
+      // Use project subpath on GitHub Pages (or "/" for custom domains/local).
+      base: basePath,
       server: {
         port: 3000,
         host: '0.0.0.0',
