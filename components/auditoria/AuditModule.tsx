@@ -3061,7 +3061,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 user_email: userEmail
             }, { allowProgressRegression: !!shouldReclassifyOpen });
             if (!savedSession) {
-                throw new Error("Falha ao salvar auditoria inicial no Supabase.");
+                throw new Error("Falha ao salvar auditoria inicial no Banco de Dados.");
             }
 
             setDbSessionId(savedSession.id);
