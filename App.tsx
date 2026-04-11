@@ -2939,6 +2939,40 @@ const App: React.FC = () => {
         }
     };
 
+     const handleDeleteUser = async (email: string) => {
+         const confirmed = window.confirm("Tem certeza que deseja excluir permanentemente este usuário? Esta ação não pode ser desfeita.");
+         if (!confirmed) return;
+ 
+         try {
+             const success = await SupabaseService.deleteUser(email);
+             if (success) {
+                 setUsers(prev => prev.filter(u => u.email !== email));
+                 if (currentUser?.email) {
+                     SupabaseService.insertAppEventLog({
+                         company_id: currentUser.company_id || null,
+                         branch: currentUser.filial || null,
+                         area: currentUser.area || null,
+                         user_email: currentUser.email,
+                         user_name: currentUser.name,
+                         app: 'configuracoes',
+                         event_type: 'user_deleted',
+                         entity_type: 'user',
+                         entity_id: email,
+                         status: 'success',
+                         success: true,
+                         source: 'web',
+                         event_meta: { target_user: email }
+                     }).catch(() => { });
+                 }
+             } else {
+                 alert("Erro ao excluir usuário no banco de dados.");
+             }
+         } catch (error) {
+             console.error("Erro ao excluir usuário:", error);
+             alert("Ocorreu um erro ao tentar excluir o usuário.");
+         }
+     };
+
     const handleUpdateUserProfile = async (field: keyof User, value: string | null) => {
         if (!currentUser) return;
 
@@ -6866,16 +6900,19 @@ const App: React.FC = () => {
                                     </div>
 
                                     <div className="overflow-x-auto overflow-y-hidden rounded-[24px] border border-gray-100 shadow-sm bg-white">
-                                        <table className="w-full min-w-[1220px] text-left text-sm">
+                                        <table className="w-full min-w-[1250px] text-left text-sm">
                                             <thead className="bg-gray-50/80 border-b border-gray-100">
                                                 <tr>
                                                     <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[220px]">Nome</th>
                                                     <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[260px]">Contato</th>
                                                     <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[120px]">Filial</th>
                                                     <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[120px]">Área</th>
-                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[120px]">Função</th>
+                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[140px]">Função</th>
                                                     <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[120px]">Status</th>
                                                     <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap text-right min-w-[130px]">Ações</th>
+                                                    {currentUser?.role === 'MASTER' && (
+                                                        <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap text-center min-w-[100px]">Excluir</th>
+                                                    )}
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-gray-50">
@@ -6901,12 +6938,14 @@ const App: React.FC = () => {
                                                             </span>
                                                         </td>
                                                         <td className="px-6 py-4 whitespace-nowrap">
-                                                            <span className={`inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold border ${u.role === 'MASTER' ? 'bg-purple-50 text-purple-700 border-purple-100' :
-                                                                u.role === 'ADMINISTRATIVO' ? 'bg-blue-50 text-blue-700 border-blue-100' :
-                                                                    'bg-gray-100 text-gray-600 border-gray-200'
-                                                                } whitespace-nowrap`}>
-                                                                {u.role === 'MASTER' ? 'Master' : u.role === 'ADMINISTRATIVO' ? 'Admin' : 'Usuário'}
-                                                            </span>
+                                                            <div className="flex items-center gap-2">
+                                                                <span className={`inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold border ${u.role === 'MASTER' ? 'bg-purple-50 text-purple-700 border-purple-100' :
+                                                                    u.role === 'ADMINISTRATIVO' ? 'bg-blue-50 text-blue-700 border-blue-100' :
+                                                                        'bg-gray-100 text-gray-600 border-gray-200'
+                                                                    } whitespace-nowrap`}>
+                                                                    {u.role === 'MASTER' ? 'Master' : u.role === 'ADMINISTRATIVO' ? 'Admin' : 'Usuário'}
+                                                                </span>
+                                                            </div>
                                                         </td>
                                                         <td className="px-6 py-4 whitespace-nowrap">
                                                             {u.rejected ? (
@@ -6963,6 +7002,19 @@ const App: React.FC = () => {
                                                                 </div>
                                                             )}
                                                         </td>
+                                                        {currentUser?.role === 'MASTER' && (
+                                                            <td className="px-6 py-4 text-center">
+                                                                {u.role !== 'MASTER' && (
+                                                                    <button
+                                                                        onClick={() => handleDeleteUser(u.email)}
+                                                                        className="p-2 hover:bg-red-50 text-gray-300 hover:text-red-600 rounded-lg transition-colors"
+                                                                        title="Excluir Usuário"
+                                                                    >
+                                                                        <Trash2 size={16} />
+                                                                    </button>
+                                                                )}
+                                                            </td>
+                                                        )}
                                                     </tr>
                                                 ))}
                                                 {filteredUsers.length === 0 && (
