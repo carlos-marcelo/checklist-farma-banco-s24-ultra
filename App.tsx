@@ -6900,44 +6900,44 @@ const App: React.FC = () => {
                                     </div>
 
                                     <div className="overflow-x-auto overflow-y-hidden rounded-[24px] border border-gray-100 shadow-sm bg-white">
-                                        <table className="w-full min-w-[1250px] text-left text-sm">
+                                        <table className="w-full text-left text-sm">
                                             <thead className="bg-gray-50/80 border-b border-gray-100">
                                                 <tr>
-                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[220px]">Nome</th>
-                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[260px]">Contato</th>
-                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[120px]">Filial</th>
-                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[120px]">Área</th>
-                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[140px]">Função</th>
-                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[120px]">Status</th>
-                                                    <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap text-right min-w-[130px]">Ações</th>
+                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] min-w-[120px]">Nome</th>
+                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] min-w-[150px]">Contato</th>
+                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[90px]">Filial</th>
+                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[90px]">Área</th>
+                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[110px]">Função</th>
+                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[100px]">Status</th>
+                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap text-right min-w-[110px]">Ações</th>
                                                     {currentUser?.role === 'MASTER' && (
-                                                        <th className="px-6 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap text-center min-w-[100px]">Excluir</th>
+                                                        <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap text-center min-w-[60px]">Excluir</th>
                                                     )}
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-gray-50">
                                                 {filteredUsers.map((u, idx) => (
                                                     <tr key={idx} className="group hover:bg-blue-50/30 transition-colors duration-200">
-                                                        <td className="px-6 py-4 whitespace-nowrap">
-                                                            <div className="font-bold text-gray-900 whitespace-nowrap">{u.name}</div>
+                                                        <td className="px-4 py-4">
+                                                            <div className="font-bold text-gray-900 break-words">{u.name}</div>
                                                         </td>
-                                                        <td className="px-6 py-4 min-w-[260px]">
+                                                        <td className="px-4 py-4 min-w-[200px]">
                                                             <div className="flex flex-col">
-                                                                <span className="text-gray-600 font-medium whitespace-nowrap overflow-hidden text-ellipsis" title={u.email}>{u.email}</span>
-                                                                <span className="text-gray-400 text-xs mt-0.5 whitespace-nowrap overflow-hidden text-ellipsis" title={u.phone || '-'}>{u.phone || '-'}</span>
+                                                                <span className="text-gray-600 font-medium break-all text-xs" title={u.email}>{u.email}</span>
+                                                                <span className="text-gray-400 text-xs mt-0.5 break-all text-xs" title={u.phone || '-'}>{u.phone || '-'}</span>
                                                             </div>
                                                         </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap">
+                                                        <td className="px-4 py-4">
                                                             <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold border bg-blue-50/60 text-blue-700 border-blue-100 whitespace-nowrap">
                                                                 {u.filial || '-'}
                                                             </span>
                                                         </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap">
+                                                        <td className="px-4 py-4 whitespace-nowrap">
                                                             <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold border bg-indigo-50/60 text-indigo-700 border-indigo-100 whitespace-nowrap">
                                                                 {u.area || '-'}
                                                             </span>
                                                         </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap">
+                                                        <td className="px-4 py-4 whitespace-nowrap">
                                                             <div className="flex items-center gap-2">
                                                                 <span className={`inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold border ${u.role === 'MASTER' ? 'bg-purple-50 text-purple-700 border-purple-100' :
                                                                     u.role === 'ADMINISTRATIVO' ? 'bg-blue-50 text-blue-700 border-blue-100' :
@@ -6947,7 +6947,7 @@ const App: React.FC = () => {
                                                                 </span>
                                                             </div>
                                                         </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap">
+                                                        <td className="px-4 py-4 whitespace-nowrap">
                                                             {u.rejected ? (
                                                                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-red-100/50 text-red-700 border border-red-100 whitespace-nowrap">
                                                                     <div className="w-1.5 h-1.5 rounded-full bg-red-500"></div> Bloqueado
@@ -6962,7 +6962,7 @@ const App: React.FC = () => {
                                                                 </span>
                                                             )}
                                                         </td>
-                                                        <td className="px-6 py-4 text-right">
+                                                        <td className="px-4 py-4 text-right">
                                                             {u.role !== 'MASTER' && (
                                                                 <div className="flex items-center justify-end gap-2 opacity-60 group-hover:opacity-100 transition-opacity">
                                                                     {u.rejected ? (
@@ -7003,14 +7003,14 @@ const App: React.FC = () => {
                                                             )}
                                                         </td>
                                                         {currentUser?.role === 'MASTER' && (
-                                                            <td className="px-6 py-4 text-center">
+                                                            <td className="px-4 py-4 text-center">
                                                                 {u.role !== 'MASTER' && (
                                                                     <button
                                                                         onClick={() => handleDeleteUser(u.email)}
-                                                                        className="p-2 hover:bg-red-50 text-gray-300 hover:text-red-600 rounded-lg transition-colors"
+                                                                        className="p-2 bg-red-50 text-red-600 hover:bg-red-600 hover:text-white rounded-xl transition-all duration-300 border border-red-100 shadow-sm hover:shadow-red-200/50 active:scale-90 inline-flex items-center justify-center"
                                                                         title="Excluir Usuário"
                                                                     >
-                                                                        <Trash2 size={16} />
+                                                                        <Trash2 size={16} strokeWidth={2.5} />
                                                                     </button>
                                                                 )}
                                                             </td>
