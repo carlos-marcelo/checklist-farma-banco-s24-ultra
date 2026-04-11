@@ -11,6 +11,14 @@ export default defineConfig(({ mode }) => {
       server: {
         port: 3000,
         host: '0.0.0.0',
+        proxy: {
+          '/api': {
+            target: env.VITE_SUPABASE_URL_PROXY || 'https://checklist-api.marcelo.far.br',
+            changeOrigin: true,
+            rewrite: (path) => path.replace(/^\/api\/rest\/v1/, '').replace(/^\/api/, ''),
+            secure: false
+          }
+        }
       },
       plugins: [react()],
       define: {
