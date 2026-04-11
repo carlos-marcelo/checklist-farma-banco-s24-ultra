@@ -1,9 +1,13 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://placeholder.supabase.co';
+const rawSupabaseUrl = import.meta.env.VITE_SUPABASE_URL || '/api';
+const supabaseUrl = rawSupabaseUrl.startsWith('/') 
+  ? `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'}${rawSupabaseUrl}`
+  : rawSupabaseUrl;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'placeholder-key';
 const supabaseHost = (() => {
   try {
+    if (supabaseUrl.startsWith('/')) return 'localhost'; // Assume local if relative
     return new URL(supabaseUrl).hostname.toLowerCase();
   } catch {
     return '';
@@ -13,6 +17,7 @@ const supabaseHost = (() => {
 const isLikelyLocalPostgrest =
   supabaseHost === 'localhost' ||
   supabaseHost === '127.0.0.1' ||
+  supabaseUrl.startsWith('/') ||
   supabaseAnonKey === 'local-key-to-bypass-auth';
 
 const useDirectPostgrest =
