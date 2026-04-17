@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense } from 'react';
 import { createPortal } from 'react-dom';
-import { Camera, FileText, CheckSquare, Printer, Clipboard, ClipboardList, Image as ImageIcon, Trash2, Menu, X, ChevronRight, Download, Star, AlertTriangle, CheckCircle, AlertCircle, LayoutDashboard, FileCheck, Settings, LogOut, Users, Palette, Upload, UserPlus, History, RotateCcw, Save, Search, Eye, EyeOff, Phone, User as UserIcon, Ban, Check, Filter, UserX, Undo2, CheckSquare as CheckSquareIcon, Trophy, Frown, PartyPopper, Lock, Loader2, Building2, MapPin, Store, MessageSquare, Send, ThumbsUp, ThumbsDown, Clock, CheckCheck, Lightbulb, MessageSquareQuote, Package, ArrowRight, ArrowLeft, ShieldCheck, HelpCircle, Info, LayoutGrid, UserCircle, FileSearch, ChevronDown, Calendar, RefreshCw, UserCircle2, Plus, SearchX, WifiOff } from 'lucide-react';
+import { Camera, FileText, CheckSquare, Printer, Clipboard, ClipboardList, Image as ImageIcon, Trash2, Menu, X, ChevronRight, Download, Star, AlertTriangle, CheckCircle, AlertCircle, LayoutDashboard, FileCheck, Settings, LogOut, Users, Palette, Upload, UserPlus, History, RotateCcw, Save, Search, Eye, EyeOff, Phone, User as UserIcon, Ban, Check, Filter, UserX, Undo2, CheckSquare as CheckSquareIcon, Trophy, Frown, PartyPopper, Lock, Loader2, Building2, MapPin, Store, MessageSquare, Send, ThumbsUp, ThumbsDown, Clock, CheckCheck, Lightbulb, MessageSquareQuote, Package, ArrowRight, ArrowLeft, ShieldCheck, HelpCircle, Info, LayoutGrid, UserCircle, FileSearch, ChevronDown, Calendar, RefreshCw, UserCircle2, Plus, SearchX, WifiOff, LineChart } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { CHECKLISTS as BASE_CHECKLISTS, THEMES, ACCESS_MODULES, ACCESS_LEVELS, INPUT_TYPE_LABELS, generateId } from './constants';
@@ -9317,6 +9317,35 @@ const App: React.FC = () => {
                                         </div>
                                     </div>
                                 </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* --- ANÁLISE DE RESULTADOS VIEW (MASTER ONLY) --- */}
+                    {currentView === 'analise_resultados' && currentUser?.role === 'MASTER' && (
+                        <div className="max-w-6xl mx-auto space-y-8 animate-fade-in pb-24">
+                            <div className="bg-white/80 backdrop-blur-xl border border-white/50 rounded-[32px] shadow-card p-10">
+                                <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+                                    <div>
+                                        <h2 className="text-3xl font-black text-gray-900 tracking-tight leading-tight">Dashboard de Resultados</h2>
+                                        <p className="text-gray-500 font-bold text-base mt-2">
+                                            Módulo em Construção. Aqui você montará os painéis visuais conectando as Vendas Totais e Pedidos carregados.
+                                        </p>
+                                    </div>
+                                    <div className="bg-emerald-50 text-emerald-600 px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-widest flex items-center gap-2">
+                                        <LineChart size={14} />
+                                        <span>BI Analítico</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            {/* Empty state while we don't build the charts */}
+                            <div className="bg-white border rounded-[28px] border-dashed border-gray-300 flex flex-col items-center justify-center p-16 opacity-60">
+                                <LineChart size={48} className="text-gray-300 mb-4" />
+                                <h3 className="text-xl font-bold text-gray-500">Aguardando Gráficos</h3>
+                                <p className="text-sm text-gray-400 mt-2 text-center max-w-sm">
+                                    Na próxima etapa, desenharemos a inteligência que lerá os dados de Cadastros Base.
+                                </p>
                             </div>
                         </div>
                     )}

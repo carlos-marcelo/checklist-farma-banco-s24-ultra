@@ -46,6 +46,7 @@ export const Header: React.FC<HeaderProps> = ({
         if (currentView === 'logs') return 'Métricas Gerenciais';
         if (currentView === 'cadastros_globais') return 'Cadastros Base Globais';
         if (currentView === 'support') return 'Suporte e Melhorias';
+        if (currentView === 'analise_resultados') return 'Análise de Resultados';
         return activeChecklist.title;
     };
 

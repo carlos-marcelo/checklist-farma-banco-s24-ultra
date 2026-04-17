@@ -16,7 +16,8 @@ import {
     MapPin,
     Store,
     Search,
-    FolderArchive
+    FolderArchive,
+    LineChart
 } from 'lucide-react';
 import { User, ChecklistDefinition, AppConfig } from '../../types';
 import { Logo } from './Logo';
@@ -54,6 +55,7 @@ export const Topbar: React.FC<TopbarProps> = ({
     const isMaster = currentUser.role === 'MASTER';
     const navItems = [
         { label: 'Dashboard', view: 'dashboard', color: 'blue', icon: <LayoutDashboard size={18} />, shortcut: 'Ctrl + D' },
+        ...(isMaster ? [{ label: 'Análise de Resultados', view: 'analise_resultados', color: 'blue', icon: <LineChart size={18} /> }] : []),
         { label: 'Checklists', view: 'checklist', color: 'emerald', icon: <ClipboardList size={18} />, shortcut: 'Ctrl + L' },
         { label: 'Visão Geral', view: 'summary', color: 'indigo', icon: <LayoutGrid size={18} /> },
         { label: 'Conferência', view: 'stock', color: 'cyan', icon: <Search size={18} />, shortcut: 'Ctrl + C' },
