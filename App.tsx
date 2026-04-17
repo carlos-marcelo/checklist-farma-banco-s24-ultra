@@ -225,6 +225,11 @@ const GLOBAL_BASE_MODULE_SLOTS: GlobalBaseModuleSlot[] = [
     { key: 'audit_ids_categoria', label: 'Auditoria IDs Categoria', description: 'Relacionamento de categorias para auditoria.' }
 ];
 
+const RESULT_ANALYSIS_SLOTS: GlobalBaseModuleSlot[] = [
+    { key: 'analysis_vendas_totais', label: 'Vendas totais produtos por filial', description: 'Arquivo base de vendas totais para análise.' },
+    { key: 'analysis_pedidos', label: 'Pedidos', description: 'Arquivo base de pedidos para análise.' }
+];
+
 const PreVencidosManager = PRE_VENCIDOS_MODULE_ENABLED
     ? React.lazy(() => import('./components/preVencidos/PreVencidosManager'))
     : null;
@@ -8002,6 +8007,67 @@ const App: React.FC = () => {
 
                             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                                 {GLOBAL_BASE_MODULE_SLOTS.map(slot => {
+                                    const uploadedFile = globalBaseFilesByKey.get(slot.key);
+                                    const isUploading = uploadingGlobalBaseKey === slot.key;
+                                    const inputId = `global-base-upload-${slot.key}`;
+                                    return (
+                                        <div key={slot.key} className="bg-white rounded-3xl border border-gray-100 shadow-sm p-5 space-y-4">
+                                            <div className="space-y-1">
+                                                <h3 className="text-sm font-black text-gray-900 tracking-tight">{slot.label}</h3>
+                                                <p className="text-xs text-gray-500 font-medium leading-relaxed">{slot.description}</p>
+                                            </div>
+
+                                            <div className={`rounded-2xl border px-4 py-3 ${uploadedFile ? 'border-emerald-200 bg-emerald-50/40' : 'border-amber-200 bg-amber-50/50'}`}>
+                                                <div className="flex items-center justify-between gap-2">
+                                                    <span className={`text-[10px] font-black uppercase tracking-widest ${uploadedFile ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                                        {uploadedFile ? 'Arquivo carregado' : 'Aguardando upload'}
+                                                    </span>
+                                                    {uploadedFile ? <CheckCircle size={14} className="text-emerald-600" /> : <AlertCircle size={14} className="text-amber-600" />}
+                                                </div>
+                                                <p className="mt-2 text-xs font-bold text-gray-700 truncate" title={uploadedFile?.file_name || 'Sem arquivo'}>
+                                                    {uploadedFile?.file_name || 'Sem arquivo'}
+                                                </p>
+                                                <p className="mt-1 text-[11px] text-gray-500 font-semibold">
+                                                    {uploadedFile ? `${formatFileSize(uploadedFile.file_size)} • ${formatFullDateTime(uploadedFile.uploaded_at)}` : 'Nenhum envio registrado'}
+                                                </p>
+                                                <p className="mt-1 text-[11px] text-gray-400 font-semibold truncate">
+                                                    {uploadedFile?.uploaded_by ? `Responsável: ${uploadedFile.uploaded_by}` : 'Responsável: —'}
+                                                </p>
+                                            </div>
+
+                                            <input
+                                                id={inputId}
+                                                type="file"
+                                                accept=".xls,.xlsx,.csv,.xml,.txt"
+                                                className="hidden"
+                                                onChange={(e) => {
+                                                    const selectedFile = e.target.files?.[0];
+                                                    if (!selectedFile) return;
+                                                    handleUploadGlobalBaseFile(slot.key, selectedFile);
+                                                    e.currentTarget.value = '';
+                                                }}
+                                            />
+                                            <button
+                                                type="button"
+                                                onClick={() => document.getElementById(inputId)?.click()}
+                                                disabled={isUploading}
+                                                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-900 text-white text-xs font-black uppercase tracking-wider hover:bg-slate-800 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                                            >
+                                                {isUploading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
+                                                {isUploading ? 'Enviando...' : 'Carregar arquivo'}
+                                            </button>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+
+                            {/* --- ANÁLISE DE RESULTADOS --- */}
+                            <div className="pt-6">
+                                <h2 className="text-xl font-black text-gray-900 tracking-tight mb-2">Análise de Resultados</h2>
+                                <p className="text-xs font-black text-gray-500 uppercase tracking-widest mb-4">Arquivos com dados de Vendas Totais e Pedidos.</p>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                                {RESULT_ANALYSIS_SLOTS.map(slot => {
                                     const uploadedFile = globalBaseFilesByKey.get(slot.key);
                                     const isUploading = uploadingGlobalBaseKey === slot.key;
                                     const inputId = `global-base-upload-${slot.key}`;
