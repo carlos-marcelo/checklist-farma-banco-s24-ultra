@@ -234,6 +234,8 @@ const PreVencidosManager = PRE_VENCIDOS_MODULE_ENABLED
     ? React.lazy(() => import('./components/preVencidos/PreVencidosManager'))
     : null;
 
+const AnaliseDashboard = React.lazy(() => import('./components/AnaliseResultados/AnaliseDashboard'));
+
 const canonicalizeFilterLabel = (value: string) => {
     const normalized = value.normalize('NFKC').replace(/\s+/g, ' ').trim();
     return normalized.replace(/\d+/g, digits => {
@@ -9339,14 +9341,9 @@ const App: React.FC = () => {
                                 </div>
                             </div>
                             
-                            {/* Empty state while we don't build the charts */}
-                            <div className="bg-white border rounded-[28px] border-dashed border-gray-300 flex flex-col items-center justify-center p-16 opacity-60">
-                                <LineChart size={48} className="text-gray-300 mb-4" />
-                                <h3 className="text-xl font-bold text-gray-500">Aguardando Gráficos</h3>
-                                <p className="text-sm text-gray-400 mt-2 text-center max-w-sm">
-                                    Na próxima etapa, desenharemos a inteligência que lerá os dados de Cadastros Base.
-                                </p>
-                            </div>
+                            <Suspense fallback={<div className="flex justify-center p-12"><Loader2 className="animate-spin text-blue-500" size={32} /></div>}>
+                                <AnaliseDashboard currentUser={currentUser!} companies={companies} />
+                            </Suspense>
                         </div>
                     )}
 
