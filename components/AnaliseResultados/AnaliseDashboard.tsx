@@ -600,55 +600,54 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
 
             {/* KPIs */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
-                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><DollarSign size={40} className="text-blue-200" /></div>
-                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Fat. Líquido ({selectedArea==='ALL' && selectedBranch==='ALL' ? 'Rede' : 'Filtro'})</p>
+                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-blue-100 hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-default">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-125 group-hover:bg-blue-100 transition-all duration-500"><DollarSign size={40} className="text-blue-300 group-hover:text-blue-500 transition-colors" /></div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1 group-hover:text-blue-500 transition-colors">Fat. Líquido ({selectedArea==='ALL' && selectedBranch==='ALL' ? 'Rede' : 'Filtro'})</p>
                     <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-gray-900 whitespace-nowrap tracking-tighter" title={formatBRL(filteredData.faturamentoLiq)}>{formatBRL(filteredData.faturamentoLiq)}</h3>
-                    <div className="flex items-center gap-3 mt-2">
-                        <p className="text-xs text-emerald-500 font-bold flex items-center gap-1"><TrendingUp size={12}/> Vol: {formatNumber(filteredData.volumeTotal)}</p>
-                        <p className="text-xs text-rose-400 font-bold flex items-center gap-1">Dev: {formatNumber(filteredData.totalDevol)}</p>
+                    <div className="flex items-center gap-3 mt-2 relative z-10">
+                        <p className="text-xs text-emerald-500 font-bold flex items-center gap-1 bg-emerald-50 px-2 py-0.5 rounded-md"><TrendingUp size={12}/> Vol: {formatNumber(filteredData.volumeTotal)}</p>
+                        <p className="text-xs text-rose-500 font-bold flex items-center gap-1 bg-rose-50 px-2 py-0.5 rounded-md">Dev: {formatNumber(filteredData.totalDevol)}</p>
                     </div>
                 </div>
 
-                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><Target size={40} className="text-indigo-200" /></div>
-                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Ticket Médio (Global)</p>
+                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-indigo-100 hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-default">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-125 group-hover:bg-indigo-100 transition-all duration-500"><Target size={40} className="text-indigo-300 group-hover:text-indigo-500 transition-colors" /></div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1 group-hover:text-indigo-500 transition-colors">Ticket Médio (Global)</p>
                     <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-gray-900 whitespace-nowrap tracking-tighter">{formatBRL(filteredData.ticketMedioGeral)}</h3>
-                    <p className="text-xs text-gray-400 font-bold mt-2">Média c/ devoluções embutidas</p>
+                    <p className="text-xs text-indigo-500 font-bold mt-2 bg-indigo-50 px-2 py-0.5 rounded-md inline-block relative z-10">Média c/ devoluções embutidas</p>
                 </div>
 
-                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-pink-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><Sparkles size={40} className="text-pink-200" /></div>
-                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Categoria HB</p>
+                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-pink-100 hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-default">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-pink-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-125 group-hover:bg-pink-100 transition-all duration-500"><Sparkles size={40} className="text-pink-300 group-hover:text-pink-500 transition-colors" /></div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1 group-hover:text-pink-500 transition-colors">Categoria HB</p>
                     <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-gray-900 whitespace-nowrap tracking-tighter" title={formatBRL(filteredData.hbTotal)}>{formatBRL(filteredData.hbTotal)}</h3>
-                    <p className="text-xs text-pink-500 font-bold mt-2">{formatPercent(filteredData.hbShare)} Share de Vendas</p>
+                    <p className="text-xs text-pink-600 font-bold mt-2 bg-pink-50 px-2 py-0.5 rounded-md inline-flex items-center gap-1 relative z-10">{formatPercent(filteredData.hbShare)} Share</p>
                 </div>
 
-                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-emerald-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><Activity size={40} className="text-emerald-200" /></div>
-                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Rentabilidade / Lucro</p>
+                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-emerald-100 hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-default">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-emerald-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-125 group-hover:bg-emerald-100 transition-all duration-500"><Activity size={40} className="text-emerald-300 group-hover:text-emerald-500 transition-colors" /></div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1 group-hover:text-emerald-500 transition-colors">Rentabilidade / Lucro</p>
                     <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-emerald-600 whitespace-nowrap tracking-tighter">{formatPercent(filteredData.lucratividadeMedia)}</h3>
-                    <p className="text-xs text-rose-500 font-bold mt-2">CMV: {formatPercent(100 - filteredData.lucratividadeMedia)}</p>
+                    <p className="text-xs text-rose-500 font-bold mt-2 bg-rose-50 px-2 py-0.5 rounded-md inline-block relative z-10">CMV: {formatPercent(100 - filteredData.lucratividadeMedia)}</p>
                 </div>
 
-                <div className="bg-gray-900 rounded-3xl p-6 shadow-sm relative overflow-hidden group">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-white/5 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><MonitorSmartphone size={40} className="text-gray-700" /></div>
-                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">E-Commerce & Digital</p>
-                    <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-white whitespace-nowrap tracking-tighter">{formatPercent(filteredData.ecomShare)} <span className="text-base font-normal text-slate-400">Share</span></h3>
-                    <p className="text-xs text-gray-500 font-bold mt-2 flex items-center gap-1"><Package size={12}/> Vendas Pedidos: {formatBRL(filteredData.ecomTotal)}</p>
+                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-cyan-100 hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-default">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-cyan-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-125 group-hover:bg-cyan-100 transition-all duration-500"><MonitorSmartphone size={40} className="text-cyan-300 group-hover:text-cyan-500 transition-colors" /></div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1 group-hover:text-cyan-500 transition-colors">E-Commerce & Digital</p>
+                    <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-gray-900 whitespace-nowrap tracking-tighter">{formatPercent(filteredData.ecomShare)} <span className="text-sm font-bold text-slate-400">Share</span></h3>
+                    <p className="text-xs text-cyan-600 font-bold mt-2 bg-cyan-50 px-2 py-0.5 rounded-md inline-flex items-center gap-1 relative z-10"><Package size={12}/> Vendas Pedidos: {formatBRL(filteredData.ecomTotal)}</p>
                 </div>
             </div>
 
             {/* Tabela de Performance por Filial (Always visible) */}
-            <div className="bg-[#0b1121] border border-blue-900/40 rounded-[28px] shadow-2xl overflow-hidden mb-6 relative group">
-                <div className="absolute top-0 right-0 w-[400px] h-[400px] bg-blue-600/10 blur-[100px] pointer-events-none rounded-full"></div>
-                <div className="p-6 border-b border-white/5 flex justify-between items-center relative z-10 bg-white/[0.01]">
+            <div className="bg-white border border-gray-100 rounded-[28px] shadow-sm overflow-hidden mb-6 relative group transition-all duration-300 hover:shadow-xl">
+                <div className="p-6 border-b border-gray-50 flex justify-between items-center relative z-10 bg-gray-50/50">
                     <div>
-                        <h3 className="text-xl font-black text-white flex items-center gap-3">
-                            <Building2 size={24} className="text-indigo-400" />
+                        <h3 className="text-xl font-black text-gray-900 flex items-center gap-3">
+                            <Building2 size={24} className="text-indigo-500" />
                             Raio-X por Filial
                         </h3>
-                        <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">
+                        <p className="text-xs font-bold text-gray-400 uppercase tracking-widest mt-1">
                             Comparativo matriz das lojas {selectedArea !== 'ALL' ? `da ${selectedArea}` : 'de toda a rede'}
                         </p>
                     </div>
@@ -656,42 +655,42 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 <div className="relative z-10 custom-scrollbar transition-all duration-300 overflow-visible w-full min-w-full">
                     <table className="w-full text-left border-collapse min-w-[700px]">
                         <thead className="sticky top-0 z-10">
-                            <tr className="bg-[#0f172a] border-b border-white/10 text-[10px] font-black tracking-widest uppercase text-slate-500 shadow-md">
+                            <tr className="bg-white/90 backdrop-blur-md border-b border-gray-200 text-[10px] font-black tracking-widest uppercase text-gray-400 shadow-sm">
                                 <th className="py-4 px-6 font-bold whitespace-nowrap">Filial</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Fat. Líquido</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Particip. (%)</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Tkt Médio (Líq)</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Rent. (%)</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">CMV (%)</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Devol.</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Share HB (%)</th>
-                                <th className="py-4 px-6 font-bold text-right border-l border-white/5 bg-slate-900/30 whitespace-nowrap">E-Commerce</th>
+                                <th className="py-4 px-6 font-bold text-right border-x border-gray-100 bg-gray-50/50 whitespace-nowrap">E-Commerce</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Particip. (%)</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Rent. (%)</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Devol.</th>
                             </tr>
                         </thead>
-                        <tbody className="divide-y divide-white/5">
+                        <tbody className="divide-y divide-gray-50">
                             {filteredData.filiais.map((f: any, idx: number) => (
-                                <tr key={idx} className="hover:bg-white/[0.03] transition-colors">
-                                    <td className="py-3 px-6 text-sm font-bold text-indigo-100 whitespace-nowrap">{f.branchName}</td>
-                                    <td className="py-3 px-6 text-sm font-black text-emerald-400 text-right whitespace-nowrap">{formatBRL(f.vlrVenda)}</td>
-                                    <td className="py-3 px-6 text-sm font-bold text-blue-300 text-right whitespace-nowrap">{formatPercent(f.participacao)}</td>
-                                    <td className="py-3 px-6 text-sm font-bold text-amber-200 text-right whitespace-nowrap">{formatBRL(f.ticketMedio)}</td>
-                                    <td className="py-3 px-6 text-sm font-medium text-right text-gray-300 min-w-[140px] whitespace-nowrap">
+                                <tr key={idx} className="hover:bg-indigo-50/30 transition-colors">
+                                    <td className="py-3 px-6 text-sm font-bold text-gray-900 whitespace-nowrap">{f.branchName}</td>
+                                    <td className="py-3 px-6 text-sm font-black text-emerald-600 text-right whitespace-nowrap">{formatBRL(f.vlrVenda)}</td>
+                                    <td className="py-3 px-6 text-sm font-bold text-indigo-600 text-right whitespace-nowrap">{formatBRL(f.ticketMedio)}</td>
+                                    <td className="py-3 px-6 text-sm font-bold text-rose-600 text-right whitespace-nowrap bg-rose-50/20">{formatPercent(100 - f.rentabilidade)}</td>
+                                    <td className="py-3 px-6 text-sm font-bold text-pink-600 text-right whitespace-nowrap bg-pink-50/20">{formatPercent(f.hbShare)}</td>
+                                    <td className="py-2 px-6 text-sm font-black text-cyan-700 text-right border-x border-gray-100 bg-cyan-50/30 whitespace-nowrap">
+                                        <div className="flex flex-col items-end leading-tight">
+                                            <span>{formatBRL(f.ecomTotalLoc)}</span>
+                                            <span className="text-[11px] font-black text-cyan-600 bg-cyan-100/50 px-2 py-0.5 rounded mt-1 border border-cyan-200/50">{formatPercent(f.ecomShareLoc)} Share</span>
+                                        </div>
+                                    </td>
+                                    <td className="py-3 px-6 text-sm font-bold text-blue-600 text-right whitespace-nowrap bg-blue-50/20">{formatPercent(f.participacao)}</td>
+                                    <td className="py-3 px-6 text-sm font-medium text-right text-gray-700 min-w-[140px] whitespace-nowrap">
                                         <div className="flex items-center justify-end gap-2">
-                                            <div className="w-16 bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                                <div className={`h-full rounded-full ${f.rentabilidade > 30 ? 'bg-emerald-400' : 'bg-rose-400'}`} style={{width: `${Math.min(100, Math.max(0, f.rentabilidade))}%`}}></div>
+                                            <div className="w-16 bg-gray-100 rounded-full h-1.5 overflow-hidden">
+                                                <div className={`h-full rounded-full ${f.rentabilidade > 30 ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{width: `${Math.min(100, Math.max(0, f.rentabilidade))}%`}}></div>
                                             </div>
                                             <span className="w-12">{formatPercent(f.rentabilidade)}</span>
                                         </div>
                                     </td>
-                                    <td className="py-3 px-6 text-sm font-bold text-rose-500 text-right whitespace-nowrap">{formatPercent(100 - f.rentabilidade)}</td>
-                                    <td className="py-3 px-6 text-sm font-bold text-rose-400 text-right whitespace-nowrap">{formatNumber(f.devolucoes)}</td>
-                                    <td className="py-3 px-6 text-sm font-bold text-pink-300 text-right whitespace-nowrap">{formatPercent(f.hbShare)}</td>
-                                    <td className="py-2 px-6 text-sm font-black text-cyan-300 text-right border-l border-white/5 bg-slate-900/30 whitespace-nowrap">
-                                        <div className="flex flex-col items-end leading-tight">
-                                            <span>{formatBRL(f.ecomTotalLoc)}</span>
-                                            <span className="text-[11px] font-black text-cyan-400 bg-cyan-900/40 px-2 py-0.5 rounded mt-1 border border-cyan-800/30">{formatPercent(f.ecomShareLoc)} Share</span>
-                                        </div>
-                                    </td>
+                                    <td className="py-3 px-6 text-sm font-bold text-rose-500 text-right whitespace-nowrap bg-rose-50/20">{formatNumber(f.devolucoes)}</td>
                                 </tr>
                             ))}
                         </tbody>
