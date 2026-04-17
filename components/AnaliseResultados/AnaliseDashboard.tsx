@@ -54,8 +54,20 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         
         for (const area of company.areas as CompanyArea[]) {
             for (const b of area.branches) {
-                // Fuzzy match, as excel might have "Filial: 1 F01 - Matriz..." and area branch is "F01"
-                if (rawBranchString.toLowerCase().includes(b.toLowerCase())) return area.name;
+                // Try literal match first
+                if (b.trim() && rawBranchString.toLowerCase().includes(b.toLowerCase().trim())) {
+                    return area.name;
+                }
+                
+                // If the user registered "Filial 1", extract the "1" and map to "F01" or starting digit
+                const numMatch = b.match(/\d+/);
+                if (numMatch) {
+                    const numStr = numMatch[0];
+                    const formattedF = 'F' + numStr.padStart(2, '0'); 
+                    if (rawBranchString.includes(formattedF) || rawBranchString.startsWith(`${numStr} `) || rawBranchString.startsWith(`${numStr}-`)) {
+                        return area.name;
+                    }
+                }
             }
         }
         return 'Geral'; // fallback
@@ -312,13 +324,17 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         };
     }, [rawState, selectedArea, selectedBranch]);
 
-    // Unique lists for selectors
-    const avaliableAreas = useMemo(() => Array.from(new Set(rawState.rawLinesVendas.map(r => r.areaName))).sort(), [rawState.rawLinesVendas]);
+    // Unique lists for selectors, using natural string sort so "10" comes after "2"
+    const avaliableAreas = useMemo(() => {
+        return Array.from(new Set(rawState.rawLinesVendas.map(r => r.areaName)))
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    }, [rawState.rawLinesVendas]);
     
     const avaliableBranches = useMemo(() => {
         let base = rawState.rawLinesVendas;
         if (selectedArea !== 'ALL') base = base.filter(r => r.areaName === selectedArea);
-        return Array.from(new Set(base.map(r => r.branchName))).sort();
+        return Array.from(new Set(base.map(r => r.branchName)))
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
     }, [rawState.rawLinesVendas, selectedArea]);
 
     const formatBRL = (val: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(val);
