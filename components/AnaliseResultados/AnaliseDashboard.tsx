@@ -490,7 +490,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
     const top5Volume = [...filteredData.grupos].sort((a,b) => b.volumeVend - a.volumeVend).slice(0, 5);
 
     return (
-        <div className={`space-y-6 bg-slate-50 p-4 -m-4 rounded-xl ${isExporting ? 'w-max min-w-full inline-block' : ''}`} ref={dashboardRef}>
+        <div className="space-y-6 bg-slate-50 p-4 -m-4 rounded-xl w-full mx-auto" ref={dashboardRef}>
             
             {/* Filter Hub */}
             <div className="bg-white/90 backdrop-blur-md rounded-2xl border border-gray-200 p-4 shadow-sm flex flex-col md:flex-row gap-4 items-center justify-between">
@@ -596,7 +596,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                             </p>
                         </div>
                     </div>
-                    <div className={`relative z-10 custom-scrollbar transition-all duration-300 ${isExporting ? 'overflow-visible w-max min-w-full max-h-none' : 'overflow-x-auto max-h-[600px] overflow-y-auto'}`}>
+                    <div className="relative z-10 custom-scrollbar transition-all duration-300 overflow-visible w-full min-w-full">
                         <table className="w-full text-left border-collapse min-w-[700px]">
                             <thead className="sticky top-0 z-10">
                                 <tr className="bg-[#0f172a] border-b border-white/10 text-[10px] font-black tracking-widest uppercase text-slate-500 shadow-md">
@@ -644,7 +644,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             )}
 
             {/* Matrix / Deep Drill Table */}
-            <div className="bg-white border border-gray-100 rounded-[28px] shadow-sm overflow-hidden">
+            <div className="bg-white border border-gray-100 rounded-[28px] shadow-sm overflow-hidden mt-8" data-html2canvas-ignore="true">
                 <div className="p-6 border-b border-gray-50 flex justify-between items-center bg-gray-50/50">
                     <div>
                         <h3 className="text-lg font-black text-gray-900">Performance por Agrupamentos</h3>
@@ -653,7 +653,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                         </p>
                     </div>
                 </div>
-                <div className={`transition-all duration-300 ${isExporting ? 'overflow-visible w-max min-w-full max-h-none' : 'overflow-x-auto max-h-[600px] overflow-y-auto'}`}>
+                <div className="transition-all duration-300 overflow-visible w-full min-w-full">
                     <table className="w-full text-left border-collapse">
                         <thead className="sticky top-0 z-10">
                             <tr className="bg-white/90 backdrop-blur-md border-b border-gray-200 text-[10px] font-black tracking-widest uppercase text-gray-400 shadow-sm">

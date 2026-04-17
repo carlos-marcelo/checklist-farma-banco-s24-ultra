@@ -9325,7 +9325,7 @@ const App: React.FC = () => {
 
                     {/* --- ANÁLISE DE RESULTADOS VIEW (MASTER ONLY) --- */}
                     {currentView === 'analise_resultados' && currentUser?.role === 'MASTER' && (
-                        <div className="max-w-6xl mx-auto space-y-8 animate-fade-in pb-24">
+                        <div className="max-w-[1800px] w-full mx-auto space-y-8 animate-fade-in pb-24 px-2 xl:px-8">
                             <div className="bg-white/80 backdrop-blur-xl border border-white/50 rounded-[32px] shadow-card p-10">
                                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
                                     <div>
