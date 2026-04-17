@@ -4,7 +4,7 @@ import {
     BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, 
     PieChart, Pie, Cell 
 } from 'recharts';
-import { Loader2, DollarSign, Target, Activity, MonitorSmartphone, Package, TrendingUp, Filter, MapPin, Building2 } from 'lucide-react';
+import { Loader2, DollarSign, Target, Activity, MonitorSmartphone, Package, TrendingUp, Filter, MapPin, Building2, Sparkles } from 'lucide-react';
 import { User, CompanyArea } from '../../types';
 import * as SupabaseService from '../../supabaseService';
 
@@ -24,6 +24,7 @@ interface SalesGroupData {
     ticketCount: number; // to rebuild average
     rentabilidade: number; 
     participacao?: number; // % contribution to total sales
+    devolucoes: number;
 }
 
 interface RawDataState {
@@ -90,10 +91,26 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 const vendasWb = XLSX.read(await vendasRes.arrayBuffer(), { type: 'array' });
                 const vendasSheet = vendasWb.Sheets[vendasWb.SheetNames[0]];
                 const vendasRaw: any[] = XLSX.utils.sheet_to_json(vendasSheet, { defval: null });
+                const vendasRawAOA: any[] = XLSX.utils.sheet_to_json(vendasSheet, { header: 'A', defval: null });
 
                 const findVal = (row: any, keys: string[]) => {
                     for (const key of Object.keys(row)) {
                         if (keys.some(k => key.toLowerCase().includes(k.toLowerCase()))) {
+                            const val = row[key];
+                            if (typeof val === 'number') return val;
+                            if (typeof val === 'string') {
+                                const parsed = parseFloat(val.replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.'));
+                                return !isNaN(parsed) ? parsed : 0;
+                            }
+                        }
+                    }
+                    return 0;
+                };
+
+                const findValExclude = (row: any, includeKeys: string[], excludeKeys: string[]) => {
+                    for (const key of Object.keys(row)) {
+                        const kLow = key.toLowerCase();
+                        if (includeKeys.some(k => kLow.includes(k.toLowerCase())) && !excludeKeys.some(k => kLow.includes(k.toLowerCase()))) {
                             const val = row[key];
                             if (typeof val === 'number') return val;
                             if (typeof val === 'string') {
@@ -115,10 +132,14 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 };
 
                 let parsedVendas: SalesGroupData[] = [];
-                let parsedTickets: Record<string, number> = {};
+                let rawBranchTickets: Record<string, {tkt: number, count: number}> = {};
+                let rawBranchDevols: Record<string, number> = {};
                 let currentBranchStr = 'Matriz/Geral';
 
-                vendasRaw.forEach((row) => {
+                vendasRaw.forEach((row, idx) => {
+                    const rowAOA = vendasRawAOA[idx + 1] || {};
+                    const rawFValue = rowAOA['F'] ?? rowAOA['f'];
+
                     const allVals = Object.values(row).map(v => String(v).trim()).filter(v => v);
                     const wholeRowStr = allVals.join(' ');
                     
@@ -131,6 +152,15 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     }
 
                     if (wholeRowStr.toLowerCase().includes('total filial')) {
+                        // Extract global Branch Returns from exact Column F string mapped previously
+                        let totalBrDevol = 0;
+                        if (typeof rawFValue === 'number') totalBrDevol = Math.abs(rawFValue);
+                        else if (typeof rawFValue === 'string') {
+                            const parsed = parseFloat(rawFValue.replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.'));
+                            if (!isNaN(parsed)) totalBrDevol = Math.abs(parsed);
+                        }
+                        rawBranchDevols[currentBranchStr] = totalBrDevol;
+
                         // Extract Venda count (number of tickets) which is usually around column E or "Venda/Devol"
                         for (const key of Object.keys(row)) {
                             const kLow = key.toLowerCase();
@@ -140,8 +170,11 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                                 if (rawVal.includes('*') || /^\d+(\.\d{3})*(,\d+)?\*?$/.test(rawVal.trim())) {
                                     const cleaned = parseFloat(rawVal.replace(/[R$\s*]/g, '').replace(/\./g, '').replace(',', '.'));
                                     if (!isNaN(cleaned) && cleaned > 0) {
-                                        // Pick the first reasonable large number as the ticket count
-                                        parsedTickets[currentBranchStr] = Math.max(parsedTickets[currentBranchStr] || 0, cleaned);
+                                        const prev = rawBranchTickets[currentBranchStr] ? rawBranchTickets[currentBranchStr].tkt : 0;
+                                        rawBranchTickets[currentBranchStr] = {
+                                            tkt: Math.max(prev, cleaned),
+                                            count: 1
+                                        };
                                     }
                                 }
                             }
@@ -170,7 +203,8 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                         vlrVenda: vlrVenda,
                         ticket: rTicket > 0 ? rTicket : 0,
                         ticketCount: rTicket > 0 ? 1 : 0,
-                        rentabilidade: findVal(row, ['% rent', 'rentabilidade'])
+                        rentabilidade: findVal(row, ['% rent', 'rentabilidade']),
+                        devolucoes: 0 // Retorno está sendo lido da matriz/filial e não por grupo
                     });
                 });
 
@@ -232,7 +266,8 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     error: null,
                     rawLinesVendas: parsedVendas,
                     rawLinesEcom: parsedEcom,
-                    rawBranchTickets: parsedTickets
+                    rawBranchTickets: rawBranchTickets,
+                    rawBranchDevols: rawBranchDevols
                 });
 
             } catch (err: any) {
@@ -271,6 +306,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             fFat += r.vlrVenda;
             fCust += r.vlrCusto;
             fVol += r.volumeVend;
+
             if (r.ticket > 0) {
                 tktSum += r.ticket;
                 tktQtd += r.ticketCount;
@@ -285,6 +321,13 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             } else {
                 aglutinadoMap.set(r.name, { ...r });
             }
+        });
+
+        // Compute total devol based ONLY on visible branches 'Total Filial' mapping
+        const visibleBranches = new Set(filteredVendas.map(r => r.branchName));
+        let totalDevol = 0;
+        visibleBranches.forEach(b => {
+             totalDevol += ((rawState as any).rawBranchDevols?.[b] || 0);
         });
 
         const ecomTotal = filteredEcom.reduce((acc, curr) => acc + curr.valor, 0);
@@ -302,10 +345,12 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         let totalOperacoes = 0;
         const validBranchesForTickets = new Set(filteredVendas.map(v => v.branchName));
         validBranchesForTickets.forEach(b => {
-             if (rawState.rawBranchTickets[b]) totalOperacoes += rawState.rawBranchTickets[b];
+             const tb = rawState.rawBranchTickets[b];
+             if (tb) totalOperacoes += tb.tkt; // Acessa a propriedade contendo o núm de cupons (Coluna E)
         });
 
-        const avgTkt = totalOperacoes > 0 ? (fFat / totalOperacoes) : 0;
+        const operacoesLiquidas = totalOperacoes - totalDevol; // Abate Devoluções (F) do Fluxo/Vendas (E)
+        const avgTkt = operacoesLiquidas > 0 ? (fFat / operacoesLiquidas) : 0;
         const ecomShare = fFat > 0 ? (ecomTotal / fFat) * 100 : 0;
 
         let finalGrouped = grouped.map(g => {
@@ -313,13 +358,24 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             return g;
         });
 
+        const isHB = (name: string) => {
+            const n = name.trim().toUpperCase();
+            return n === 'HB' || n.includes('HIGIENE') || n.includes('PERFUMARIA') || n.includes('COSMÉTIC') || n.includes('COSMETIC') || n.includes('BELEZA') || n === 'H.B.' || n === 'H.B';
+        };
+        
+        const hbTotal = finalGrouped.filter(g => isHB(g.name)).reduce((acc, g) => acc + g.vlrVenda, 0);
+        const hbShare = fFat > 0 ? (hbTotal / fFat) * 100 : 0;
+
         return {
             faturamentoLiq: fFat,
             ticketMedioGeral: avgTkt,
             lucratividadeMedia: avgRent,
             volumeTotal: fVol,
+            totalDevol,
             ecomTotal,
             ecomShare,
+            hbTotal,
+            hbShare,
             grupos: finalGrouped
         };
     }, [rawState, selectedArea, selectedBranch]);
@@ -402,32 +458,42 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             </div>
 
             {/* KPIs */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
                 <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group">
                     <div className="absolute -right-4 -top-4 w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><DollarSign size={40} className="text-blue-200" /></div>
                     <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Fat. Líquido ({selectedArea==='ALL' && selectedBranch==='ALL' ? 'Rede' : 'Filtro'})</p>
-                    <h3 className="text-2xl font-black text-gray-900">{formatBRL(filteredData.faturamentoLiq)}</h3>
-                    <p className="text-xs text-emerald-500 font-bold mt-2 flex items-center gap-1"><TrendingUp size={12}/> Vol: {formatNumber(filteredData.volumeTotal)} und</p>
+                    <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-gray-900 whitespace-nowrap tracking-tighter" title={formatBRL(filteredData.faturamentoLiq)}>{formatBRL(filteredData.faturamentoLiq)}</h3>
+                    <div className="flex items-center gap-3 mt-2">
+                        <p className="text-xs text-emerald-500 font-bold flex items-center gap-1"><TrendingUp size={12}/> Vol: {formatNumber(filteredData.volumeTotal)}</p>
+                        <p className="text-xs text-rose-400 font-bold flex items-center gap-1">Dev: {formatNumber(filteredData.totalDevol)}</p>
+                    </div>
                 </div>
 
                 <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group">
                     <div className="absolute -right-4 -top-4 w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><Target size={40} className="text-indigo-200" /></div>
                     <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Ticket Médio (Global)</p>
-                    <h3 className="text-2xl font-black text-gray-900">{formatBRL(filteredData.ticketMedioGeral)}</h3>
-                    <p className="text-xs text-gray-400 font-bold mt-2">Média com base no fluxo</p>
+                    <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-gray-900 whitespace-nowrap tracking-tighter">{formatBRL(filteredData.ticketMedioGeral)}</h3>
+                    <p className="text-xs text-gray-400 font-bold mt-2">Média c/ devoluções embutidas</p>
+                </div>
+
+                <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-pink-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><Sparkles size={40} className="text-pink-200" /></div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Categoria HB</p>
+                    <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-gray-900 whitespace-nowrap tracking-tighter" title={formatBRL(filteredData.hbTotal)}>{formatBRL(filteredData.hbTotal)}</h3>
+                    <p className="text-xs text-pink-500 font-bold mt-2">{formatPercent(filteredData.hbShare)} Share de Vendas</p>
                 </div>
 
                 <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group">
                     <div className="absolute -right-4 -top-4 w-24 h-24 bg-emerald-50 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><Activity size={40} className="text-emerald-200" /></div>
                     <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Rentabilidade / Lucro</p>
-                    <h3 className="text-2xl font-black text-emerald-600">{formatPercent(filteredData.lucratividadeMedia)}</h3>
+                    <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-emerald-600 whitespace-nowrap tracking-tighter">{formatPercent(filteredData.lucratividadeMedia)}</h3>
                     <p className="text-xs text-rose-500 font-bold mt-2">CMV: {formatPercent(100 - filteredData.lucratividadeMedia)}</p>
                 </div>
 
                 <div className="bg-gray-900 rounded-3xl p-6 shadow-sm relative overflow-hidden group">
                     <div className="absolute -right-4 -top-4 w-24 h-24 bg-white/5 rounded-full flex items-center justify-center opacity-50 group-hover:scale-110 transition-transform"><MonitorSmartphone size={40} className="text-gray-700" /></div>
                     <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">E-Commerce & Digital</p>
-                    <h3 className="text-2xl font-black text-white">{formatPercent(filteredData.ecomShare)} <span className="text-sm text-gray-400 font-medium">Share</span></h3>
+                    <h3 className="text-lg xl:text-lg 2xl:text-xl font-black text-white whitespace-nowrap tracking-tighter">{formatPercent(filteredData.ecomShare)} <span className="text-base font-normal text-slate-400">Share</span></h3>
                     <p className="text-xs text-gray-500 font-bold mt-2 flex items-center gap-1"><Package size={12}/> Vendas Pedidos: {formatBRL(filteredData.ecomTotal)}</p>
                 </div>
             </div>
