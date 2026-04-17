@@ -366,6 +366,51 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         const hbTotal = finalGrouped.filter(g => isHB(g.name)).reduce((acc, g) => acc + g.vlrVenda, 0);
         const hbShare = fFat > 0 ? (hbTotal / fFat) * 100 : 0;
 
+        // Consolidar performance absoluta por Filial para a tabela secundária
+        const filiaisMap = new Map<string, any>();
+        filteredVendas.forEach(r => {
+            const bName = r.branchName;
+            if (!filiaisMap.has(bName)) {
+                filiaisMap.set(bName, {
+                    branchName: bName,
+                    vlrVenda: 0,
+                    vlrCusto: 0,
+                    volumeVend: 0,
+                    hbTotal: 0,
+                });
+            }
+            const exist = filiaisMap.get(bName);
+            exist.vlrVenda += r.vlrVenda;
+            exist.vlrCusto += r.vlrCusto;
+            exist.volumeVend += r.volumeVend;
+            if (isHB(r.name)) exist.hbTotal += r.vlrVenda;
+        });
+
+        const filiaisPerformance = Array.from(filiaisMap.values()).map(b => {
+             const bDevol = ((rawState as any).rawBranchDevols?.[b.branchName] || 0);
+             const bt = rawState.rawBranchTickets[b.branchName];
+             const bTkts = bt ? bt.tkt : 0;
+             const opLiq = bTkts - bDevol;
+             const avgTkt = opLiq > 0 ? (b.vlrVenda / opLiq) : 0;
+             const rent = b.vlrVenda > 0 ? ((b.vlrVenda - b.vlrCusto) / b.vlrVenda) * 100 : 0;
+             const participacao = fFat > 0 ? (b.vlrVenda / fFat) * 100 : 0;
+             const hbShareLoc = b.vlrVenda > 0 ? (b.hbTotal / b.vlrVenda) * 100 : 0;
+             const ecomSalesLoc = filteredEcom.filter(e => e.branchName === b.branchName).reduce((a,c) => a + c.valor, 0);
+             const ecomShareLocal = b.vlrVenda > 0 ? (ecomSalesLoc / b.vlrVenda) * 100 : 0;
+
+             return {
+                 ...b,
+                 devolucoes: bDevol,
+                 ticketMedio: avgTkt,
+                 rentabilidade: rent,
+                 participacao,
+                 hbShare: hbShareLoc,
+                 ecomTotalLoc: ecomSalesLoc,
+                 ecomShareLoc: ecomShareLocal
+             };
+        });
+        filiaisPerformance.sort((a,b) => b.vlrVenda - a.vlrVenda);
+
         return {
             faturamentoLiq: fFat,
             ticketMedioGeral: avgTkt,
@@ -376,7 +421,8 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             ecomShare,
             hbTotal,
             hbShare,
-            grupos: finalGrouped
+            grupos: finalGrouped,
+            filiais: filiaisPerformance
         };
     }, [rawState, selectedArea, selectedBranch]);
 
@@ -497,6 +543,68 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     <p className="text-xs text-gray-500 font-bold mt-2 flex items-center gap-1"><Package size={12}/> Vendas Pedidos: {formatBRL(filteredData.ecomTotal)}</p>
                 </div>
             </div>
+
+            {/* Tabela de Performance por Filial (Only visible when Area is selected) */}
+            {selectedArea !== 'ALL' && (
+                <div className="bg-[#0b1121] border border-blue-900/40 rounded-[28px] shadow-2xl overflow-hidden mb-6 relative group">
+                    <div className="absolute top-0 right-0 w-[400px] h-[400px] bg-blue-600/10 blur-[100px] pointer-events-none rounded-full"></div>
+                    <div className="p-6 border-b border-white/5 flex justify-between items-center relative z-10 bg-white/[0.01]">
+                        <div>
+                            <h3 className="text-xl font-black text-white flex items-center gap-3">
+                                <Building2 size={24} className="text-indigo-400" />
+                                Raio-X por Filial
+                            </h3>
+                            <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">
+                                Comparativo matriz das lojas da {selectedArea}
+                            </p>
+                        </div>
+                    </div>
+                    <div className="overflow-x-auto max-h-[400px] overflow-y-auto relative z-10 custom-scrollbar">
+                        <table className="w-full text-left border-collapse min-w-[700px]">
+                            <thead className="sticky top-0 z-10">
+                                <tr className="bg-[#0f172a] border-b border-white/10 text-[10px] font-black tracking-widest uppercase text-slate-500 shadow-md">
+                                    <th className="py-4 px-6 font-bold whitespace-nowrap">Filial</th>
+                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Fat. Líquido</th>
+                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Particip. (%)</th>
+                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Tkt Médio (Líq)</th>
+                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Rent. (%)</th>
+                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">CMV (%)</th>
+                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Devol.</th>
+                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Share HB (%)</th>
+                                    <th className="py-4 px-6 font-bold text-right border-l border-white/5 bg-slate-900/30 whitespace-nowrap">E-Commerce</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-white/5">
+                                {filteredData.filiais.map((f: any, idx: number) => (
+                                    <tr key={idx} className="hover:bg-white/[0.03] transition-colors">
+                                        <td className="py-3 px-6 text-sm font-bold text-indigo-100 whitespace-nowrap">{f.branchName}</td>
+                                        <td className="py-3 px-6 text-sm font-black text-emerald-400 text-right whitespace-nowrap">{formatBRL(f.vlrVenda)}</td>
+                                        <td className="py-3 px-6 text-sm font-bold text-blue-300 text-right whitespace-nowrap">{formatPercent(f.participacao)}</td>
+                                        <td className="py-3 px-6 text-sm font-bold text-amber-200 text-right whitespace-nowrap">{formatBRL(f.ticketMedio)}</td>
+                                        <td className="py-3 px-6 text-sm font-medium text-right text-gray-300 min-w-[140px] whitespace-nowrap">
+                                            <div className="flex items-center justify-end gap-2">
+                                                <div className="w-16 bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                                    <div className={`h-full rounded-full ${f.rentabilidade > 30 ? 'bg-emerald-400' : 'bg-rose-400'}`} style={{width: `${Math.min(100, Math.max(0, f.rentabilidade))}%`}}></div>
+                                                </div>
+                                                <span className="w-12">{formatPercent(f.rentabilidade)}</span>
+                                            </div>
+                                        </td>
+                                        <td className="py-3 px-6 text-sm font-bold text-rose-500 text-right whitespace-nowrap">{formatPercent(100 - f.rentabilidade)}</td>
+                                        <td className="py-3 px-6 text-sm font-bold text-rose-400 text-right whitespace-nowrap">{formatNumber(f.devolucoes)}</td>
+                                        <td className="py-3 px-6 text-sm font-bold text-pink-300 text-right whitespace-nowrap">{formatPercent(f.hbShare)}</td>
+                                        <td className="py-2 px-6 text-sm font-black text-cyan-300 text-right border-l border-white/5 bg-slate-900/30 whitespace-nowrap">
+                                            <div className="flex flex-col items-end leading-tight">
+                                                <span>{formatBRL(f.ecomTotalLoc)}</span>
+                                                <span className="text-[11px] font-black text-cyan-400 bg-cyan-900/40 px-2 py-0.5 rounded mt-1 border border-cyan-800/30">{formatPercent(f.ecomShareLoc)} Share</span>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            )}
 
             {/* Matrix / Deep Drill Table */}
             <div className="bg-white border border-gray-100 rounded-[28px] shadow-sm overflow-hidden">
