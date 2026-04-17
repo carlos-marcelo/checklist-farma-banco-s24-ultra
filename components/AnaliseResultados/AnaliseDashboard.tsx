@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import * as XLSX from 'xlsx';
+import html2canvas from 'html2canvas';
 import { 
     BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, 
     PieChart, Pie, Cell 
 } from 'recharts';
-import { Loader2, DollarSign, Target, Activity, MonitorSmartphone, Package, TrendingUp, Filter, MapPin, Building2, Sparkles } from 'lucide-react';
+import { Loader2, DollarSign, Target, Activity, MonitorSmartphone, Package, TrendingUp, Filter, MapPin, Building2, Sparkles, Camera } from 'lucide-react';
 import { User, CompanyArea } from '../../types';
 import * as SupabaseService from '../../supabaseService';
 
@@ -36,6 +37,9 @@ interface RawDataState {
 }
 
 export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser, companies = [] }) => {
+    const dashboardRef = useRef<HTMLDivElement>(null);
+    const [isExporting, setIsExporting] = useState(false);
+
     const [rawState, setRawState] = useState<RawDataState>({
         loading: true,
         error: null,
@@ -46,6 +50,28 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
 
     const [selectedArea, setSelectedArea] = useState<string>('ALL');
     const [selectedBranch, setSelectedBranch] = useState<string>('ALL');
+
+    const takeSnapshot = async () => {
+        if (!dashboardRef.current) return;
+        setIsExporting(true);
+        try {
+            await new Promise(r => setTimeout(r, 100)); // allow render frame
+            const canvas = await html2canvas(dashboardRef.current, {
+                scale: 2,
+                useCORS: true,
+                backgroundColor: '#f8fafc',
+            });
+            const image = canvas.toDataURL("image/png");
+            const link = document.createElement("a");
+            link.href = image;
+            link.download = `RaioX_${selectedArea}_${new Date().toISOString().split('T')[0]}.png`;
+            link.click();
+        } catch (error) {
+            console.error("Error generating snapshot", error);
+        } finally {
+            setIsExporting(false);
+        }
+    };
 
     // Build area mapping
     const getAreaForBranch = (rawBranchString: string): string => {
@@ -409,7 +435,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                  ecomShareLoc: ecomShareLocal
              };
         });
-        filiaisPerformance.sort((a,b) => b.vlrVenda - a.vlrVenda);
+        filiaisPerformance.sort((a,b) => a.branchName.localeCompare(b.branchName, undefined, { numeric: true, sensitivity: 'base' }));
 
         return {
             faturamentoLiq: fFat,
@@ -464,7 +490,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
     const top5Volume = [...filteredData.grupos].sort((a,b) => b.volumeVend - a.volumeVend).slice(0, 5);
 
     return (
-        <div className="space-y-6">
+        <div className={`space-y-6 bg-slate-50 p-4 -m-4 rounded-xl ${isExporting ? 'w-max min-w-full inline-block' : ''}`} ref={dashboardRef}>
             
             {/* Filter Hub */}
             <div className="bg-white/90 backdrop-blur-md rounded-2xl border border-gray-200 p-4 shadow-sm flex flex-col md:flex-row gap-4 items-center justify-between">
@@ -500,6 +526,17 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                             {avaliableBranches.map(b => <option key={b} value={b}>{b}</option>)}
                         </select>
                     </div>
+
+                    {/* Snapshot Print Button */}
+                    <button 
+                        onClick={takeSnapshot}
+                        disabled={isExporting}
+                        className="flex-none flex items-center justify-center gap-2 bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white font-bold py-1.5 px-4 rounded-xl shadow-md transition-all active:scale-95 disabled:opacity-50"
+                    >
+                        {isExporting ? <Loader2 size={16} className="animate-spin"/> : <Camera size={16} />}
+                        <span className="text-sm whitespace-nowrap">{isExporting ? 'Processando...' : 'Screenshot'}</span>
+                    </button>
+                    
                 </div>
             </div>
 
@@ -559,7 +596,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                             </p>
                         </div>
                     </div>
-                    <div className="overflow-x-auto max-h-[400px] overflow-y-auto relative z-10 custom-scrollbar">
+                    <div className={`relative z-10 custom-scrollbar transition-all duration-300 ${isExporting ? 'overflow-visible w-max min-w-full max-h-none' : 'overflow-x-auto max-h-[600px] overflow-y-auto'}`}>
                         <table className="w-full text-left border-collapse min-w-[700px]">
                             <thead className="sticky top-0 z-10">
                                 <tr className="bg-[#0f172a] border-b border-white/10 text-[10px] font-black tracking-widest uppercase text-slate-500 shadow-md">
@@ -616,7 +653,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                         </p>
                     </div>
                 </div>
-                <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+                <div className={`transition-all duration-300 ${isExporting ? 'overflow-visible w-max min-w-full max-h-none' : 'overflow-x-auto max-h-[600px] overflow-y-auto'}`}>
                     <table className="w-full text-left border-collapse">
                         <thead className="sticky top-0 z-10">
                             <tr className="bg-white/90 backdrop-blur-md border-b border-gray-200 text-[10px] font-black tracking-widest uppercase text-gray-400 shadow-sm">
