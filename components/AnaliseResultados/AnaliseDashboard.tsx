@@ -49,6 +49,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
     });
 
     const [selectedArea, setSelectedArea] = useState<string>('ALL');
+    const [selectedCity, setSelectedCity] = useState<string>('ALL');
     const [selectedBranch, setSelectedBranch] = useState<string>('ALL');
 
     const takeSnapshot = async () => {
@@ -314,6 +315,18 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             filteredEcom = filteredEcom.filter(r => getAreaForBranch(r.branchName) === selectedArea);
         }
 
+        if (selectedCity !== 'ALL') {
+            const cityNormalized = selectedCity.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+            const cityMatch = (bName: string) => {
+                const upper = bName.toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                return upper.includes(cityNormalized) || 
+                    (selectedCity === 'SÃO GABRIEL' && upper.includes('MATRIZ'));
+            };
+                
+            filteredVendas = filteredVendas.filter(r => cityMatch(r.branchName));
+            filteredEcom = filteredEcom.filter(r => cityMatch(r.branchName));
+        }
+
         if (selectedBranch !== 'ALL') {
             filteredVendas = filteredVendas.filter(r => r.branchName === selectedBranch);
             filteredEcom = filteredEcom.filter(r => r.branchName === selectedBranch);
@@ -450,20 +463,49 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             grupos: finalGrouped,
             filiais: filiaisPerformance
         };
-    }, [rawState, selectedArea, selectedBranch]);
+    }, [rawState, selectedArea, selectedCity, selectedBranch]);
 
     // Unique lists for selectors, using natural string sort so "10" comes after "2"
     const avaliableAreas = useMemo(() => {
         return Array.from(new Set(rawState.rawLinesVendas.map(r => r.areaName)))
             .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
     }, [rawState.rawLinesVendas]);
+
+    const avaliableCities = useMemo(() => {
+        let base = rawState.rawLinesVendas;
+        if (selectedArea !== 'ALL') base = base.filter(r => r.areaName === selectedArea);
+        
+        const cities = new Set<string>();
+        base.forEach(r => {
+            const upperName = r.branchName.toUpperCase();
+            if (upperName.includes('MATRIZ')) {
+                cities.add('SÃO GABRIEL');
+            }
+            const parts = r.branchName.split('-');
+            if (parts.length > 1) {
+                let city = parts[1].replace(/[\d\.\/]+.*$/, '').trim().toUpperCase();
+                // Força unificação de acentos comuns
+                if (city === 'SAO GABRIEL' || city === 'SÃO GABRIEL') city = 'SÃO GABRIEL';
+                if (city && city.length > 2) cities.add(city);
+            }
+        });
+        return Array.from(cities).sort((a, b) => a.localeCompare(b));
+    }, [rawState.rawLinesVendas, selectedArea]);
     
     const avaliableBranches = useMemo(() => {
         let base = rawState.rawLinesVendas;
         if (selectedArea !== 'ALL') base = base.filter(r => r.areaName === selectedArea);
+        if (selectedCity !== 'ALL') {
+            const cityNormalized = selectedCity.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+            base = base.filter(r => {
+                const upper = r.branchName.toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                return upper.includes(cityNormalized) || 
+                       (selectedCity === 'SÃO GABRIEL' && upper.includes('MATRIZ'));
+            });
+        }
         return Array.from(new Set(base.map(r => r.branchName)))
             .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
-    }, [rawState.rawLinesVendas, selectedArea]);
+    }, [rawState.rawLinesVendas, selectedArea, selectedCity]);
 
     const formatBRL = (val: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(val);
     const formatPercent = (val: number) => val.toFixed(2) + '%';
@@ -507,11 +549,27 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                             value={selectedArea}
                             onChange={(e) => {
                                 setSelectedArea(e.target.value);
+                                setSelectedCity('ALL');
                                 setSelectedBranch('ALL');
                             }}
                         >
                             <option value="ALL">Todas as Áreas (Total Empresa)</option>
                             {avaliableAreas.map(a => <option key={a} value={a}>{a}</option>)}
+                        </select>
+                    </div>
+
+                    <div className="flex-1 sm:flex-none flex items-center bg-gray-50 border border-gray-200 rounded-xl px-3 py-1.5 focus-within:ring-2 ring-cyan-100 transition-shadow">
+                        <MapPin size={14} className="text-cyan-500 mr-2" />
+                        <select 
+                            className="bg-transparent border-none text-sm font-bold text-gray-700 outline-none pr-4 w-full cursor-pointer appearance-none"
+                            value={selectedCity}
+                            onChange={(e) => {
+                                setSelectedCity(e.target.value);
+                                setSelectedBranch('ALL');
+                            }}
+                        >
+                            <option value="ALL">Todas as Cidades</option>
+                            {avaliableCities.map(c => <option key={c} value={c}>{c}</option>)}
                         </select>
                     </div>
 
@@ -522,7 +580,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                             value={selectedBranch}
                             onChange={(e) => setSelectedBranch(e.target.value)}
                         >
-                            <option value="ALL">Todas as Filiais {selectedArea !== 'ALL' && 'da Área'}</option>
+                            <option value="ALL">Todas as Filiais</option>
                             {avaliableBranches.map(b => <option key={b} value={b}>{b}</option>)}
                         </select>
                     </div>
@@ -581,67 +639,65 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 </div>
             </div>
 
-            {/* Tabela de Performance por Filial (Only visible when Area is selected) */}
-            {selectedArea !== 'ALL' && (
-                <div className="bg-[#0b1121] border border-blue-900/40 rounded-[28px] shadow-2xl overflow-hidden mb-6 relative group">
-                    <div className="absolute top-0 right-0 w-[400px] h-[400px] bg-blue-600/10 blur-[100px] pointer-events-none rounded-full"></div>
-                    <div className="p-6 border-b border-white/5 flex justify-between items-center relative z-10 bg-white/[0.01]">
-                        <div>
-                            <h3 className="text-xl font-black text-white flex items-center gap-3">
-                                <Building2 size={24} className="text-indigo-400" />
-                                Raio-X por Filial
-                            </h3>
-                            <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">
-                                Comparativo matriz das lojas da {selectedArea}
-                            </p>
-                        </div>
-                    </div>
-                    <div className="relative z-10 custom-scrollbar transition-all duration-300 overflow-visible w-full min-w-full">
-                        <table className="w-full text-left border-collapse min-w-[700px]">
-                            <thead className="sticky top-0 z-10">
-                                <tr className="bg-[#0f172a] border-b border-white/10 text-[10px] font-black tracking-widest uppercase text-slate-500 shadow-md">
-                                    <th className="py-4 px-6 font-bold whitespace-nowrap">Filial</th>
-                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Fat. Líquido</th>
-                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Particip. (%)</th>
-                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Tkt Médio (Líq)</th>
-                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Rent. (%)</th>
-                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">CMV (%)</th>
-                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Devol.</th>
-                                    <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Share HB (%)</th>
-                                    <th className="py-4 px-6 font-bold text-right border-l border-white/5 bg-slate-900/30 whitespace-nowrap">E-Commerce</th>
-                                </tr>
-                            </thead>
-                            <tbody className="divide-y divide-white/5">
-                                {filteredData.filiais.map((f: any, idx: number) => (
-                                    <tr key={idx} className="hover:bg-white/[0.03] transition-colors">
-                                        <td className="py-3 px-6 text-sm font-bold text-indigo-100 whitespace-nowrap">{f.branchName}</td>
-                                        <td className="py-3 px-6 text-sm font-black text-emerald-400 text-right whitespace-nowrap">{formatBRL(f.vlrVenda)}</td>
-                                        <td className="py-3 px-6 text-sm font-bold text-blue-300 text-right whitespace-nowrap">{formatPercent(f.participacao)}</td>
-                                        <td className="py-3 px-6 text-sm font-bold text-amber-200 text-right whitespace-nowrap">{formatBRL(f.ticketMedio)}</td>
-                                        <td className="py-3 px-6 text-sm font-medium text-right text-gray-300 min-w-[140px] whitespace-nowrap">
-                                            <div className="flex items-center justify-end gap-2">
-                                                <div className="w-16 bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                                    <div className={`h-full rounded-full ${f.rentabilidade > 30 ? 'bg-emerald-400' : 'bg-rose-400'}`} style={{width: `${Math.min(100, Math.max(0, f.rentabilidade))}%`}}></div>
-                                                </div>
-                                                <span className="w-12">{formatPercent(f.rentabilidade)}</span>
-                                            </div>
-                                        </td>
-                                        <td className="py-3 px-6 text-sm font-bold text-rose-500 text-right whitespace-nowrap">{formatPercent(100 - f.rentabilidade)}</td>
-                                        <td className="py-3 px-6 text-sm font-bold text-rose-400 text-right whitespace-nowrap">{formatNumber(f.devolucoes)}</td>
-                                        <td className="py-3 px-6 text-sm font-bold text-pink-300 text-right whitespace-nowrap">{formatPercent(f.hbShare)}</td>
-                                        <td className="py-2 px-6 text-sm font-black text-cyan-300 text-right border-l border-white/5 bg-slate-900/30 whitespace-nowrap">
-                                            <div className="flex flex-col items-end leading-tight">
-                                                <span>{formatBRL(f.ecomTotalLoc)}</span>
-                                                <span className="text-[11px] font-black text-cyan-400 bg-cyan-900/40 px-2 py-0.5 rounded mt-1 border border-cyan-800/30">{formatPercent(f.ecomShareLoc)} Share</span>
-                                            </div>
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
+            {/* Tabela de Performance por Filial (Always visible) */}
+            <div className="bg-[#0b1121] border border-blue-900/40 rounded-[28px] shadow-2xl overflow-hidden mb-6 relative group">
+                <div className="absolute top-0 right-0 w-[400px] h-[400px] bg-blue-600/10 blur-[100px] pointer-events-none rounded-full"></div>
+                <div className="p-6 border-b border-white/5 flex justify-between items-center relative z-10 bg-white/[0.01]">
+                    <div>
+                        <h3 className="text-xl font-black text-white flex items-center gap-3">
+                            <Building2 size={24} className="text-indigo-400" />
+                            Raio-X por Filial
+                        </h3>
+                        <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">
+                            Comparativo matriz das lojas {selectedArea !== 'ALL' ? `da ${selectedArea}` : 'de toda a rede'}
+                        </p>
                     </div>
                 </div>
-            )}
+                <div className="relative z-10 custom-scrollbar transition-all duration-300 overflow-visible w-full min-w-full">
+                    <table className="w-full text-left border-collapse min-w-[700px]">
+                        <thead className="sticky top-0 z-10">
+                            <tr className="bg-[#0f172a] border-b border-white/10 text-[10px] font-black tracking-widest uppercase text-slate-500 shadow-md">
+                                <th className="py-4 px-6 font-bold whitespace-nowrap">Filial</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Fat. Líquido</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Particip. (%)</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Tkt Médio (Líq)</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Rent. (%)</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">CMV (%)</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Devol.</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Share HB (%)</th>
+                                <th className="py-4 px-6 font-bold text-right border-l border-white/5 bg-slate-900/30 whitespace-nowrap">E-Commerce</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/5">
+                            {filteredData.filiais.map((f: any, idx: number) => (
+                                <tr key={idx} className="hover:bg-white/[0.03] transition-colors">
+                                    <td className="py-3 px-6 text-sm font-bold text-indigo-100 whitespace-nowrap">{f.branchName}</td>
+                                    <td className="py-3 px-6 text-sm font-black text-emerald-400 text-right whitespace-nowrap">{formatBRL(f.vlrVenda)}</td>
+                                    <td className="py-3 px-6 text-sm font-bold text-blue-300 text-right whitespace-nowrap">{formatPercent(f.participacao)}</td>
+                                    <td className="py-3 px-6 text-sm font-bold text-amber-200 text-right whitespace-nowrap">{formatBRL(f.ticketMedio)}</td>
+                                    <td className="py-3 px-6 text-sm font-medium text-right text-gray-300 min-w-[140px] whitespace-nowrap">
+                                        <div className="flex items-center justify-end gap-2">
+                                            <div className="w-16 bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                                <div className={`h-full rounded-full ${f.rentabilidade > 30 ? 'bg-emerald-400' : 'bg-rose-400'}`} style={{width: `${Math.min(100, Math.max(0, f.rentabilidade))}%`}}></div>
+                                            </div>
+                                            <span className="w-12">{formatPercent(f.rentabilidade)}</span>
+                                        </div>
+                                    </td>
+                                    <td className="py-3 px-6 text-sm font-bold text-rose-500 text-right whitespace-nowrap">{formatPercent(100 - f.rentabilidade)}</td>
+                                    <td className="py-3 px-6 text-sm font-bold text-rose-400 text-right whitespace-nowrap">{formatNumber(f.devolucoes)}</td>
+                                    <td className="py-3 px-6 text-sm font-bold text-pink-300 text-right whitespace-nowrap">{formatPercent(f.hbShare)}</td>
+                                    <td className="py-2 px-6 text-sm font-black text-cyan-300 text-right border-l border-white/5 bg-slate-900/30 whitespace-nowrap">
+                                        <div className="flex flex-col items-end leading-tight">
+                                            <span>{formatBRL(f.ecomTotalLoc)}</span>
+                                            <span className="text-[11px] font-black text-cyan-400 bg-cyan-900/40 px-2 py-0.5 rounded mt-1 border border-cyan-800/30">{formatPercent(f.ecomShareLoc)} Share</span>
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
 
             {/* Matrix / Deep Drill Table */}
             <div className="bg-white border border-gray-100 rounded-[28px] shadow-sm overflow-hidden mt-8" data-html2canvas-ignore="true">
