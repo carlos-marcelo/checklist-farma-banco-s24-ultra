@@ -477,15 +477,13 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         
         const cities = new Set<string>();
         base.forEach(r => {
-            const upperName = r.branchName.toUpperCase();
-            if (upperName.includes('MATRIZ')) {
-                cities.add('SÃO GABRIEL');
-            }
             const parts = r.branchName.split('-');
             if (parts.length > 1) {
                 let city = parts[1].replace(/[\d\.\/]+.*$/, '').trim().toUpperCase();
-                // Força unificação de acentos comuns
+                // Força unificação
+                if (city === 'MATRIZ') city = 'SÃO GABRIEL';
                 if (city === 'SAO GABRIEL' || city === 'SÃO GABRIEL') city = 'SÃO GABRIEL';
+                
                 if (city && city.length > 2) cities.add(city);
             }
         });
