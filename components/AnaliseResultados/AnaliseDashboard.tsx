@@ -532,7 +532,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
     const top5Volume = [...filteredData.grupos].sort((a,b) => b.volumeVend - a.volumeVend).slice(0, 5);
 
     return (
-        <div className="space-y-6 bg-slate-50 p-4 -m-4 rounded-xl w-full mx-auto" ref={dashboardRef}>
+        <div className="space-y-6 bg-slate-50 p-4 -m-4 rounded-xl w-full mx-auto overflow-x-auto custom-scrollbar">
             
             {/* Filter Hub */}
             <div className="bg-white/90 backdrop-blur-md rounded-2xl border border-gray-200 p-4 shadow-sm flex flex-col md:flex-row gap-4 items-center justify-between">
@@ -598,6 +598,8 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 </div>
             </div>
 
+            {/* Container Alvo do Screenshot */}
+            <div ref={dashboardRef} className="space-y-6 w-max min-w-full pb-8">
             {/* KPIs */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
                 <div className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-blue-100 hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-default">
@@ -750,6 +752,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 </div>
             </div>
 
+            </div>
         </div>
     );
 };
