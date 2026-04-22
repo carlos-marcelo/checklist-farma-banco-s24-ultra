@@ -659,12 +659,11 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                                 <th className="py-4 px-6 font-bold whitespace-nowrap">Filial</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Fat. Líquido</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Tkt Médio (Líq)</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">CMV (%)</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Share HB (%)</th>
-                                <th className="py-4 px-6 font-bold text-right border-x border-gray-100 bg-gray-50/50 whitespace-nowrap">E-Commerce</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Particip. (%)</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Rent. (%)</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Devol.</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap text-pink-600">HB (R$)</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap text-pink-600">Share HB (%)</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap text-rose-600">CMV (%)</th>
+                                <th className="py-4 px-6 font-bold text-right border-x border-gray-100 bg-gray-50/50 whitespace-nowrap text-cyan-700">E-Commerce</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap text-rose-500">Devol.</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-50">
@@ -673,21 +672,13 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                                     <td className="py-3 px-6 text-sm font-bold text-gray-900 whitespace-nowrap">{f.branchName}</td>
                                     <td className="py-3 px-6 text-sm font-black text-emerald-600 text-right whitespace-nowrap">{formatBRL(f.vlrVenda)}</td>
                                     <td className="py-3 px-6 text-sm font-bold text-indigo-600 text-right whitespace-nowrap">{formatBRL(f.ticketMedio)}</td>
-                                    <td className="py-3 px-6 text-sm font-bold text-rose-600 text-right whitespace-nowrap bg-rose-50/20">{formatPercent(100 - f.rentabilidade)}</td>
+                                    <td className="py-3 px-6 text-sm font-black text-pink-600 text-right whitespace-nowrap">{formatBRL(f.hbTotal)}</td>
                                     <td className="py-3 px-6 text-sm font-bold text-pink-600 text-right whitespace-nowrap bg-pink-50/20">{formatPercent(f.hbShare)}</td>
+                                    <td className="py-3 px-6 text-sm font-bold text-rose-600 text-right whitespace-nowrap bg-rose-50/20">{formatPercent(100 - f.rentabilidade)}</td>
                                     <td className="py-2 px-6 text-sm font-black text-cyan-700 text-right border-x border-gray-100 bg-cyan-50/30 whitespace-nowrap">
                                         <div className="flex flex-col items-end leading-tight">
                                             <span>{formatBRL(f.ecomTotalLoc)}</span>
                                             <span className="text-[11px] font-black text-cyan-600 bg-cyan-100/50 px-2 py-0.5 rounded mt-1 border border-cyan-200/50">{formatPercent(f.ecomShareLoc)} Share</span>
-                                        </div>
-                                    </td>
-                                    <td className="py-3 px-6 text-sm font-bold text-blue-600 text-right whitespace-nowrap bg-blue-50/20">{formatPercent(f.participacao)}</td>
-                                    <td className="py-3 px-6 text-sm font-medium text-right text-gray-700 min-w-[140px] whitespace-nowrap">
-                                        <div className="flex items-center justify-end gap-2">
-                                            <div className="w-16 bg-gray-100 rounded-full h-1.5 overflow-hidden">
-                                                <div className={`h-full rounded-full ${f.rentabilidade > 30 ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{width: `${Math.min(100, Math.max(0, f.rentabilidade))}%`}}></div>
-                                            </div>
-                                            <span className="w-12">{formatPercent(f.rentabilidade)}</span>
                                         </div>
                                     </td>
                                     <td className="py-3 px-6 text-sm font-bold text-rose-500 text-right whitespace-nowrap bg-rose-50/20">{formatNumber(f.devolucoes)}</td>
