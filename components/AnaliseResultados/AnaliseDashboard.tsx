@@ -34,7 +34,19 @@ interface RawDataState {
     rawLinesVendas: SalesGroupData[];
     rawLinesEcom: { branchName: string, valor: number }[];
     rawBranchTickets: Record<string, number>;
+    rawBranchDevols?: Record<string, number>;
+    vendasUpdatedAt?: string;
 }
+
+const formatDateToBr = (dateStr?: string) => {
+    if (!dateStr) return '';
+    try {
+        const d = new Date(dateStr);
+        return d.toLocaleDateString('pt-BR') + ' às ' + d.toLocaleTimeString('pt-BR', {hour12: false});
+    } catch {
+        return '';
+    }
+};
 
 export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser, companies = [] }) => {
     const dashboardRef = useRef<HTMLDivElement>(null);
@@ -294,7 +306,8 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     rawLinesVendas: parsedVendas,
                     rawLinesEcom: parsedEcom,
                     rawBranchTickets: rawBranchTickets,
-                    rawBranchDevols: rawBranchDevols
+                    rawBranchDevols: rawBranchDevols,
+                    vendasUpdatedAt: String(vendasFileMeta.updated_at || vendasFileMeta.created_at || '')
                 });
 
             } catch (err: any) {
@@ -651,6 +664,12 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                             Comparativo matriz das lojas {selectedArea !== 'ALL' ? `da ${selectedArea}` : 'de toda a rede'}
                         </p>
                     </div>
+                    {rawState.vendasUpdatedAt && (
+                        <div className="flex flex-col items-end border border-gray-200 bg-white rounded-xl px-4 py-2 shadow-sm">
+                            <span className="text-[9px] font-black uppercase tracking-widest text-gray-400">Atualizado em</span>
+                            <span className="text-sm font-bold text-gray-700">{formatDateToBr(rawState.vendasUpdatedAt)}</span>
+                        </div>
+                    )}
                 </div>
                 <div className="relative z-10 custom-scrollbar transition-all duration-300 overflow-visible w-full min-w-full">
                     <table className="w-full text-left border-collapse min-w-[700px]">
