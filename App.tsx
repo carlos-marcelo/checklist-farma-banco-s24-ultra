@@ -1484,6 +1484,11 @@ const App: React.FC = () => {
     const [isLoadingDashboardAudits, setIsLoadingDashboardAudits] = useState(false);
     const [dashboardAuditsError, setDashboardAuditsError] = useState<string | null>(null);
     const [dashboardAuditsFetchedAt, setDashboardAuditsFetchedAt] = useState<string | null>(null);
+    const [dashboardCompletedAuditSessions, setDashboardCompletedAuditSessions] = useState<SupabaseService.DbAuditSession[]>([]);
+    const [isLoadingCompletedDashboardAudits, setIsLoadingCompletedDashboardAudits] = useState(false);
+    const [completedDashboardAuditsError, setCompletedDashboardAuditsError] = useState<string | null>(null);
+    const [completedDashboardAuditsFetchedAt, setCompletedDashboardAuditsFetchedAt] = useState<string | null>(null);
+    const [completedAuditNumberFilter, setCompletedAuditNumberFilter] = useState<string>('all');
     const [auditJumpFilial, setAuditJumpFilial] = useState<string>('');
 
     // Logs & Eventos
@@ -4805,6 +4810,97 @@ const App: React.FC = () => {
         }
     }, [currentUser, dashboardAuditBranchCandidates]);
 
+    const loadCompletedDashboardAuditSessions = useCallback(async () => {
+        if (!currentUser) return;
+        setIsLoadingCompletedDashboardAudits(true);
+        setCompletedDashboardAuditsError(null);
+        try {
+            const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates)).filter(Boolean);
+            let metadataQuery = supabase
+                .from('audit_sessions')
+                .select('id, branch, audit_number, status, progress, user_email, created_at, updated_at')
+                .eq('status', 'completed')
+                .order('updated_at', { ascending: false })
+                .limit(1000); // We might need a larger limit for completed audits
+
+            if (queryBranches.length > 0) {
+                metadataQuery = metadataQuery.in('branch', queryBranches);
+            }
+
+            const { data: metadataRowsRaw, error: metadataError } = await metadataQuery;
+            if (metadataError) throw metadataError;
+
+            const metadataRows = (metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>;
+            const scopedMetadata = currentUser.role === 'MASTER'
+                ? metadataRows
+                : metadataRows.filter(session => {
+                    const currentBranch = String(currentUser.filial || '').trim();
+                    if (!currentBranch) return false;
+                    const sessionRaw = String(session.branch || '').trim();
+                    if (sessionRaw === currentBranch) return true;
+                    return normalizeBranchLabel(sessionRaw) === normalizeBranchLabel(currentBranch);
+                });
+
+            // Keep the latest completed session per branch and audit_number
+            const latestByBranchAndNumber = new Map<string, typeof scopedMetadata[number]>();
+            scopedMetadata.forEach((session) => {
+                const branchLabel = normalizeBranchLabel(session.branch);
+                const auditNumber = Number(session.audit_number || 0);
+                const key = `${branchLabel}_${auditNumber}`;
+                const prev = latestByBranchAndNumber.get(key);
+                if (!prev) {
+                    latestByBranchAndNumber.set(key, session);
+                    return;
+                }
+                const prevTs = Date.parse(String(prev.updated_at || prev.created_at || '')) || 0;
+                const curTs = Date.parse(String(session.updated_at || session.created_at || '')) || 0;
+                if (curTs > prevTs) {
+                    latestByBranchAndNumber.set(key, session);
+                }
+            });
+
+            const latestMetadata = Array.from(latestByBranchAndNumber.values()).filter(s => !!s.id);
+            const detailIds = latestMetadata.map(s => String(s.id));
+
+            if (detailIds.length === 0) {
+                setDashboardCompletedAuditSessions([]);
+                setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
+                return;
+            }
+
+            const chunkSize = 30;
+            const detailBatches: string[][] = [];
+            for (let i = 0; i < detailIds.length; i += chunkSize) {
+                detailBatches.push(detailIds.slice(i, i + chunkSize));
+            }
+
+            const detailResults = await Promise.all(detailBatches.map(async (batch) => {
+                const { data: detailRows, error: detailError } = await supabase
+                    .from('audit_sessions')
+                    .select('id, branch, audit_number, status, progress, data, user_email, created_at, updated_at')
+                    .in('id', batch);
+                if (detailError) throw detailError;
+                return (detailRows || []) as SupabaseService.DbAuditSession[];
+            }));
+
+            const detailedRows = detailResults.flat();
+            const detailsById = new Map(detailedRows.map(row => [String(row.id), row]));
+            const resolvedRows = latestMetadata
+                .map((meta) => detailsById.get(String(meta.id)))
+                .filter((row): row is SupabaseService.DbAuditSession => Boolean(row));
+
+            setDashboardCompletedAuditSessions(resolvedRows);
+            setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
+        } catch (error) {
+            console.error('Erro ao carregar sessões concluídas de auditoria para o dashboard:', error);
+            setDashboardCompletedAuditSessions([]);
+            setCompletedDashboardAuditsError('Não foi possível carregar auditorias concluídas agora.');
+        } finally {
+            setIsLoadingCompletedDashboardAudits(false);
+        }
+    }, [currentUser, dashboardAuditBranchCandidates]);
+
+
     useEffect(() => {
         const previousView = prevViewRef.current;
         prevViewRef.current = currentView;
@@ -4813,9 +4909,10 @@ const App: React.FC = () => {
         // Atualiza automaticamente apenas ao ENTRAR na tela de dashboard.
         // Em F5, o currentUser pode chegar depois e previousView já ser "dashboard".
         // Nesse caso, se ainda não houve carga ("Aguardando carga"), deve carregar.
-        if (previousView === 'dashboard' && dashboardAuditsFetchedAt) return;
+        if (previousView === 'dashboard' && dashboardAuditsFetchedAt && completedDashboardAuditsFetchedAt) return;
         void loadDashboardAuditSessions();
-    }, [currentView, currentUser, loadDashboardAuditSessions, dashboardAuditsFetchedAt]);
+        void loadCompletedDashboardAuditSessions();
+    }, [currentView, currentUser, loadDashboardAuditSessions, loadCompletedDashboardAuditSessions, dashboardAuditsFetchedAt, completedDashboardAuditsFetchedAt]);
 
     const logBranchOptions = useMemo(() => {
         // Usa Map normalizado para deduplicar variações: '8' e 'Filial 8' → 'Filial 8'
@@ -5617,6 +5714,584 @@ const App: React.FC = () => {
 
         return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
     }, [dashboardAuditSessions, scopedCompanies, scopedUsers]);
+
+    const dashboardCompletedAuditOverview = useMemo(() => {
+        type BranchMetric = {
+            branch: string;
+            area: string;
+            auditNumber: number;
+            updatedAt: string;
+            progressPct: number;
+            totalSkus: number;
+            countedSkus: number;
+            pendingSkus: number;
+            totalUnits: number;
+            countedUnits: number;
+            pendingUnits: number;
+            totalCost: number;
+            pendingCost: number;
+            diffQty: number;
+            diffCost: number;
+            countedCost: number;
+            divergencePct: number;
+            termsWithExcel: number;
+        };
+
+        const branchToArea = new Map<string, string>();
+        scopedCompanies.forEach(c => {
+            (c.areas || []).forEach((area: any) => {
+                const areaName = String(area?.name || '').trim() || 'Sem Área';
+                (area.branches || []).forEach((branch: string) => {
+                    const normalized = normalizeBranchLabel(branch);
+                    branchToArea.set(normalized, areaName);
+                });
+            });
+        });
+        scopedUsers.forEach(u => {
+            const normalized = normalizeBranchLabel(u.filial || '');
+            if (normalized === 'Sem Filial') return;
+            if (!branchToArea.has(normalized)) {
+                branchToArea.set(normalized, (u.area || 'Sem Área').trim() || 'Sem Área');
+            }
+        });
+
+        const latestByBranch = new Map<string, SupabaseService.DbAuditSession>();
+        dashboardCompletedAuditSessions.forEach(session => {
+            if (completedAuditNumberFilter !== 'all' && String(session.audit_number || 0) !== completedAuditNumberFilter) {
+                return;
+            }
+            const branchLabel = normalizeBranchLabel(session.branch);
+            const prev = latestByBranch.get(branchLabel);
+            if (!prev) {
+                latestByBranch.set(branchLabel, session);
+                return;
+            }
+            const prevAudit = Number(prev.audit_number || 0);
+            const curAudit = Number(session.audit_number || 0);
+            if (curAudit > prevAudit) {
+                latestByBranch.set(branchLabel, session);
+                return;
+            }
+            if (curAudit < prevAudit) return;
+            const prevTs = Date.parse(String(prev.updated_at || prev.created_at || '')) || 0;
+            const curTs = Date.parse(String(session.updated_at || session.created_at || '')) || 0;
+            if (curTs > prevTs || (curTs === prevTs && Number(session.audit_number || 0) > Number(prev.audit_number || 0))) {
+                latestByBranch.set(branchLabel, session);
+            }
+        });
+
+        const branches: BranchMetric[] = [];
+        const uniqueSkuSet = new Set<string>();
+        const uniqueSkuDoneSet = new Set<string>();
+        const normalizeProductCode = (value: unknown) =>
+            String(value ?? '')
+                .trim()
+                .replace(/\D/g, '')
+                .replace(/^0+/, '');
+        latestByBranch.forEach((session, branchLabel) => {
+            const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+            const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
+
+            const skuMap = new Map<string, { units: number; cost: number; done: boolean }>();
+            const fallbackCategoryKeys = new Set<string>();
+            let fallbackTotalSkus = 0;
+            let fallbackCountedSkus = 0;
+            let fallbackTotalUnits = 0;
+            let fallbackCountedUnits = 0;
+            let fallbackTotalCost = 0;
+            let fallbackCountedCost = 0;
+
+            groups.forEach((group: any) => {
+                (group?.departments || []).forEach((dept: any) => {
+                    (dept?.categories || []).forEach((cat: any) => {
+                        const itemsCount = Number(cat?.itemsCount || 0);
+                        const units = Number(cat?.totalQuantity || 0);
+                        const cost = Number(cat?.totalCost || 0);
+                        const status = normalizeAuditCategoryStatus(cat?.status);
+                        const products = Array.isArray(cat?.products) ? cat.products : [];
+                        const groupKey = String(group?.id || group?.name || '').trim();
+                        const deptKey = String(dept?.numericId || dept?.id || dept?.name || '').trim();
+                        const catKey = String(cat?.id || cat?.numericId || cat?.name || '').trim();
+                        const fallbackKey = `${groupKey}|${deptKey}|${catKey}`;
+
+                        if (products.length > 0) {
+                            products.forEach((p: any) => {
+                                const code = normalizeProductCode(p?.reducedCode || p?.code || '');
+                                if (!code) return;
+                                const productUnits = Number(p?.quantity || 0);
+                                const unitCost = Number(p?.cost || 0);
+                                const productCost = productUnits * unitCost;
+                                const prev = skuMap.get(code) || { units: 0, cost: 0, done: false };
+                                // Dedup defensivo: se o mesmo SKU vier duplicado na estrutura, mantém o maior valor.
+                                skuMap.set(code, {
+                                    units: Math.max(prev.units, productUnits),
+                                    cost: Math.max(prev.cost, productCost),
+                                    done: prev.done || status === 'done'
+                                });
+                            });
+                        } else if (!fallbackCategoryKeys.has(fallbackKey)) {
+                            fallbackCategoryKeys.add(fallbackKey);
+                            fallbackTotalSkus += itemsCount;
+                            fallbackTotalUnits += units;
+                            fallbackTotalCost += cost;
+                            if (status === 'done') {
+                                fallbackCountedSkus += itemsCount;
+                                fallbackCountedUnits += units;
+                                fallbackCountedCost += cost;
+                            }
+                        }
+                    });
+                });
+            });
+
+            let totalSkus = fallbackTotalSkus;
+            let countedSkus = fallbackCountedSkus;
+            let totalUnits = fallbackTotalUnits;
+            let countedUnits = fallbackCountedUnits;
+            let totalCost = fallbackTotalCost;
+            let countedCost = fallbackCountedCost;
+            skuMap.forEach((sku, code) => {
+                totalSkus += 1;
+                totalUnits += sku.units;
+                totalCost += sku.cost;
+                if (sku.done) {
+                    countedSkus += 1;
+                    countedUnits += sku.units;
+                    countedCost += sku.cost;
+                }
+                uniqueSkuSet.add(code);
+                if (sku.done) uniqueSkuDoneSet.add(code);
+            });
+
+            let diffQty = 0;
+            let diffCost = 0;
+            let termsWithExcel = 0;
+            const termDraftEntries: Array<[string, any]> = parsedData?.termDrafts && typeof parsedData.termDrafts === 'object'
+                ? Object.entries(parsedData.termDrafts)
+                : [];
+            const backupMetricsByKey: Record<string, any> = parsedData?.termExcelMetricsByKey && typeof parsedData.termExcelMetricsByKey === 'object'
+                ? parsedData.termExcelMetricsByKey
+                : {};
+            const normalizeScopeId = (value: unknown) => String(value ?? '').trim().toLowerCase();
+            const normalizeDigits = (value: unknown) => String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
+            const normalizeText = (value: unknown) =>
+                String(value ?? '')
+                    .normalize('NFD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toLowerCase()
+                    .replace(/\s+/g, ' ')
+                    .trim();
+            const makeAliasSet = (values: unknown[]) => {
+                const set = new Set<string>();
+                values.forEach(v => {
+                    const raw = normalizeScopeId(v);
+                    if (raw) set.add(raw);
+                    const digits = normalizeDigits(v);
+                    if (digits) set.add(digits);
+                });
+                return set;
+            };
+            const sumRows = (rows: any[]) => rows.reduce((acc, curr) => ({
+                diffQty: acc.diffQty + Number(curr?.diffQty || 0),
+                diffCost: acc.diffCost + Number(curr?.diffCost || 0)
+            }), { diffQty: 0, diffCost: 0 });
+            const mergeExcelMetricsPools = (pools: any[]) => {
+                const validPools = (pools || []).filter(Boolean);
+                if (validPools.length === 0) return null;
+                if (validPools.length === 1) return validPools[0];
+
+                const uniqueItems = new Map<string, any>();
+                validPools.forEach((pool: any) => {
+                    (Array.isArray(pool?.items) ? pool.items : []).forEach((it: any) => {
+                        const keyObj = {
+                            code: normalizeDigits(it?.code || it?.reducedCode),
+                            groupId: normalizeScopeId(it?.groupId),
+                            deptId: normalizeScopeId(it?.deptId),
+                            catId: normalizeScopeId(it?.catId),
+                            groupName: normalizeText(it?.groupName),
+                            deptName: normalizeText(it?.deptName),
+                            catName: normalizeText(it?.catName),
+                            sysQty: Number(it?.sysQty || 0),
+                            countedQty: Number(it?.countedQty || 0),
+                            diffQty: Number(it?.diffQty || 0),
+                            sysCost: Number(it?.sysCost || 0),
+                            countedCost: Number(it?.countedCost || 0),
+                            diffCost: Number(it?.diffCost || 0)
+                        };
+                        const key = JSON.stringify(keyObj);
+                        if (!uniqueItems.has(key)) uniqueItems.set(key, it);
+                    });
+                });
+
+                if (uniqueItems.size > 0) {
+                    const items = Array.from(uniqueItems.values());
+                    const groupedMap: Record<string, any> = {};
+                    items.forEach((it: any) => {
+                        const gId = normalizeScopeId(it?.groupId);
+                        const dId = normalizeScopeId(it?.deptId);
+                        const cId = normalizeScopeId(it?.catId);
+                        const g = it?.groupName || '';
+                        const d = it?.deptName || '';
+                        const c = it?.catName || '';
+                        const key = `${gId || g}|${dId || d}|${cId || c}`;
+                        if (!groupedMap[key]) {
+                            groupedMap[key] = {
+                                groupId: gId || undefined,
+                                deptId: dId || undefined,
+                                catId: cId || undefined,
+                                groupName: g,
+                                deptName: d,
+                                catName: c,
+                                diffQty: 0,
+                                diffCost: 0
+                            };
+                        }
+                        groupedMap[key].diffQty += Number(it?.diffQty || 0);
+                        groupedMap[key].diffCost += Number(it?.diffCost || 0);
+                    });
+                    return { items, groupedDifferences: Object.values(groupedMap) };
+                }
+
+                return {
+                    items: [],
+                    groupedDifferences: validPools.flatMap((pool: any) => Array.isArray(pool?.groupedDifferences) ? pool.groupedDifferences : [])
+                };
+            };
+
+            const termKeys = new Set<string>([
+                ...termDraftEntries.map(([k]) => String(k || '')),
+                ...Object.keys(backupMetricsByKey || {})
+            ]);
+            // Alinhamento com o módulo:
+            // - pool geral considera apenas termDrafts ativos (excelMetrics presentes e não removidos)
+            // - backup por key só é usado no acesso direto do escopo (getScopedMetricsLocal)
+            const pools = termDraftEntries
+                .map(([, draft]) => {
+                    if (!draft?.excelMetrics) return null;
+                    if (draft?.excelMetricsRemovedAt && !draft?.excelMetrics) return null;
+                    return draft.excelMetrics;
+                })
+                .filter(Boolean);
+            termsWithExcel = pools.length;
+            const mergedMetrics = mergeExcelMetricsPools(pools as any[]);
+            const scopedRows = Array.isArray(mergedMetrics?.items) && mergedMetrics.items.length > 0
+                ? mergedMetrics.items
+                : (Array.isArray(mergedMetrics?.groupedDifferences) ? mergedMetrics.groupedDifferences : []);
+
+            const groupNameToIds = new Map<string, Set<string>>();
+            groups.forEach((group: any) => {
+                const key = normalizeText(group?.name);
+                if (!key) return;
+                const ids = groupNameToIds.get(key) || new Set<string>();
+                makeAliasSet([group?.id]).forEach(id => ids.add(id));
+                groupNameToIds.set(key, ids);
+            });
+            const matchByUniqueName = (nameMap: Map<string, Set<string>>, rowName: unknown, targetAliases: Set<string>) => {
+                const key = normalizeText(rowName);
+                if (!key) return false;
+                const ids = nameMap.get(key);
+                if (!ids || ids.size !== 1) return false;
+                const only = Array.from(ids)[0];
+                return targetAliases.has(only);
+            };
+            const partialScopeKey = (s: { groupId?: string; deptId?: string; catId?: string }) => [s.groupId || '', s.deptId || '', s.catId || ''].join('|');
+            const getScopeCategories = (groupId?: string, deptId?: string, catId?: string) => {
+                const out: Array<{ group: any; dept: any; cat: any }> = [];
+                (groups || []).forEach((group: any) => {
+                    if (groupId && normalizeScopeId(group.id) !== normalizeScopeId(groupId)) return;
+                    (group.departments || []).forEach((dept: any) => {
+                        if (deptId && normalizeScopeId(dept.id) !== normalizeScopeId(deptId)) return;
+                        (dept.categories || []).forEach((cat: any) => {
+                            if (catId && normalizeScopeId(cat.id) !== normalizeScopeId(catId)) return;
+                            out.push({ group, dept, cat });
+                        });
+                    });
+                });
+                return out;
+            };
+            const buildTermKey = (scope: { type: 'group' | 'department' | 'category'; groupId: string; deptId?: string; catId?: string }) =>
+                [scope.type, scope.groupId || '', scope.deptId || '', scope.catId || ''].join('|');
+            const parseCustomDraftKey = (draftKey: string) => {
+                const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
+                if (!match) return null as null | { batchId?: string; scopesPart: string };
+                const hasNewFormat = typeof match[2] === 'string';
+                if (hasNewFormat) return { batchId: (match[1] || '').trim() || undefined, scopesPart: match[2] || '' };
+                return { batchId: undefined, scopesPart: match[1] || '' };
+            };
+            const getScopedMetricsLocal = (scope: { type: 'group' | 'department' | 'category'; group: any; dept?: any; cat?: any }) => {
+                const scopeGroupId = String(scope.group?.id || '');
+                const scopeDeptId = scope.dept ? String(scope.dept?.id || '') : undefined;
+                const scopeCatId = scope.cat ? String(scope.cat?.id || '') : undefined;
+                const key = buildTermKey({
+                    type: scope.type,
+                    groupId: scopeGroupId,
+                    deptId: scopeDeptId,
+                    catId: scopeCatId
+                });
+                const draft = (parsedData?.termDrafts || {})[key];
+                const backup = backupMetricsByKey[key];
+                if (draft?.excelMetricsRemovedAt && !draft?.excelMetrics) return null;
+                const draftMetrics = draft?.excelMetrics || backup || null;
+
+                const groupNameToIds = new Map<string, Set<string>>();
+                (groups || []).forEach((g: any) => {
+                    const keyName = normalizeText(g.name);
+                    if (!keyName) return;
+                    const ids = groupNameToIds.get(keyName) || new Set<string>();
+                    makeAliasSet([g.id]).forEach(id => ids.add(id));
+                    groupNameToIds.set(keyName, ids);
+                });
+                const deptNameToIds = new Map<string, Set<string>>();
+                (scope.group?.departments || []).forEach((d: any) => {
+                    const keyName = normalizeText(d.name);
+                    if (!keyName) return;
+                    const ids = deptNameToIds.get(keyName) || new Set<string>();
+                    makeAliasSet([d.id, d.numericId]).forEach(id => ids.add(id));
+                    deptNameToIds.set(keyName, ids);
+                });
+                const catNameToIds = new Map<string, Set<string>>();
+                (scope.dept?.categories || []).forEach((c: any) => {
+                    const keyName = normalizeText(c.name);
+                    if (!keyName) return;
+                    const ids = catNameToIds.get(keyName) || new Set<string>();
+                    makeAliasSet([c.id, c.numericId]).forEach(id => ids.add(id));
+                    catNameToIds.set(keyName, ids);
+                });
+                const groupAliases = makeAliasSet([scopeGroupId, scope.group?.id]);
+                const deptAliases = makeAliasSet([scopeDeptId, scope.dept?.id, scope.dept?.numericId]);
+                const catAliases = makeAliasSet([scopeCatId, scope.cat?.id, scope.cat?.numericId]);
+                const groupName = normalizeText(scope.group?.name);
+                const deptName = normalizeText(scope.dept?.name);
+                const catName = normalizeText(scope.cat?.name);
+                const matchScopeRecord = (row: any) => {
+                    const rowG = normalizeScopeId(row?.groupId);
+                    const rowD = normalizeScopeId(row?.deptId);
+                    const rowC = normalizeScopeId(row?.catId);
+                    const matchG = rowG
+                        ? (groupAliases.has(rowG) || groupAliases.has(normalizeDigits(rowG)))
+                        : (normalizeText(row?.groupName) === groupName && matchByUniqueName(groupNameToIds, row?.groupName, groupAliases));
+                    if (!matchG) return false;
+                    if (scope.type === 'group') return true;
+                    const matchD = rowD
+                        ? (deptAliases.has(rowD) || deptAliases.has(normalizeDigits(rowD)))
+                        : (normalizeText(row?.deptName) === deptName && matchByUniqueName(deptNameToIds, row?.deptName, deptAliases));
+                    if (!matchD) return false;
+                    if (scope.type === 'department') return true;
+                    const matchC = rowC
+                        ? (catAliases.has(rowC) || catAliases.has(normalizeDigits(rowC)))
+                        : (normalizeText(row?.catName) === catName && matchByUniqueName(catNameToIds, row?.catName, catAliases));
+                    return matchC;
+                };
+
+                if (draftMetrics) {
+                    const directItems = (Array.isArray(draftMetrics?.items) ? draftMetrics.items : []).filter((it: any) => matchScopeRecord(it));
+                    const directGrouped = (Array.isArray(draftMetrics?.groupedDifferences) ? draftMetrics.groupedDifferences : []).filter((it: any) => matchScopeRecord(it));
+                    const source = directItems.length > 0 ? directItems : (directGrouped.length > 0 ? directGrouped : null);
+                    return source ? sumRows(source) : null;
+                }
+
+                const targetCatKeys = new Set(
+                    getScopeCategories(scopeGroupId, scopeDeptId, scopeCatId)
+                        .map(({ group, dept, cat }) => partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id }))
+                );
+                const draftTouchesScope = (draftKey: string) => {
+                    if (targetCatKeys.size === 0) return false;
+                    if (draftKey.startsWith('custom|')) {
+                        const meta = parseCustomDraftKey(draftKey);
+                        const scopedKeys = (meta?.scopesPart || '').split(',').filter(Boolean);
+                        for (const scopeKey of scopedKeys) {
+                            const [g, d, c] = scopeKey.split('|');
+                            const expanded = getScopeCategories(g || undefined, d || undefined, c || undefined);
+                            for (const { group, dept, cat } of expanded) {
+                                if (targetCatKeys.has(partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id }))) return true;
+                            }
+                        }
+                        return false;
+                    }
+                    const [type, g, d, c] = draftKey.split('|');
+                    if (!type || type === 'custom') return false;
+                    const expanded = getScopeCategories(g || undefined, d || undefined, c || undefined);
+                    for (const { group, dept, cat } of expanded) {
+                        if (targetCatKeys.has(partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id }))) return true;
+                    }
+                    return false;
+                };
+                const scopedPools = termDraftEntries
+                    .filter(([draftKey, draftValue]) => {
+                        if (!draftValue?.excelMetrics || draftValue?.excelMetricsRemovedAt) return false;
+                        return draftTouchesScope(String(draftKey || ''));
+                    })
+                    .map(([, draftValue]) => draftValue.excelMetrics)
+                    .filter(Boolean);
+                const base = mergeExcelMetricsPools(scopedPools as any[]);
+                // Alinhamento exato com o módulo: no fallback sem termo direto,
+                // a filtragem é feita somente em groupedDifferences.
+                if (!base || !Array.isArray(base.groupedDifferences)) return null;
+                const scopeGroupIdNorm = normalizeScopeId(scopeGroupId);
+                const scopeDeptIdNorm = normalizeScopeId(scopeDeptId);
+                const scopeCatIdNorm = normalizeScopeId(scopeCatId);
+                const filtered = (base.groupedDifferences || []).filter((row: any) => {
+                    const hasGroupId = !!normalizeScopeId(row?.groupId);
+                    const hasDeptId = !!normalizeScopeId(row?.deptId);
+                    const hasCatId = !!normalizeScopeId(row?.catId);
+                    const matchG = hasGroupId
+                        ? normalizeScopeId(row?.groupId) === scopeGroupIdNorm
+                        : normalizeText(row?.groupName) === groupName;
+                    if (scope.type === 'group') return matchG;
+                    const matchD = hasDeptId
+                        ? normalizeScopeId(row?.deptId) === scopeDeptIdNorm
+                        : normalizeText(row?.deptName) === deptName;
+                    if (scope.type === 'department') return matchG && matchD;
+                    const matchC = hasCatId
+                        ? normalizeScopeId(row?.catId) === scopeCatIdNorm
+                        : normalizeText(row?.catName) === catName;
+                    return matchG && matchD && matchC;
+                });
+                return filtered.length > 0 ? sumRows(filtered) : null;
+            };
+
+            groups.forEach((group: any) => {
+                const groupDirect = getScopedMetricsLocal({ type: 'group', group });
+                const deptMetrics = (group?.departments || [])
+                    .map((dept: any) => getScopedMetricsLocal({ type: 'department', group, dept }))
+                    .filter(Boolean) as Array<{ diffQty: number; diffCost: number }>;
+
+                let groupMetric = groupDirect || { diffQty: 0, diffCost: 0 };
+                if (deptMetrics.length > 0) {
+                    const byDepartments = sumRows(deptMetrics as any[]);
+                    if (!groupDirect) {
+                        groupMetric = byDepartments;
+                    } else {
+                        const hasRelevantMismatch =
+                            Math.abs(Number(groupDirect.diffQty || 0) - Number(byDepartments.diffQty || 0)) > 0.01 ||
+                            Math.abs(Number(groupDirect.diffCost || 0) - Number(byDepartments.diffCost || 0)) > 0.01;
+                        groupMetric = hasRelevantMismatch ? byDepartments : groupDirect;
+                    }
+                }
+
+                diffQty += Number(groupMetric.diffQty || 0);
+                diffCost += Number(groupMetric.diffCost || 0);
+            });
+
+            const pendingSkus = Math.max(0, totalSkus - countedSkus);
+            const pendingUnits = Math.max(0, totalUnits - countedUnits);
+            const pendingCost = Math.max(0, totalCost - countedCost);
+            const progressPct = totalUnits > 0
+                ? (countedUnits / totalUnits) * 100
+                : Number(session.progress || 0);
+            const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
+
+            branches.push({
+                branch: branchLabel,
+                area: branchToArea.get(branchLabel) || 'Sem Área',
+                auditNumber: Number(session.audit_number || 0),
+                updatedAt: String(session.updated_at || session.created_at || ''),
+                progressPct,
+                totalSkus,
+                countedSkus,
+                pendingSkus,
+                totalUnits,
+                countedUnits,
+                pendingUnits,
+                totalCost,
+                pendingCost,
+                diffQty,
+                diffCost,
+                countedCost,
+                divergencePct,
+                termsWithExcel
+            });
+        });
+
+        const getBranchOrder = (label: string) => {
+            const numeric = Number((String(label || '').match(/\d+/)?.[0] || '999999'));
+            return Number.isFinite(numeric) ? numeric : 999999;
+        };
+        branches.sort((a, b) => getBranchOrder(a.branch) - getBranchOrder(b.branch));
+
+        const areaMap = new Map<string, {
+            area: string;
+            branches: number;
+            totalSkus: number;
+            countedSkus: number;
+            pendingSkus: number;
+            totalUnits: number;
+            countedUnits: number;
+            pendingUnits: number;
+            countedCost: number;
+            diffQty: number;
+            diffCost: number;
+        }>();
+
+        branches.forEach(item => {
+            const current = areaMap.get(item.area) || {
+                area: item.area,
+                branches: 0,
+                totalSkus: 0,
+                countedSkus: 0,
+                pendingSkus: 0,
+                totalUnits: 0,
+                countedUnits: 0,
+                pendingUnits: 0,
+                countedCost: 0,
+                diffQty: 0,
+                diffCost: 0
+            };
+            current.branches += 1;
+            current.totalSkus += item.totalSkus;
+            current.countedSkus += item.countedSkus;
+            current.pendingSkus += item.pendingSkus;
+            current.totalUnits += item.totalUnits;
+            current.countedUnits += item.countedUnits;
+            current.pendingUnits += item.pendingUnits;
+            current.countedCost += item.countedCost;
+            current.diffQty += item.diffQty;
+            current.diffCost += item.diffCost;
+            areaMap.set(item.area, current);
+        });
+
+        const areas = Array.from(areaMap.values()).sort((a, b) => a.area.localeCompare(b.area, 'pt-BR'));
+        const summary = branches.reduce((acc, item) => {
+            acc.openAudits += 1;
+            acc.totalSkus += item.totalSkus;
+            acc.countedSkus += item.countedSkus;
+            acc.pendingSkus += item.pendingSkus;
+            acc.totalUnits += item.totalUnits;
+            acc.countedUnits += item.countedUnits;
+            acc.pendingUnits += item.pendingUnits;
+            acc.totalCost += item.totalCost;
+            acc.pendingCost += item.pendingCost;
+            acc.countedCost += item.countedCost;
+            acc.diffQty += item.diffQty;
+            acc.diffCost += item.diffCost;
+            return acc;
+        }, {
+            openAudits: 0,
+            totalSkus: 0,
+            countedSkus: 0,
+            pendingSkus: 0,
+            totalUnits: 0,
+            countedUnits: 0,
+            pendingUnits: 0,
+            totalCost: 0,
+            pendingCost: 0,
+            countedCost: 0,
+            diffQty: 0,
+            diffCost: 0
+        });
+
+        const accumulatedPct = summary.totalUnits > 0
+            ? (summary.countedUnits / summary.totalUnits) * 100
+            : 0;
+        const uniqueTotalSkus = uniqueSkuSet.size;
+        const uniqueCountedSkus = uniqueSkuDoneSet.size;
+        const uniquePendingSkus = Math.max(0, uniqueTotalSkus - uniqueCountedSkus);
+        const summaryDivergencePct = summary.countedCost > 0
+            ? (summary.diffCost / summary.countedCost) * 100
+            : 0;
+
+        return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
+    }, [dashboardCompletedAuditSessions, scopedCompanies, scopedUsers, completedAuditNumberFilter]);
 
     const handleOpenAuditFromDashboardBranch = useCallback((branchLabel: string) => {
         const raw = String(branchLabel || '').trim();
@@ -9348,6 +10023,7 @@ const App: React.FC = () => {
                     )}
 
                     {/* --- DASHBOARD VIEW (BI EM CONSTRUÇÃO) --- */}
+{/* --- DASHBOARD VIEW (BI EM CONSTRUÇÃO) --- */}
                     {currentView === 'dashboard' && (
                         <div className="max-w-6xl mx-auto space-y-8 animate-fade-in pb-24">
                             <div className="bg-white/80 backdrop-blur-xl border border-white/50 rounded-[32px] shadow-card p-10">
@@ -9369,7 +10045,14 @@ const App: React.FC = () => {
                                     <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                                         <div>
                                             <p className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-500">Auditoria de Estoque</p>
-                                            <h3 className="text-xl font-black text-gray-900">Resumo de Auditorias Abertas</h3>
+                                            <div className="flex items-center gap-3">
+                                                <h3 className="text-xl font-black text-gray-900">Resumo de Auditorias Abertas</h3>
+                                                {dashboardCompletedAuditOverview.summary.openAudits > 0 && (
+                                                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-green-100 text-green-800 border border-green-200 uppercase tracking-widest">
+                                                        {dashboardCompletedAuditOverview.summary.openAudits} concluída{dashboardCompletedAuditOverview.summary.openAudits !== 1 ? 's' : ''}
+                                                    </span>
+                                                )}
+                                            </div>
                                         </div>
                                         <div className="flex items-center justify-end gap-3">
                                             <span className="text-[10px] leading-none font-bold text-gray-400 uppercase tracking-widest whitespace-nowrap text-right">
@@ -9503,6 +10186,171 @@ const App: React.FC = () => {
                                                             onClick={() => handleOpenAuditFromDashboardBranch(branch.branch)}
                                                             className="w-full text-left rounded-xl border border-gray-100 px-3 py-2 hover:border-indigo-200 hover:bg-indigo-50/30 transition-colors"
                                                             title={`Abrir Auditoria da ${branch.branch}`}
+                                                        >
+                                                            <div className="flex items-center justify-between gap-3">
+                                                                <p className="text-sm font-black text-gray-800">{branch.branch}</p>
+                                                                <span className="text-[10px] font-black uppercase tracking-widest text-indigo-500">Inv. {branch.auditNumber}</span>
+                                                            </div>
+                                                            <div className="mt-1 grid grid-cols-2 gap-2 text-[11px] font-bold">
+                                                                <span className="text-gray-600 whitespace-nowrap tabular-nums">{branch.countedUnits.toLocaleString('pt-BR')} un. conferidas</span>
+                                                                <span className={`text-right ${branch.diffQty < 0 ? 'text-red-600' : branch.diffQty > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                    {branch.diffQty > 0 ? '+' : ''}{branch.diffQty.toLocaleString('pt-BR', { maximumFractionDigits: 0 })} un.
+                                                                </span>
+                                                                <span className="text-gray-500">{branch.area}</span>
+                                                                <span className={`text-right whitespace-nowrap tabular-nums ${branch.diffCost < 0 ? 'text-red-600' : branch.diffCost > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                    {branch.diffCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                                </span>
+                                                                <span className="text-slate-600 whitespace-nowrap tabular-nums">{branch.countedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                                                                <span className={`text-right whitespace-nowrap tabular-nums ${branch.divergencePct < 0 ? 'text-red-600' : branch.divergencePct > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                    {branch.divergencePct > 0 ? '+' : ''}{branch.divergencePct.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
+                                                                </span>
+                                                            </div>
+                                                            <div className="mt-2 h-2 rounded-full bg-gray-100 overflow-hidden">
+                                                                <div className="h-full rounded-full bg-emerald-500" style={{ width: `${Math.max(0, Math.min(100, branch.progressPct))}%` }} />
+                                                            </div>
+                                                            <p className="mt-1 text-[10px] font-black text-emerald-600 uppercase tracking-widest text-right">
+                                                                {branch.progressPct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%
+                                                            </p>
+                                                        </button>
+                                                    ))
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="sm:col-span-2 lg:col-span-3 bg-white border border-gray-100 rounded-[28px] p-6 shadow-sm space-y-5">
+                                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                                        <div>
+                                            <p className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-500">Auditoria de Estoque</p>
+                                            <h3 className="text-xl font-black text-gray-900">Resumo de Auditorias Concluídas</h3>
+                                        </div>
+                                        <div className="flex items-center justify-end gap-3">
+                                            <select value={completedAuditNumberFilter} onChange={e => setCompletedAuditNumberFilter(e.target.value)} className="px-3 py-2 rounded-xl border border-gray-200 text-xs font-bold text-gray-700 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+                                                <option value="all">Todas as auditorias</option>
+                                                {Array.from(new Set(dashboardCompletedAuditSessions.map(s => String(s.audit_number || 0)))).sort((a,b)=>Number(b)-Number(a)).map(num => (<option key={num} value={num}>Auditoria {num}</option>))}
+                                            </select>
+                                            <span className="text-[10px] leading-none font-bold text-gray-400 uppercase tracking-widest whitespace-nowrap text-right">
+                                                {completedDashboardAuditsFetchedAt ? `Atualizado: ${formatFullDateTime(completedDashboardAuditsFetchedAt)}` : 'Aguardando carga'}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    {completedDashboardAuditsError && (
+                                        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-bold text-red-700">
+                                            {completedDashboardAuditsError}
+                                        </div>
+                                    )}
+
+                                    <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-4 gap-3">
+                                        <div className="rounded-2xl border border-indigo-100 bg-indigo-50/50 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-indigo-500">Auditorias concluídas</p>
+                                            <p className="text-[1.65rem] leading-none font-black text-indigo-700 whitespace-nowrap tabular-nums">{dashboardCompletedAuditOverview.summary.openAudits}</p>
+                                            <p className="text-[9px] font-bold text-indigo-500/80 leading-none">Inventários concluídos com sucesso</p>
+                                        </div>
+                                        <div className="rounded-2xl border border-emerald-100 bg-emerald-50/50 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-500">Qtde conferida</p>
+                                            <p className="text-[1.65rem] leading-none font-black text-emerald-700 whitespace-nowrap tabular-nums">{dashboardCompletedAuditOverview.summary.countedUnits.toLocaleString('pt-BR')}</p>
+                                            <p className="text-[9px] font-bold text-emerald-600/80 leading-none">Unidades já conferidas no físico</p>
+                                            <p className="text-[9px] font-bold text-emerald-600/80 leading-none">Falta conferir un.: {dashboardCompletedAuditOverview.summary.pendingUnits.toLocaleString('pt-BR')}</p>
+                                        </div>
+                                        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Qtde divergência</p>
+                                            <p className={`text-[1.65rem] leading-none font-black whitespace-nowrap tabular-nums ${dashboardCompletedAuditOverview.summary.diffQty < 0 ? 'text-red-600' : dashboardCompletedAuditOverview.summary.diffQty > 0 ? 'text-emerald-600' : 'text-slate-700'}`}>
+                                                {dashboardCompletedAuditOverview.summary.diffQty > 0 ? '+' : ''}{dashboardCompletedAuditOverview.summary.diffQty.toLocaleString('pt-BR', { maximumFractionDigits: 0 })}
+                                            </p>
+                                            <p className="text-[9px] font-bold text-slate-500/80 leading-none">Diferença líquida entre sistema e físico</p>
+                                        </div>
+                                        <div className="rounded-2xl border border-amber-100 bg-amber-50/50 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-amber-500">Falta conferir</p>
+                                            <p className="text-[1.65rem] leading-none font-black text-amber-700 whitespace-nowrap tabular-nums">{dashboardCompletedAuditOverview.uniquePendingSkus.toLocaleString('pt-BR')}</p>
+                                            <p className="text-[9px] font-bold text-amber-700/80 leading-none">SKU único pendente: {dashboardCompletedAuditOverview.uniquePendingSkus.toLocaleString('pt-BR')}</p>
+                                            <p className="text-[9px] font-bold text-amber-700/80 leading-none">SKU único conferido: {dashboardCompletedAuditOverview.uniqueCountedSkus.toLocaleString('pt-BR')}</p>
+                                        </div>
+                                        <div className="rounded-2xl border border-blue-100 bg-blue-50/50 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-blue-500">% conferido acumulado</p>
+                                            <p className="text-[1.65rem] leading-none font-black text-blue-700 whitespace-nowrap tabular-nums">{dashboardCompletedAuditOverview.accumulatedPct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</p>
+                                            <p className="text-[9px] font-bold text-blue-500/80 leading-none">Unidades conferidas / unidades previstas</p>
+                                        </div>
+                                        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Divergência R$</p>
+                                            <p className={`text-[1.5rem] leading-none font-black whitespace-nowrap tabular-nums ${dashboardCompletedAuditOverview.summary.diffCost < 0 ? 'text-red-600' : dashboardCompletedAuditOverview.summary.diffCost > 0 ? 'text-emerald-600' : 'text-slate-700'}`}>
+                                                {dashboardCompletedAuditOverview.summary.diffCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                            </p>
+                                            <p className="text-[9px] font-bold text-slate-500/80 leading-none">Impacto financeiro total das divergências</p>
+                                        </div>
+                                        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Total conferido R$</p>
+                                            <p className="text-[1.5rem] leading-none font-black text-slate-700 whitespace-nowrap tabular-nums">
+                                                {dashboardCompletedAuditOverview.summary.countedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                            </p>
+                                            <p className="text-[9px] font-bold text-slate-500/80 leading-none">Valor em custo do que já foi conferido</p>
+                                            <p className="text-[9px] font-bold text-slate-500/80 leading-none">Falta conferir R$: {dashboardCompletedAuditOverview.summary.pendingCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</p>
+                                        </div>
+                                        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Rep. divergência</p>
+                                            <p className={`text-[1.65rem] leading-none font-black whitespace-nowrap tabular-nums ${dashboardCompletedAuditOverview.summaryDivergencePct < 0 ? 'text-red-600' : dashboardCompletedAuditOverview.summaryDivergencePct > 0 ? 'text-emerald-600' : 'text-slate-700'}`}>
+                                                {dashboardCompletedAuditOverview.summaryDivergencePct > 0 ? '+' : ''}{dashboardCompletedAuditOverview.summaryDivergencePct.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
+                                            </p>
+                                            <p className="text-[9px] font-bold text-slate-500/80 leading-none">Divergência R$ sobre o total conferido</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                                        <div className="rounded-2xl border border-gray-100 bg-white p-4">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-3">Por Área</p>
+                                            <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                                                {dashboardCompletedAuditOverview.areas.length === 0 ? (
+                                                    <p className="text-sm font-semibold text-gray-400">Nenhuma filial com auditoria concluída.</p>
+                                                ) : (
+                                                    dashboardCompletedAuditOverview.areas.map(area => {
+                                                        const pct = area.totalUnits > 0 ? (area.countedUnits / area.totalUnits) * 100 : 0;
+                                                        const areaDivergencePct = area.countedCost > 0 ? (area.diffCost / area.countedCost) * 100 : 0;
+                                                        return (
+                                                            <div key={area.area} className="rounded-xl border border-gray-100 px-3 py-2">
+                                                                <div className="flex items-center justify-between">
+                                                                    <p className="text-sm font-black text-gray-800">{area.area}</p>
+                                                                    <p className="text-[11px] font-bold text-gray-500">{area.branches} filial(is)</p>
+                                                                </div>
+                                                                <div className="mt-1 grid grid-cols-2 gap-2 text-[11px] font-bold">
+                                                                    <span className="text-emerald-600 whitespace-nowrap tabular-nums">{area.countedUnits.toLocaleString('pt-BR')} un. conferidas</span>
+                                                                    <span className={`text-right ${area.diffQty < 0 ? 'text-red-600' : area.diffQty > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                        {area.diffQty > 0 ? '+' : ''}{area.diffQty.toLocaleString('pt-BR', { maximumFractionDigits: 0 })} un.
+                                                                    </span>
+                                                                    <span className="text-slate-600 whitespace-nowrap tabular-nums">{area.countedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                                                                    <span className={`text-right ${area.diffCost < 0 ? 'text-red-600' : area.diffCost > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                        {area.diffCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                                    </span>
+                                                                    <span className="text-slate-500">Rep. divergência</span>
+                                                                    <span className={`text-right whitespace-nowrap tabular-nums ${areaDivergencePct < 0 ? 'text-red-600' : areaDivergencePct > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                        {areaDivergencePct > 0 ? '+' : ''}{areaDivergencePct.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
+                                                                    </span>
+                                                                </div>
+                                                                <div className="mt-2 h-2 rounded-full bg-gray-100 overflow-hidden">
+                                                                    <div className="h-full rounded-full bg-indigo-500" style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
+                                                                </div>
+                                                                <p className="mt-1 text-[10px] font-black text-indigo-500 uppercase tracking-widest text-right">
+                                                                    {pct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%
+                                                                </p>
+                                                            </div>
+                                                        );
+                                                    })
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        <div className="rounded-2xl border border-gray-100 bg-white p-4">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-3">Por Filial</p>
+                                            <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                                                {dashboardCompletedAuditOverview.branches.length === 0 ? (
+                                                    <p className="text-sm font-semibold text-gray-400">Nenhuma filial com auditoria concluída.</p>
+                                                ) : (
+                                                    dashboardCompletedAuditOverview.branches.map(branch => (
+                                                        <button
+                                                            key={`${branch.branch}_${branch.auditNumber}`}
+                                                            type="button"
+                                                            onClick={() => handleOpenAuditFromDashboardBranch(branch.branch)}
+                                                            className="w-full text-left rounded-xl border border-gray-100 px-3 py-2 bg-gray-50/50 hover:border-indigo-200 hover:bg-indigo-50/30 transition-colors"
+                                                            title={`Abrir Auditoria da ${branch.branch} concluída`}
                                                         >
                                                             <div className="flex items-center justify-between gap-3">
                                                                 <p className="text-sm font-black text-gray-800">{branch.branch}</p>
