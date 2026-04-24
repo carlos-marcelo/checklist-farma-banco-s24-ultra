@@ -1484,6 +1484,7 @@ const App: React.FC = () => {
     const [isLoadingDashboardAudits, setIsLoadingDashboardAudits] = useState(false);
     const [dashboardAuditsError, setDashboardAuditsError] = useState<string | null>(null);
     const [dashboardAuditsFetchedAt, setDashboardAuditsFetchedAt] = useState<string | null>(null);
+    const [openAuditNumberFilter, setOpenAuditNumberFilter] = useState<string>('all');
     const [dashboardCompletedAuditSessions, setDashboardCompletedAuditSessions] = useState<SupabaseService.DbAuditSession[]>([]);
     const [isLoadingCompletedDashboardAudits, setIsLoadingCompletedDashboardAudits] = useState(false);
     const [completedDashboardAuditsError, setCompletedDashboardAuditsError] = useState<string | null>(null);
@@ -5180,8 +5181,14 @@ const App: React.FC = () => {
             }
         });
 
+        let filteredSessions = dashboardAuditSessions;
+        if (openAuditNumberFilter !== 'all') {
+            const tgtNum = Number(openAuditNumberFilter);
+            filteredSessions = filteredSessions.filter(s => Number(s.audit_number || 0) === tgtNum);
+        }
+
         const latestByBranch = new Map<string, SupabaseService.DbAuditSession>();
-        dashboardAuditSessions.forEach(session => {
+        filteredSessions.forEach(session => {
             const branchLabel = normalizeBranchLabel(session.branch);
             const prev = latestByBranch.get(branchLabel);
             if (!prev) {
@@ -5713,7 +5720,7 @@ const App: React.FC = () => {
             : 0;
 
         return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
-    }, [dashboardAuditSessions, scopedCompanies, scopedUsers]);
+    }, [dashboardAuditSessions, scopedCompanies, scopedUsers, openAuditNumberFilter]);
 
     const dashboardCompletedAuditOverview = useMemo(() => {
         type BranchMetric = {
@@ -6291,7 +6298,8 @@ const App: React.FC = () => {
             : 0;
 
         return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
-    }, [dashboardCompletedAuditSessions, scopedCompanies, scopedUsers, completedAuditNumberFilter]);
+    }, [dashboardCompletedAuditSessions, scopedCompanies, scopedUsers, completedAuditNumberFilter]);
+
 
     const handleOpenAuditFromDashboardBranch = useCallback((branchLabel: string) => {
         const raw = String(branchLabel || '').trim();
@@ -10052,6 +10060,26 @@ const App: React.FC = () => {
                                                         {dashboardCompletedAuditOverview.summary.openAudits} concluída{dashboardCompletedAuditOverview.summary.openAudits !== 1 ? 's' : ''}
                                                     </span>
                                                 )}
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-3">
+                                            <div className="relative">
+                                                <select
+                                                    value={openAuditNumberFilter}
+                                                    onChange={(e) => setOpenAuditNumberFilter(e.target.value)}
+                                                    className="appearance-none bg-white border border-gray-200 text-gray-700 text-xs font-black uppercase tracking-widest rounded-xl px-4 py-2 pr-8 hover:bg-gray-50 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
+                                                >
+                                                    <option value="all">Todas as auditorias</option>
+                                                    {Array.from(new Set(dashboardAuditSessions.map(s => Number(s.audit_number || 0)).filter(n => n > 0)))
+                                                        .sort((a, b) => a - b)
+                                                        .map(num => (
+                                                            <option key={num} value={String(num)}>Auditoria {num}</option>
+                                                        ))
+                                                    }
+                                                </select>
+                                                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-500">
+                                                    <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z" /></svg>
+                                                </div>
                                             </div>
                                         </div>
                                         <div className="flex items-center justify-end gap-3">
