@@ -4292,7 +4292,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const compressed = await ImageUtils.compressImage(dataUrl, { maxWidth: 600, quality: 0.6 });
                 
                 const currentData = data;
-                const currentDrafts = termDraftsRef.current || termDrafts;
                 const currentForm = termFormRef.current || termForm;
 
                 let finalForm = { ...currentForm } as TermForm;
@@ -4305,25 +4304,30 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 // Atualiza a UI com a versão comprimida
                 updateTermForm(() => finalForm);
 
-                // Monta estrutura de salvamento
+                // IMPORTANTE: Buscar a auditoria MAIS RECENTE do banco para não sobrescrever o progresso de outros usuários (ex: Gestor vs Master)
+                const freshLatest = await fetchLatestAudit(selectedFilial);
+                const baseData = freshLatest ? (freshLatest.data as AuditData) : currentData;
+                const baseDrafts = (baseData as any).termDrafts || {};
+
+                // Monta estrutura de salvamento baseada nos dados mais recentes
                 const key = buildTermKey(termModal);
                 const forceClearedFlag = removedExcelDraftKeysRef.current.has(key);
-                const latestDraftAtKey = currentDrafts[key];
+                const latestDraftAtKey = baseDrafts[key] || termDrafts[key];
                 const hasAnyMetricsInMemory = !!(rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || finalForm.excelMetrics || latestDraftAtKey?.excelMetrics);
                 const forceCleared = forceClearedFlag && !hasAnyMetricsInMemory;
                 const persistedMetrics = forceCleared ? undefined : (rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || finalForm.excelMetrics || latestDraftAtKey?.excelMetrics);
                 
                 const formToSave = persistedMetrics ? { ...finalForm, excelMetrics: persistedMetrics } : (latestDraftAtKey || finalForm);
-                const nextDrafts = forceCleared ? currentDrafts : upsertScopeDraft(currentDrafts, termModal, formToSave);
+                const nextDrafts = forceCleared ? baseDrafts : upsertScopeDraft(baseDrafts, termModal, formToSave);
                 
                 // Replica assinatura para TODOS os termos em rascunho instantaneamente
                 const syncedDrafts = replicateSignersToAllTermDrafts(nextDrafts, finalForm);
-                const nextDataWithTerms = { ...currentData, termDrafts: syncedDrafts } as any;
+                const nextDataWithTerms = { ...baseData, termDrafts: syncedDrafts } as any;
                 
                 setTermDrafts(syncedDrafts);
                 setData(nextDataWithTerms as AuditData);
 
-                // Dispara salvamento pro DB
+                // Dispara salvamento pro DB passando allowProgressRegression para contornar qualquer rejeição de timestamp
                 let skus = 0;
                 let doneSkus = 0;
                 (nextDataWithTerms.groups || []).forEach((g: any) =>
@@ -4335,15 +4339,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     )
                 );
                 const progress = skus > 0 ? (doneSkus / skus) * 100 : 0;
+                
                 const savedSession = await persistAuditSession({
-                    id: dbSessionId,
+                    id: freshLatest?.id || dbSessionId,
                     branch: selectedFilial,
-                    audit_number: nextAuditNumber,
-                    status: 'open',
+                    audit_number: freshLatest?.audit_number || nextAuditNumber,
+                    status: freshLatest?.status || 'open',
                     data: nextDataWithTerms,
-                    progress: progress,
+                    progress: Math.max(progress, Number(freshLatest?.progress || 0)),
                     user_email: userEmail
-                });
+                }, { allowProgressRegression: true });
+                
                 if (savedSession) {
                     await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
                 }
@@ -4351,9 +4357,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 console.error("Auto-save signature failed:", err);
             }
         })();
-    };
-
-    const closeTermModal = useCallback(() => {
+    };const closeTermModal = useCallback(() => {
         const currentScope = termModal;
         const currentForm = termFormRef.current || termForm;
         const currentData = data;
