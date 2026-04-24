@@ -10103,7 +10103,7 @@ const App: React.FC = () => {
                                         </div>
                                         <div className="rounded-2xl border border-blue-100 bg-blue-50/50 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
                                             <p className="text-[10px] font-black uppercase tracking-widest text-blue-500">% conferido acumulado</p>
-                                            <p className="text-[1.65rem] leading-none font-black text-blue-700 whitespace-nowrap tabular-nums">{dashboardAuditOverview.accumulatedPct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</p>
+                                            <p className="text-[1.65rem] leading-none font-black text-blue-700 whitespace-nowrap tabular-nums">{(dashboardAuditOverview.accumulatedPct === 100 ? "100" : dashboardAuditOverview.accumulatedPct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%</p>
                                             <p className="text-[9px] font-bold text-blue-500/80 leading-none">Unidades conferidas / unidades previstas</p>
                                         </div>
                                         <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
@@ -10164,7 +10164,7 @@ const App: React.FC = () => {
                                                                     <div className="h-full rounded-full bg-indigo-500" style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
                                                                 </div>
                                                                 <p className="mt-1 text-[10px] font-black text-indigo-500 uppercase tracking-widest text-right">
-                                                                    {pct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%
+                                                                    {(pct === 100 ? "100" : pct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%
                                                                 </p>
                                                             </div>
                                                         );
@@ -10209,7 +10209,7 @@ const App: React.FC = () => {
                                                                 <div className="h-full rounded-full bg-emerald-500" style={{ width: `${Math.max(0, Math.min(100, branch.progressPct))}%` }} />
                                                             </div>
                                                             <p className="mt-1 text-[10px] font-black text-emerald-600 uppercase tracking-widest text-right">
-                                                                {branch.progressPct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%
+                                                                {(branch.progressPct === 100 ? "100" : branch.progressPct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%
                                                             </p>
                                                         </button>
                                                     ))
@@ -10268,7 +10268,7 @@ const App: React.FC = () => {
                                         </div>
                                         <div className="rounded-2xl border border-blue-100 bg-blue-50/50 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
                                             <p className="text-[10px] font-black uppercase tracking-widest text-blue-500">% conferido acumulado</p>
-                                            <p className="text-[1.65rem] leading-none font-black text-blue-700 whitespace-nowrap tabular-nums">{dashboardCompletedAuditOverview.accumulatedPct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</p>
+                                            <p className="text-[1.65rem] leading-none font-black text-blue-700 whitespace-nowrap tabular-nums">{(dashboardCompletedAuditOverview.accumulatedPct === 100 ? "100" : dashboardCompletedAuditOverview.accumulatedPct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%</p>
                                             <p className="text-[9px] font-bold text-blue-500/80 leading-none">Unidades conferidas / unidades previstas</p>
                                         </div>
                                         <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
@@ -10329,7 +10329,7 @@ const App: React.FC = () => {
                                                                     <div className="h-full rounded-full bg-indigo-500" style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
                                                                 </div>
                                                                 <p className="mt-1 text-[10px] font-black text-indigo-500 uppercase tracking-widest text-right">
-                                                                    {pct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%
+                                                                    {(pct === 100 ? "100" : pct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%
                                                                 </p>
                                                             </div>
                                                         );
@@ -10374,7 +10374,7 @@ const App: React.FC = () => {
                                                                 <div className="h-full rounded-full bg-emerald-500" style={{ width: `${Math.max(0, Math.min(100, branch.progressPct))}%` }} />
                                                             </div>
                                                             <p className="mt-1 text-[10px] font-black text-emerald-600 uppercase tracking-widest text-right">
-                                                                {branch.progressPct.toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%
+                                                                {(branch.progressPct === 100 ? "100" : branch.progressPct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%
                                                             </p>
                                                         </button>
                                                     ))
