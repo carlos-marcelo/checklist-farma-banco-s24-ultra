@@ -4271,6 +4271,88 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         });
     };
 
+    const handleSignatureComplete = async (field: 'managerSignature' | 'managerSignature2' | { collabIndex: number }, dataUrl: string) => {
+        if (isReadOnlyCompletedView || !termModal || !data) return;
+
+        // Atualização instantânea para a UI
+        updateTermForm(prev => {
+            if (!prev) return prev;
+            const updated = { ...prev };
+            if (field === 'managerSignature') updated.managerSignature = dataUrl;
+            else if (field === 'managerSignature2') updated.managerSignature2 = dataUrl;
+            else if (typeof field === 'object' && field.collabIndex !== undefined) {
+                updated.collaborators = updated.collaborators.map((c, i) => i === field.collabIndex ? { ...c, signature: dataUrl } : c);
+            }
+            return updated;
+        });
+
+        // Background: compressão, replicação para todos os termos e salvamento no BD
+        void (async () => {
+            try {
+                const compressed = await ImageUtils.compressImage(dataUrl, { maxWidth: 600, quality: 0.6 });
+                
+                const currentData = data;
+                const currentDrafts = termDraftsRef.current || termDrafts;
+                const currentForm = termFormRef.current || termForm;
+
+                let finalForm = { ...currentForm } as TermForm;
+                if (field === 'managerSignature') finalForm.managerSignature = compressed;
+                else if (field === 'managerSignature2') finalForm.managerSignature2 = compressed;
+                else if (typeof field === 'object' && field.collabIndex !== undefined) {
+                    finalForm.collaborators = finalForm.collaborators.map((c, i) => i === field.collabIndex ? { ...c, signature: compressed } : c);
+                }
+
+                // Atualiza a UI com a versão comprimida
+                updateTermForm(() => finalForm);
+
+                // Monta estrutura de salvamento
+                const key = buildTermKey(termModal);
+                const forceClearedFlag = removedExcelDraftKeysRef.current.has(key);
+                const latestDraftAtKey = currentDrafts[key];
+                const hasAnyMetricsInMemory = !!(rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || finalForm.excelMetrics || latestDraftAtKey?.excelMetrics);
+                const forceCleared = forceClearedFlag && !hasAnyMetricsInMemory;
+                const persistedMetrics = forceCleared ? undefined : (rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || finalForm.excelMetrics || latestDraftAtKey?.excelMetrics);
+                
+                const formToSave = persistedMetrics ? { ...finalForm, excelMetrics: persistedMetrics } : (latestDraftAtKey || finalForm);
+                const nextDrafts = forceCleared ? currentDrafts : upsertScopeDraft(currentDrafts, termModal, formToSave);
+                
+                // Replica assinatura para TODOS os termos em rascunho instantaneamente
+                const syncedDrafts = replicateSignersToAllTermDrafts(nextDrafts, finalForm);
+                const nextDataWithTerms = { ...currentData, termDrafts: syncedDrafts } as any;
+                
+                setTermDrafts(syncedDrafts);
+                setData(nextDataWithTerms as AuditData);
+
+                // Dispara salvamento pro DB
+                let skus = 0;
+                let doneSkus = 0;
+                (nextDataWithTerms.groups || []).forEach((g: any) =>
+                    (g.departments || []).forEach((d: any) =>
+                        (d.categories || []).forEach((c: any) => {
+                            skus += Number(c.itemsCount || 0);
+                            if (isDoneStatus(c.status)) doneSkus += Number(c.itemsCount || 0);
+                        })
+                    )
+                );
+                const progress = skus > 0 ? (doneSkus / skus) * 100 : 0;
+                const savedSession = await persistAuditSession({
+                    id: dbSessionId,
+                    branch: selectedFilial,
+                    audit_number: nextAuditNumber,
+                    status: 'open',
+                    data: nextDataWithTerms,
+                    progress: progress,
+                    user_email: userEmail
+                });
+                if (savedSession) {
+                    await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
+                }
+            } catch (err) {
+                console.error("Auto-save signature failed:", err);
+            }
+        })();
+    };
+
     const closeTermModal = useCallback(() => {
         const currentScope = termModal;
         const currentForm = termFormRef.current || termForm;
@@ -7790,22 +7872,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 )}
                                             </div>
                                         ) : canFillTermSignatures ? (
-                                            <SignaturePad onEnd={(dataUrl) => {
-                                                // Salva imediatamente para não perder ao fechar modal rapidamente.
-                                                updateTermForm(prev => ({ ...prev, managerSignature2: dataUrl }));
-                                                void (async () => {
-                                                    try {
-                                                        const compressed = await ImageUtils.compressImage(dataUrl, { maxWidth: 600, quality: 0.6 });
-                                                        updateTermForm(prev => (
-                                                            prev.managerSignature2 === dataUrl
-                                                                ? { ...prev, managerSignature2: compressed }
-                                                                : prev
-                                                        ));
-                                                    } catch {
-                                                        // Mantém dataUrl original se compress falhar.
-                                                    }
-                                                })();
-                                            }} />
+                                            <SignaturePad onEnd={(dataUrl) => handleSignatureComplete('managerSignature2', dataUrl)} />
                                         ) : (
                                             <div className="border border-slate-100 rounded-xl bg-slate-50 h-40 flex items-center justify-center text-slate-400 text-[10px] font-bold uppercase tracking-widest italic">Assinatura Pendente</div>
                                         )}
@@ -7874,22 +7941,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 )}
                                             </div>
                                         ) : canFillTermSignatures ? (
-                                            <SignaturePad onEnd={(dataUrl) => {
-                                                // Salva imediatamente para não perder ao fechar modal rapidamente.
-                                                updateTermForm(prev => ({ ...prev, managerSignature: dataUrl }));
-                                                void (async () => {
-                                                    try {
-                                                        const compressed = await ImageUtils.compressImage(dataUrl, { maxWidth: 600, quality: 0.6 });
-                                                        updateTermForm(prev => (
-                                                            prev.managerSignature === dataUrl
-                                                                ? { ...prev, managerSignature: compressed }
-                                                                : prev
-                                                        ));
-                                                    } catch {
-                                                        // Mantém dataUrl original se compress falhar.
-                                                    }
-                                                })();
-                                            }} />
+                                            <SignaturePad onEnd={(dataUrl) => handleSignatureComplete('managerSignature', dataUrl)} />
                                         ) : (
                                             <div className="border border-slate-100 rounded-xl bg-slate-50 h-40 flex items-center justify-center text-slate-400 text-[10px] font-bold uppercase tracking-widest italic">Assinatura Pendente</div>
                                         )}
