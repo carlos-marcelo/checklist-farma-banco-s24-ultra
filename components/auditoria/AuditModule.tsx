@@ -4650,6 +4650,25 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
 
 
+            const systemCategoryMap = new Map<string, { groupId: string, groupName: string, deptId: string, deptName: string, catId: string, catName: string }>();
+            (data?.groups || []).forEach(g => {
+                (g.departments || []).forEach(d => {
+                    (d.categories || []).forEach(c => {
+                        const key = normalizeText(c.name);
+                        if (key && !systemCategoryMap.has(key)) {
+                            systemCategoryMap.set(key, {
+                                groupId: String(g.id),
+                                groupName: g.name,
+                                deptId: String(d.id),
+                                deptName: d.name,
+                                catId: String(c.id),
+                                catName: c.name
+                            });
+                        }
+                    });
+                });
+            });
+
             const groupedMap: Record<string, { groupId?: string, groupName: string, deptId?: string, deptName: string, catId?: string, catName: string, sysQty: number, sysCost: number, countedQty: number, countedCost: number, diffQty: number, diffCost: number }> = {};
 
             // Skip header (row 0), process data rows
@@ -4785,7 +4804,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     singleScopedGroupName ||
                     'DIVERSOS (SEM GRUPO)';
 
-                const hierarchy = {
+                let hierarchy = {
                     groupId: normalizeScopeId((cadastroPreferredEntry as any)?.groupId) || normalizeScopeId(contextRegistryEntry?.groupId) || normalizeScopeId(fallbackEntry?.groupId) || normalizeScopeId(primaryScopeGroupId) || '',
                     groupName: resolvedGroupName,
                     deptId: normalizeScopeId(localCadastroEntry?.deptId) || normalizeScopeId((cadastroPreferredEntry as any)?.deptId) || normalizeScopeId(contextRegistryEntry?.deptId) || normalizeScopeId(fallbackEntry?.deptId) || '',
@@ -4793,6 +4812,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     catId: normalizeScopeId(localCadastroEntry?.catId) || normalizeScopeId((cadastroPreferredEntry as any)?.catId) || normalizeScopeId(contextRegistryEntry?.catId) || normalizeScopeId(fallbackEntry?.catId) || '',
                     catName: localCadastroEntry?.catName || (cadastroPreferredEntry as any)?.catName || contextRegistryEntry?.catName || fallbackEntry?.catName || 'DIVERSOS (SEM CATEGORIA)'
                 };
+
+                // Forçar hierarquia do sistema se for órfão mas tiver nome de categoria válido no mix da filial
+                const normCat = normalizeText(hierarchy.catName);
+                if ((!hierarchy.catId || hierarchy.groupName.includes('DIVERSOS')) && systemCategoryMap.has(normCat)) {
+                    const forced = systemCategoryMap.get(normCat)!;
+                    hierarchy = {
+                        groupId: normalizeScopeId(forced.groupId),
+                        groupName: forced.groupName,
+                        deptId: normalizeScopeId(forced.deptId),
+                        deptName: forced.deptName,
+                        catId: normalizeScopeId(forced.catId),
+                        catName: forced.catName
+                    };
+                }
 
                 const groupKey = `${hierarchy.groupId || hierarchy.groupName}|${hierarchy.deptId || hierarchy.deptName}|${hierarchy.catId || hierarchy.catName}`;
                 if (!groupedMap[groupKey]) {
@@ -8213,22 +8246,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                         if (!termComparisonMetrics.groupedDifferences || termComparisonMetrics.groupedDifferences.length === 0) return null;
 
                                                         const groupsMap = new Map();
+                                                        const norm = (s: string) => String(s || 'DIVERSOS').trim().toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
                                                         termComparisonMetrics.groupedDifferences.forEach((diff: any) => {
-                                                            if (!groupsMap.has(diff.groupName)) {
-                                                                groupsMap.set(diff.groupName, { name: diff.groupName, diffQty: 0, diffCost: 0, departments: new Map() });
-                                                            }
-                                                            const g = groupsMap.get(diff.groupName);
-                                                            g.diffQty += diff.diffQty;
-                                                            g.diffCost += diff.diffCost;
+                                                            const gName = norm(diff.groupName);
+                                                            const dName = norm(diff.deptName);
+                                                            const cName = norm(diff.catName);
 
-                                                            if (!g.departments.has(diff.deptName)) {
-                                                                g.departments.set(diff.deptName, { name: diff.deptName, diffQty: 0, diffCost: 0, categories: [] });
+                                                            if (!groupsMap.has(gName)) {
+                                                                groupsMap.set(gName, { name: diff.groupName || 'DIVERSOS', diffQty: 0, diffCost: 0, departments: new Map() });
                                                             }
-                                                            const d = g.departments.get(diff.deptName);
-                                                            d.diffQty += diff.diffQty;
-                                                            d.diffCost += diff.diffCost;
+                                                            const g = groupsMap.get(gName);
+                                                            g.diffQty += diff.diffQty || 0;
+                                                            g.diffCost += diff.diffCost || 0;
 
-                                                            d.categories.push({ name: diff.catName, diffQty: diff.diffQty, diffCost: diff.diffCost });
+                                                            if (!g.departments.has(dName)) {
+                                                                g.departments.set(dName, { name: diff.deptName || 'DIVERSOS', diffQty: 0, diffCost: 0, categories: new Map() });
+                                                            }
+                                                            const d = g.departments.get(dName);
+                                                            d.diffQty += diff.diffQty || 0;
+                                                            d.diffCost += diff.diffCost || 0;
+
+                                                            if (!d.categories.has(cName)) {
+                                                                d.categories.set(cName, { name: diff.catName || 'DIVERSOS', diffQty: 0, diffCost: 0 });
+                                                            }
+                                                            const c = d.categories.get(cName);
+                                                            c.diffQty += diff.diffQty || 0;
+                                                            c.diffCost += diff.diffCost || 0;
                                                         });
 
                                                         const nested = Array.from(groupsMap.values()).map(g => ({
@@ -8236,7 +8279,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                             departments: Array.from(g.departments.values())
                                                                 .map((d: any) => ({
                                                                     ...d,
-                                                                    categories: d.categories.filter((c: any) =>
+                                                                    categories: Array.from(d.categories.values()).filter((c: any) =>
                                                                         Math.abs(c.diffQty) > 0.01 || Math.abs(c.diffCost) > 0.01
                                                                     )
                                                                 }))
@@ -8308,8 +8351,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                                                             {dept.categories.map((cat: any, cIdx: number) => {
                                                                                                 const catItems = (termComparisonMetrics?.items || []).filter(
                                                                                                     (item: any) =>
-                                                                                                        item.catName?.toLowerCase() === cat.name?.toLowerCase() &&
-                                                                                                        item.deptName?.toLowerCase() === dept.name?.toLowerCase()
+                                                                                                        norm(item.catName) === norm(cat.name) &&
+                                                                                                        norm(item.deptName) === norm(dept.name)
                                                                                                 ).sort((a: any, b: any) => a.diffCost - b.diffCost);
                                                                                                 const catKey = `${dept.name}|${cat.name}`;
                                                                                                 return (
