@@ -48,7 +48,10 @@ import {
     Search,
     RefreshCw,
     X,
-    Upload
+    Upload,
+    Save,
+    Check,
+    Loader2
 } from 'lucide-react';
 
 const GROUP_UPLOAD_IDS = ['2000', '3000', '4000', '8000', '10000', '66', '67'] as const;
@@ -855,6 +858,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [termFieldErrors, setTermFieldErrors] = useState<Record<string, string>>({});
     const [termTouchedFields, setTermTouchedFields] = useState<Record<string, boolean>>({});
     const [termShakeFields, setTermShakeFields] = useState<Record<string, boolean>>({});
+    const [isSavingTerm, setIsSavingTerm] = useState(false);
+    const [showSavedFeedback, setShowSavedFeedback] = useState(false);
     const composeTermDraftsForPersist = useCallback((...maps: Array<Record<string, TermForm> | undefined | null>) => {
         return maps.reduce((acc, current) => mergeTermDraftMaps(acc, (current || {}) as Record<string, TermForm>), {} as Record<string, TermForm>);
     }, []);
@@ -4357,7 +4362,49 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 console.error("Auto-save signature failed:", err);
             }
         })();
-    };const closeTermModal = useCallback(() => {
+    };
+    const handleSaveTermDraft = async () => {
+        if (!termModal || !termForm || !data) return;
+        setIsSavingTerm(true);
+        try {
+            const freshLatest = await fetchLatestAudit(selectedFilial);
+            const baseData = freshLatest ? (freshLatest.data as AuditData) : data;
+            const baseDrafts = (baseData as any).termDrafts || {};
+            const key = buildTermKey(termModal);
+            const forceClearedFlag = removedExcelDraftKeysRef.current.has(key);
+            const latestDraftAtKey = baseDrafts[key] || termDrafts[key];
+            const hasAnyMetricsInMemory = !!(rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || termForm.excelMetrics || latestDraftAtKey?.excelMetrics);
+            const forceCleared = forceClearedFlag && !hasAnyMetricsInMemory;
+            const persistedMetrics = forceCleared ? undefined : (rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || termForm.excelMetrics || latestDraftAtKey?.excelMetrics);
+            const formToSave = persistedMetrics ? { ...termForm, excelMetrics: persistedMetrics } : termForm;
+            const nextDrafts = forceCleared ? baseDrafts : upsertScopeDraft(baseDrafts, termModal, formToSave);
+            const syncedDrafts = replicateSignersToAllTermDrafts(nextDrafts, termForm);
+            const nextDataWithTerms = { ...baseData, termDrafts: syncedDrafts } as any;
+            setTermDrafts(syncedDrafts);
+            setData(nextDataWithTerms as AuditData);
+            const savedSession = await persistAuditSession({
+                id: freshLatest?.id || dbSessionId,
+                branch: selectedFilial,
+                audit_number: freshLatest?.audit_number || nextAuditNumber,
+                status: freshLatest?.status || 'open',
+                data: nextDataWithTerms,
+                progress: calculateProgress(nextDataWithTerms),
+                user_email: userEmail
+            }, { allowProgressRegression: true });
+            if (savedSession) {
+                await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
+                setShowSavedFeedback(true);
+                alert("✅ Dados salvos com sucesso no Banco de Dados!");
+                setTimeout(() => setShowSavedFeedback(false), 2500);
+            }
+        } catch (err) {
+            console.error("Error saving term draft:", err);
+            alert("Erro ao salvar rascunho do termo. Verifique sua conexão.");
+        } finally {
+            setIsSavingTerm(false);
+        }
+    };
+    const closeTermModal = useCallback(() => {
         const currentScope = termModal;
         const currentForm = termFormRef.current || termForm;
         const currentData = data;
@@ -8480,6 +8527,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 Produtos no termo: {termScopeInfo.products.length}
                             </span>
                             <div className="w-full sm:w-auto flex flex-col sm:flex-row gap-2">
+                                <button
+                                    onClick={handleSaveTermDraft}
+                                    disabled={isSavingTerm || isReadOnlyCompletedView}
+                                    className={`w-full sm:w-auto px-6 py-3 rounded-xl font-black text-[11px] uppercase tracking-widest transition-all shadow-md flex items-center justify-center gap-2 ${
+                                        showSavedFeedback 
+                                            ? 'bg-emerald-600 text-white' 
+                                            : 'bg-indigo-600 text-white hover:bg-indigo-700 disabled:bg-slate-300'
+                                    }`}
+                                >
+                                    {isSavingTerm ? (
+                                        <>
+                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                            Salvando...
+                                        </>
+                                    ) : showSavedFeedback ? (
+                                        <>
+                                            <Check className="w-4 h-4" />
+                                            Dados Salvos!
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Save className="w-4 h-4" />
+                                            Salvar Dados
+                                        </>
+                                    )}
+                                </button>
                                 <button
                                     onClick={() => handlePrintTerm({ divergencesOnly: true })}
                                     className="w-full sm:w-auto px-6 py-3 rounded-xl bg-amber-600 text-white font-black text-[11px] uppercase tracking-widest hover:bg-amber-500 transition-all shadow-md"
