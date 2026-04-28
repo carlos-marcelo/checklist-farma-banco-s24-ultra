@@ -114,6 +114,51 @@ const TERM_MANUAL_CLASSIFICATION_BY_CODE: Record<string, { groupId: string; dept
     '84489': { groupId: '4000', deptId: '121', catId: '106' }
 };
 
+const AuditTermInput = React.memo(({ 
+    value, 
+    onCommit, 
+    onImmediateChange,
+    onBlurAction,
+    placeholder, 
+    className, 
+    readOnly, 
+    maxLength, 
+    dataField 
+}: { 
+    value: string; 
+    onCommit: (val: string) => void; 
+    onImmediateChange?: (val: string) => void;
+    onBlurAction?: (val: string) => void;
+    placeholder?: string; 
+    className?: string; 
+    readOnly?: boolean; 
+    maxLength?: number; 
+    dataField?: string; 
+}) => {
+    const [local, setLocal] = React.useState(value);
+    React.useEffect(() => { setLocal(value); }, [value]);
+
+    return (
+        <input
+            type="text"
+            value={local}
+            onChange={(e) => {
+                setLocal(e.target.value);
+                if (onImmediateChange) onImmediateChange(e.target.value);
+            }}
+            onBlur={() => {
+                if (local !== value) onCommit(local);
+                if (onBlurAction) onBlurAction(local);
+            }}
+            placeholder={placeholder}
+            className={className}
+            readOnly={readOnly}
+            maxLength={maxLength}
+            data-term-field={dataField}
+        />
+    );
+});
+
 const isDiversosLabel = (value?: string) => {
     const t = String(value || '')
         .normalize('NFD')
@@ -4251,7 +4296,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setTermDrafts(current => upsertScopeDraft(current, scope as any, formToSave));
     };
 
-    const updateTermForm = (updater: (prev: TermForm) => TermForm) => {
+    const updateTermForm = (updater: (prev: TermForm) => TermForm, options?: { skipReplication?: boolean }) => {
         setTermForm(prev => {
             if (!prev) return prev;
             if (isReadOnlyCompletedView) return prev;
@@ -4260,7 +4305,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const key = buildTermKey(termModal);
                 setTermDrafts(current => {
                     const persistedMetrics =
-                        rawTermComparisonMetrics ||
+                        rawTermMetricsRef.current ||
                         termComparisonMetrics ||
                         next.excelMetrics ||
                         current[key]?.excelMetrics;
@@ -4269,6 +4314,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         termModal,
                         persistedMetrics ? { ...next, excelMetrics: persistedMetrics } : next
                     );
+                    if (options?.skipReplication) return currentScopeDrafts;
                     return replicateSignersToAllTermDrafts(currentScopeDrafts, next);
                 });
             }
@@ -7865,20 +7911,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                                 <div className="md:col-span-2 space-y-1">
                                     <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Nº Inventário</label>
-                                    <input
-                                        type="text"
+                                    <AuditTermInput
                                         value={termForm.inventoryNumber}
-                                        onChange={(e) => updateTermForm(prev => ({ ...prev, inventoryNumber: e.target.value }))}
+                                        onCommit={(val) => updateTermForm(prev => ({ ...prev, inventoryNumber: val }))}
                                         readOnly={!canEditTerm}
                                         className={`w-full bg-white border border-slate-200 rounded-xl px-4 py-2 font-bold text-sm text-slate-700 ${!canEditTerm ? 'bg-slate-50 cursor-not-allowed' : ''}`}
                                     />
                                 </div>
                                 <div className="md:col-span-2 space-y-1">
                                     <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Data</label>
-                                    <input
-                                        type="text"
+                                    <AuditTermInput
                                         value={termForm.date}
-                                        onChange={(e) => updateTermForm(prev => ({ ...prev, date: e.target.value }))}
+                                        onCommit={(val) => updateTermForm(prev => ({ ...prev, date: val }))}
                                         placeholder="DD/MM/AAAA"
                                         readOnly={!canEditTerm}
                                         className={`w-full bg-white border border-slate-200 rounded-xl px-4 py-2 font-bold text-sm text-slate-700 ${!canEditTerm ? 'bg-slate-50 cursor-not-allowed' : ''}`}
@@ -7895,16 +7939,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     <div>
                                         <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2">Gestor 1</p>
                                         <div className="grid grid-cols-1 gap-2 mb-2">
-                                            <input
-                                                type="text"
+                                            <AuditTermInput
                                                 value={termForm.managerName2}
-                                                onChange={(e) => {
-                                                    clearTermFieldError('manager1_name');
-                                                    updateTermForm(prev => ({ ...prev, managerName2: e.target.value }));
-                                                }}
-                                                onBlur={(e) => validateTermFieldOnBlur('manager1_name', e.target.value)}
+                                                onImmediateChange={() => clearTermFieldError('manager1_name')}
+                                                onCommit={(val) => updateTermForm(prev => ({ ...prev, managerName2: val }), { skipReplication: true })}
+                                                onBlurAction={(val) => validateTermFieldOnBlur('manager1_name', val)}
                                                 placeholder="Nome do Gestor 1"
-                                                data-term-field="manager1_name"
+                                                dataField="manager1_name"
                                                 readOnly={!canFillTermSignatures}
                                                 className={`w-full bg-white border rounded-xl px-4 py-2 font-bold text-xs ${
                                                     termFieldErrors.manager1_name
@@ -7917,16 +7958,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             {termFieldErrors.manager1_name && (
                                                 <p className="text-[10px] font-bold text-red-600">{termFieldErrors.manager1_name}</p>
                                             )}
-                                            <input
-                                                type="text"
+                                            <AuditTermInput
                                                 value={termForm.managerCpf2}
-                                                onChange={(e) => {
-                                                    clearTermFieldError('manager1_cpf');
-                                                    updateTermForm(prev => ({ ...prev, managerCpf2: formatCpf(e.target.value) }));
-                                                }}
-                                                onBlur={(e) => validateTermFieldOnBlur('manager1_cpf', e.target.value)}
+                                                onImmediateChange={() => clearTermFieldError('manager1_cpf')}
+                                                onCommit={(val) => updateTermForm(prev => ({ ...prev, managerCpf2: formatCpf(val) }), { skipReplication: true })}
+                                                onBlurAction={(val) => validateTermFieldOnBlur('manager1_cpf', val)}
                                                 placeholder="CPF Gestor 1"
-                                                data-term-field="manager1_cpf"
+                                                dataField="manager1_cpf"
                                                 maxLength={14}
                                                 readOnly={!canFillTermSignatures}
                                                 className={`w-full bg-white border rounded-xl px-4 py-2 font-bold text-xs ${
@@ -7964,16 +8002,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     <div>
                                         <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2">Gestor 2</p>
                                         <div className="grid grid-cols-1 gap-2 mb-2">
-                                            <input
-                                                type="text"
+                                            <AuditTermInput
                                                 value={termForm.managerName}
-                                                onChange={(e) => {
-                                                    clearTermFieldError('manager2_name');
-                                                    updateTermForm(prev => ({ ...prev, managerName: e.target.value }));
-                                                }}
-                                                onBlur={(e) => validateTermFieldOnBlur('manager2_name', e.target.value)}
+                                                onImmediateChange={() => clearTermFieldError('manager2_name')}
+                                                onCommit={(val) => updateTermForm(prev => ({ ...prev, managerName: val }), { skipReplication: true })}
+                                                onBlurAction={(val) => validateTermFieldOnBlur('manager2_name', val)}
                                                 placeholder="Nome do Gestor 2"
-                                                data-term-field="manager2_name"
+                                                dataField="manager2_name"
                                                 readOnly={!canFillTermSignatures}
                                                 className={`w-full bg-white border rounded-xl px-4 py-2 font-bold text-xs ${
                                                     termFieldErrors.manager2_name
@@ -7986,16 +8021,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             {termFieldErrors.manager2_name && (
                                                 <p className="text-[10px] font-bold text-red-600">{termFieldErrors.manager2_name}</p>
                                             )}
-                                            <input
-                                                type="text"
+                                            <AuditTermInput
                                                 value={termForm.managerCpf}
-                                                onChange={(e) => {
-                                                    clearTermFieldError('manager2_cpf');
-                                                    updateTermForm(prev => ({ ...prev, managerCpf: formatCpf(e.target.value) }));
-                                                }}
-                                                onBlur={(e) => validateTermFieldOnBlur('manager2_cpf', e.target.value)}
+                                                onImmediateChange={() => clearTermFieldError('manager2_cpf')}
+                                                onCommit={(val) => updateTermForm(prev => ({ ...prev, managerCpf: formatCpf(val) }), { skipReplication: true })}
+                                                onBlurAction={(val) => validateTermFieldOnBlur('manager2_cpf', val)}
                                                 placeholder="CPF Gestor 2"
-                                                data-term-field="manager2_cpf"
+                                                dataField="manager2_cpf"
                                                 maxLength={14}
                                                 readOnly={!canFillTermSignatures}
                                                 className={`w-full bg-white border rounded-xl px-4 py-2 font-bold text-xs ${
@@ -8047,19 +8079,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 </div>
                                                 <div className="flex-1 space-y-3">
                                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                                        <input
-                                                            type="text"
+                                                        <AuditTermInput
                                                             value={collab.name}
-                                                            onChange={(e) => {
-                                                                clearTermFieldError(`collab_${idx}_name`);
+                                                            onImmediateChange={() => clearTermFieldError(`collab_${idx}_name`)}
+                                                            onCommit={(val) => {
                                                                 updateTermForm(prev => ({
                                                                     ...prev,
-                                                                    collaborators: prev.collaborators.map((c, i) => i === idx ? { ...c, name: e.target.value } : c)
-                                                                }));
+                                                                    collaborators: prev.collaborators.map((c, i) => i === idx ? { ...c, name: val } : c)
+                                                                }), { skipReplication: true });
                                                             }}
-                                                            onBlur={(e) => validateTermFieldOnBlur(`collab_${idx}_name`, e.target.value)}
+                                                            onBlurAction={(val) => validateTermFieldOnBlur(`collab_${idx}_name`, val)}
                                                             placeholder={`Colaborador ${collabNumber}`}
-                                                            data-term-field={`collab_${idx}_name`}
+                                                            dataField={`collab_${idx}_name`}
                                                             readOnly={!canFillTermSignatures}
                                                             className={`w-full bg-white border rounded-xl px-4 py-2 font-semibold text-xs ${
                                                                 termFieldErrors[`collab_${idx}_name`]
@@ -8069,19 +8100,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                                         : 'border-slate-200 text-slate-700')
                                                             } ${termShakeFields[`collab_${idx}_name`] ? 'term-field-shake' : ''} ${!canFillTermSignatures ? 'bg-slate-50 cursor-not-allowed' : ''}`}
                                                         />
-                                                        <input
-                                                            type="text"
+                                                        <AuditTermInput
                                                             value={collab.cpf}
-                                                            onChange={(e) => {
-                                                                clearTermFieldError(`collab_${idx}_cpf`);
+                                                            onImmediateChange={() => clearTermFieldError(`collab_${idx}_cpf`)}
+                                                            onCommit={(val) => {
                                                                 updateTermForm(prev => ({
                                                                     ...prev,
-                                                                    collaborators: prev.collaborators.map((c, i) => i === idx ? { ...c, cpf: formatCpf(e.target.value) } : c)
-                                                                }));
+                                                                    collaborators: prev.collaborators.map((c, i) => i === idx ? { ...c, cpf: formatCpf(val) } : c)
+                                                                }), { skipReplication: true });
                                                             }}
-                                                            onBlur={(e) => validateTermFieldOnBlur(`collab_${idx}_cpf`, e.target.value)}
+                                                            onBlurAction={(val) => validateTermFieldOnBlur(`collab_${idx}_cpf`, val)}
                                                             placeholder={`CPF ${collabNumber}`}
-                                                            data-term-field={`collab_${idx}_cpf`}
+                                                            dataField={`collab_${idx}_cpf`}
                                                             maxLength={14}
                                                             readOnly={!canFillTermSignatures}
                                                             className={`w-full bg-white border rounded-xl px-4 py-2 font-semibold text-xs ${
