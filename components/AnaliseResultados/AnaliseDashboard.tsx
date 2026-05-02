@@ -698,10 +698,10 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                         <tbody className="divide-y divide-gray-50">
                             {filteredData.filiais.map((f: any, idx: number) => (
                                 <tr key={idx} className="hover:bg-indigo-50/30 transition-colors">
-                                    <td className="py-3 px-6 text-xs font-medium text-gray-500 whitespace-nowrap">
-                                        <div className="flex flex-col">
-                                            <span className="text-[9px] font-black uppercase text-indigo-400">{f.areaName}</span>
-                                            <span className="text-[9px] font-bold text-gray-400">{f.cityName}</span>
+                                    <td className="py-3 px-6 text-sm font-bold whitespace-nowrap">
+                                        <div className="flex flex-col leading-tight">
+                                            <span className="text-indigo-600 uppercase">{f.areaName}</span>
+                                            <span className="text-gray-500 uppercase">{f.cityName}</span>
                                         </div>
                                     </td>
                                     <td className="py-3 px-6 text-sm font-bold text-gray-900 whitespace-nowrap">{f.branchName}</td>
