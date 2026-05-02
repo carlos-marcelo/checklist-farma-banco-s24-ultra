@@ -17,6 +17,7 @@ interface AnaliseDashboardProps {
 interface SalesGroupData {
     branchName: string;
     areaName: string;
+    cityName: string;
     name: string;      
     estoque: number;
     volumeVend: number;
@@ -92,25 +93,38 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         const company = companies.find(c => c.id === currentUser?.company_id);
         if (!company || !company.areas) return 'Geral';
         
+        const rawNormalized = rawBranchString.toLowerCase().trim();
+        const rawNumMatch = rawBranchString.match(/\d+/);
+        const rawNum = rawNumMatch ? parseInt(rawNumMatch[0]) : null;
+
         for (const area of company.areas as CompanyArea[]) {
             for (const b of area.branches) {
-                // Try literal match first
-                if (b.trim() && rawBranchString.toLowerCase().includes(b.toLowerCase().trim())) {
-                    return area.name;
-                }
-                
-                // If the user registered "Filial 1", extract the "1" and map to "F01" or starting digit
-                const numMatch = b.match(/\d+/);
-                if (numMatch) {
-                    const numStr = numMatch[0];
-                    const formattedF = 'F' + numStr.padStart(2, '0'); 
-                    if (rawBranchString.includes(formattedF) || rawBranchString.startsWith(`${numStr} `) || rawBranchString.startsWith(`${numStr}-`)) {
-                        return area.name;
-                    }
-                }
+                const bNormalized = b.toLowerCase().trim();
+                if (!bNormalized) continue;
+
+                if (rawNormalized.includes(bNormalized) || bNormalized.includes(rawNormalized)) return area.name;
+                const bNumMatch = b.match(/\d+/);
+                const bNum = bNumMatch ? parseInt(bNumMatch[0]) : null;
+                if (rawNum !== null && bNum !== null && rawNum === bNum) return area.name;
+                if ((rawNormalized.includes('matriz') || rawNormalized.includes('geral')) && 
+                    (bNormalized.includes('matriz') || bNormalized.includes('geral'))) return area.name;
             }
         }
-        return 'Geral'; // fallback
+        return 'Geral';
+    };
+
+    const getCityForBranch = (bName: string): string => {
+        const n = bName.toUpperCase();
+        if (n.includes('MATRIZ') || n.includes('SAO GABRIEL') || n.includes('SÃO GABRIEL')) return 'SÃO GABRIEL';
+        if (n.includes('LIVRAMENTO')) return 'LIVRAMENTO';
+        if (n.includes('ROSARIO')) return 'ROSARIO';
+        if (n.includes('SANTIAGO')) return 'SANTIAGO';
+        if (n.includes('ALEGRETE')) return 'ALEGRETE';
+        if (n.includes('CACAPAVA')) return 'CACAPAVA';
+        if (n.includes('QUARAI')) return 'QUARAÍ';
+        if (n.includes('SÃO BORJA') || n.includes('SAO BORJA')) return 'SÃO BORJA';
+        
+        return 'SÃO GABRIEL'; // Fallback
     };
 
     useEffect(() => {
@@ -179,13 +193,21 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     const rowAOA = vendasRawAOA[idx + 1] || {};
                     const rawFValue = rowAOA['F'] ?? rowAOA['f'];
 
-                    const allVals = Object.values(row).map(v => String(v).trim()).filter(v => v);
+                    const allVals = Object.values(row)
+                        .filter(v => v !== null && v !== undefined)
+                        .map(v => String(v).trim())
+                        .filter(v => v && v.toLowerCase() !== 'null');
                     const wholeRowStr = allVals.join(' ');
                     
-                    if (wholeRowStr.toLowerCase().includes('filial:') && allVals.length <= 4) {
-                        const branchNameMatched = wholeRowStr.split(/filial:/i)[1]?.trim();
-                        if (branchNameMatched && branchNameMatched.length > 2) {
-                            currentBranchStr = branchNameMatched;
+                    const lowerRow = wholeRowStr.toLowerCase();
+                    if ((lowerRow.includes('filial') || lowerRow.includes('loja') || lowerRow.includes('unidade')) && !lowerRow.includes('total')) {
+                        // Regex ganancioso para capturar a string inteira após a palavra-chave
+                        const match = wholeRowStr.match(/(?:filial|loja|unidade)\s*:?\s*(.*)/i);
+                        if (match && match[1]) {
+                            const branchNameMatched = match[1].trim();
+                            if (branchNameMatched && branchNameMatched.length >= 1) {
+                                currentBranchStr = branchNameMatched;
+                            }
                         }
                         return; // It's just a header row
                     }
@@ -234,6 +256,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     parsedVendas.push({
                         branchName: currentBranchStr,
                         areaName: getAreaForBranch(currentBranchStr),
+                        cityName: getCityForBranch(currentBranchStr),
                         name: gp,
                         estoque: findVal(row, ['estoque']),
                         volumeVend: rVolVend,
@@ -329,15 +352,8 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         }
 
         if (selectedCity !== 'ALL') {
-            const cityNormalized = selectedCity.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-            const cityMatch = (bName: string) => {
-                const upper = bName.toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-                return upper.includes(cityNormalized) || 
-                    (selectedCity === 'SÃO GABRIEL' && upper.includes('MATRIZ'));
-            };
-                
-            filteredVendas = filteredVendas.filter(r => cityMatch(r.branchName));
-            filteredEcom = filteredEcom.filter(r => cityMatch(r.branchName));
+            filteredVendas = filteredVendas.filter(r => r.cityName === selectedCity);
+            filteredEcom = filteredEcom.filter(r => getCityForBranch(r.branchName) === selectedCity);
         }
 
         if (selectedBranch !== 'ALL') {
@@ -425,6 +441,8 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
             if (!filiaisMap.has(bName)) {
                 filiaisMap.set(bName, {
                     branchName: bName,
+                    areaName: r.areaName,
+                    cityName: r.cityName,
                     vlrVenda: 0,
                     vlrCusto: 0,
                     volumeVend: 0,
@@ -487,18 +505,9 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
     const avaliableCities = useMemo(() => {
         let base = rawState.rawLinesVendas;
         if (selectedArea !== 'ALL') base = base.filter(r => r.areaName === selectedArea);
-        
         const cities = new Set<string>();
         base.forEach(r => {
-            const parts = r.branchName.split('-');
-            if (parts.length > 1) {
-                let city = parts[1].replace(/[\d\.\/]+.*$/, '').trim().toUpperCase();
-                // Força unificação
-                if (city === 'MATRIZ') city = 'SÃO GABRIEL';
-                if (city === 'SAO GABRIEL' || city === 'SÃO GABRIEL') city = 'SÃO GABRIEL';
-                
-                if (city && city.length > 2) cities.add(city);
-            }
+            if (r.cityName) cities.add(r.cityName);
         });
         return Array.from(cities).sort((a, b) => a.localeCompare(b));
     }, [rawState.rawLinesVendas, selectedArea]);
@@ -675,6 +684,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     <table className="w-full text-left border-collapse min-w-[700px]">
                         <thead className="sticky top-0 z-10">
                             <tr className="bg-white/90 backdrop-blur-md border-b border-gray-200 text-[10px] font-black tracking-widest uppercase text-gray-400 shadow-sm">
+                                <th className="py-4 px-6 font-bold whitespace-nowrap">Mapeamento</th>
                                 <th className="py-4 px-6 font-bold whitespace-nowrap">Filial</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Fat. Líquido</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Tkt Médio (Líq)</th>
@@ -682,12 +692,18 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Share HB (%)</th>
                                 <th className="py-4 px-6 font-bold text-right whitespace-nowrap">CMV (%)</th>
                                 <th className="py-4 px-6 font-bold text-right border-x border-gray-100 bg-gray-50/50 whitespace-nowrap">E-Commerce</th>
-                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Devol.</th>
+                                <th className="py-4 px-6 font-bold text-right whitespace-nowrap">Devol..</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-50">
                             {filteredData.filiais.map((f: any, idx: number) => (
                                 <tr key={idx} className="hover:bg-indigo-50/30 transition-colors">
+                                    <td className="py-3 px-6 text-xs font-medium text-gray-500 whitespace-nowrap">
+                                        <div className="flex flex-col">
+                                            <span className="text-[9px] font-black uppercase text-indigo-400">{f.areaName}</span>
+                                            <span className="text-[9px] font-bold text-gray-400">{f.cityName}</span>
+                                        </div>
+                                    </td>
                                     <td className="py-3 px-6 text-sm font-bold text-gray-900 whitespace-nowrap">{f.branchName}</td>
                                     <td className="py-3 px-6 text-sm font-black text-emerald-600 text-right whitespace-nowrap">{formatBRL(f.vlrVenda)}</td>
                                     <td className="py-3 px-6 text-sm font-bold text-indigo-600 text-right whitespace-nowrap">{formatBRL(f.ticketMedio)}</td>
