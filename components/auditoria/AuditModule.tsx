@@ -3001,7 +3001,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     if (!resolvedScope.deptId && deptByReduced.deptId) {
                         resolvedScope.deptId = deptByReduced.deptId;
                     }
-                    if ((!resolvedScope.deptName || resolvedScope.deptName === 'OUTROS') && deptByReduced.deptName) {
+                    if ((!resolvedScope.deptName || resolvedScope.deptName === 'OUTROS' || resolvedScope.deptName === UNCLASSIFIED_DEPT_NAME) && deptByReduced.deptName) {
                         resolvedScope.deptName = deptByReduced.deptName;
                     }
                 }
@@ -3009,14 +3009,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     if (!resolvedScope.catId && catByReduced.catId) {
                         resolvedScope.catId = catByReduced.catId;
                     }
-                    if ((!resolvedScope.catName || resolvedScope.catName === 'GERAL') && catByReduced.catName) {
+                    if ((!resolvedScope.catName || resolvedScope.catName === 'GERAL' || resolvedScope.catName === UNCLASSIFIED_CAT_NAME) && catByReduced.catName) {
                         resolvedScope.catName = catByReduced.catName;
                     }
                     if (catByReduced.deptName) {
                         if (!resolvedScope.deptId) {
                             resolvedScope.deptId = resolveIdByDescription(catByReduced.deptName, deptIdByDescription, deptDescEntries);
                         }
-                        if ((!resolvedScope.deptName || resolvedScope.deptName === 'OUTROS')) {
+                        if ((!resolvedScope.deptName || resolvedScope.deptName === 'OUTROS' || resolvedScope.deptName === UNCLASSIFIED_DEPT_NAME)) {
                             const deptParsed = parseHierarchyCell(catByReduced.deptName, "OUTROS");
                             resolvedScope.deptName = deptParsed.name || resolvedScope.deptName;
                             if (!resolvedScope.deptId && deptParsed.numericId) {
