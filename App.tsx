@@ -4905,7 +4905,7 @@ const App: React.FC = () => {
     useEffect(() => {
         const previousView = prevViewRef.current;
         prevViewRef.current = currentView;
-        if (!currentUser) return;
+        if (!currentUser || isLoadingData) return;
         if (currentView !== 'dashboard') return;
         // Atualiza automaticamente apenas ao ENTRAR na tela de dashboard.
         // Em F5, o currentUser pode chegar depois e previousView já ser "dashboard".
@@ -4913,7 +4913,7 @@ const App: React.FC = () => {
         if (previousView === 'dashboard' && dashboardAuditsFetchedAt && completedDashboardAuditsFetchedAt) return;
         void loadDashboardAuditSessions();
         void loadCompletedDashboardAuditSessions();
-    }, [currentView, currentUser, loadDashboardAuditSessions, loadCompletedDashboardAuditSessions, dashboardAuditsFetchedAt, completedDashboardAuditsFetchedAt]);
+    }, [currentView, currentUser, isLoadingData, loadDashboardAuditSessions, loadCompletedDashboardAuditSessions, dashboardAuditsFetchedAt, completedDashboardAuditsFetchedAt]);
 
     const logBranchOptions = useMemo(() => {
         // Usa Map normalizado para deduplicar variações: '8' e 'Filial 8' → 'Filial 8'
