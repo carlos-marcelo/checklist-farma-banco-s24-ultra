@@ -837,40 +837,42 @@ const ExcelMetricsDashboard: React.FC<{
             <div className="grid grid-cols-3 gap-2">
                 <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 min-w-0">
                     <span className="text-[8px] text-slate-500 font-bold uppercase tracking-widest block mb-1">Est. Sist (Qtde)</span>
-                    <span className="mobile-metric-number text-[12px] sm:text-[14px] font-black text-slate-700 leading-tight break-words">{Math.round(metrics.sysQty).toLocaleString('pt-BR')} un.</span>
+                    <span className="mobile-metric-number text-[11px] sm:text-[13px] 2xl:text-[14px] font-black text-slate-700 leading-tight whitespace-nowrap tracking-tighter block">{Math.round(metrics.sysQty).toLocaleString('pt-BR')} un.</span>
                 </div>
                 <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 min-w-0">
                     <span className="text-[8px] text-slate-500 font-bold uppercase tracking-widest block mb-1">Est. Físico (Qtde)</span>
-                    <span className="mobile-metric-number text-[12px] sm:text-[14px] font-black text-slate-700 leading-tight break-words">{Math.round(metrics.countedQty).toLocaleString('pt-BR')} un.</span>
+                    <span className="mobile-metric-number text-[11px] sm:text-[13px] 2xl:text-[14px] font-black text-slate-700 leading-tight whitespace-nowrap tracking-tighter block">{Math.round(metrics.countedQty).toLocaleString('pt-BR')} un.</span>
                 </div>
                 <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 min-w-0">
                     <span className="text-[8px] text-slate-500 font-bold uppercase tracking-widest block mb-1">Diferença (Qtde)</span>
-                    <span className={`mobile-metric-number text-[12px] sm:text-[14px] font-black leading-tight break-words ${metrics.diffQty < 0 ? 'text-red-600' : metrics.diffQty > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                    <span className={`mobile-metric-number text-[11px] sm:text-[13px] 2xl:text-[14px] font-black leading-tight whitespace-nowrap tracking-tighter block ${metrics.diffQty < 0 ? 'text-red-600' : metrics.diffQty > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
                         {metrics.diffQty > 0 ? '+' : ''}{Math.round(metrics.diffQty).toLocaleString('pt-BR')} un.
                     </span>
                 </div>
             </div>
-            <div className="grid grid-cols-3 gap-2 mt-2">
+            <div className="grid grid-cols-2 gap-2 mt-2">
                 <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 min-w-0">
                     <span className="text-[8px] text-slate-500 font-bold uppercase tracking-widest block mb-1">Custo Sist</span>
-                    <span className="mobile-metric-number text-[12px] sm:text-[14px] font-black text-slate-700 leading-tight break-words">{metrics.sysCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                    <span className="mobile-metric-number text-[12px] sm:text-[14px] font-black text-slate-700 leading-tight whitespace-nowrap tracking-tighter block">{metrics.sysCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
                 </div>
                 <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 min-w-0">
                     <span className="text-[8px] text-slate-500 font-bold uppercase tracking-widest block mb-1">Custo Físico</span>
-                    <span className="mobile-metric-number text-[12px] sm:text-[14px] font-black text-slate-700 leading-tight break-words">{metrics.countedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                    <span className="mobile-metric-number text-[12px] sm:text-[14px] font-black text-slate-700 leading-tight whitespace-nowrap tracking-tighter block">{metrics.countedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
                 </div>
-                <div className={`border rounded-lg p-2 min-w-0 ${metrics.diffCost < 0 ? 'bg-red-50 border-red-200' : metrics.diffCost > 0 ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-100'}`}>
+                <div className={`col-span-2 border rounded-lg p-3 min-w-0 ${metrics.diffCost < 0 ? 'bg-red-50 border-red-200' : metrics.diffCost > 0 ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-100'}`}>
                     <span className="text-[8px] text-slate-500 font-bold uppercase tracking-widest block mb-1">Resultado Fin.</span>
-                    <span className={`mobile-metric-number text-[12px] sm:text-[14px] font-black leading-tight break-words ${metrics.diffCost < 0 ? 'text-red-700' : metrics.diffCost > 0 ? 'text-emerald-700' : 'text-slate-500'}`}>
+                    <span className={`mobile-metric-number text-[14px] sm:text-[16px] font-black leading-tight whitespace-nowrap tracking-tighter block ${metrics.diffCost < 0 ? 'text-red-700' : metrics.diffCost > 0 ? 'text-emerald-700' : 'text-slate-500'}`}>
                         {metrics.diffCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
                     </span>
-                    {metrics.diffCost < 0 && <span className="text-[8px] font-black text-red-500 uppercase block">Prejuízo</span>}
-                    {metrics.diffCost > 0 && <span className="text-[8px] font-black text-emerald-600 uppercase block">Sobra</span>}
-                    {representativity !== null && (
-                        <span className="text-[8px] font-black text-slate-600 uppercase tracking-widest block mt-1">
-                            Rep. Auditada: {representativity.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
-                        </span>
-                    )}
+                    <div className="flex items-center gap-3 mt-1">
+                        {metrics.diffCost < 0 && <span className="text-[9px] font-black text-red-500 uppercase">Prejuízo</span>}
+                        {metrics.diffCost > 0 && <span className="text-[9px] font-black text-emerald-600 uppercase">Sobra</span>}
+                        {representativity !== null && (
+                            <span className="text-[9px] font-black text-slate-600 uppercase tracking-widest">
+                                Rep: {representativity.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
+                            </span>
+                        )}
+                    </div>
                 </div>
             </div>
         </div>
