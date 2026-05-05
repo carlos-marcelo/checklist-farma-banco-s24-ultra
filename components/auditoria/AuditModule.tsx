@@ -7709,8 +7709,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         const startLabel = catStatus === AuditStatus.IN_PROGRESS ? 'PAUSAR' : 'INICIAR';
                         const catProgressValue = catStatus === AuditStatus.DONE ? 100 : catStatus === AuditStatus.IN_PROGRESS ? 50 : 0;
                         return (
-                            <div key={cat.id} className={`p-4 sm:p-6 rounded-[2rem] border-2 flex flex-col gap-4 sm:gap-6 transition-all hover:shadow-lg group ${catStatus === AuditStatus.DONE ? 'border-slate-200 bg-white' : catStatus === AuditStatus.IN_PROGRESS ? 'border-blue-200 bg-blue-50/40' : 'border-slate-50 bg-white'}`}>
-                                <div className="min-w-0">
+                            <div key={cat.id} className={`p-4 sm:p-6 lg:p-8 rounded-[2rem] border-2 flex flex-col lg:flex-row items-stretch lg:items-center gap-4 sm:gap-6 lg:gap-10 transition-all hover:shadow-lg group ${catStatus === AuditStatus.DONE ? 'border-slate-200 bg-white' : catStatus === AuditStatus.IN_PROGRESS ? 'border-blue-200 bg-blue-50/40' : 'border-slate-50 bg-white'}`}>
+                                <div className="flex flex-col items-center justify-center bg-slate-50 rounded-[2rem] p-4 sm:p-6 w-full lg:w-auto lg:min-w-[160px] border border-slate-100 shadow-inner">
+                                    <span className="text-[9px] font-black text-slate-400 uppercase mb-2 italic">SISTEMA ID</span>
+                                    <span className="text-5xl font-black text-indigo-700 leading-none tracking-tighter">{cat.numericId || '--'}</span>
+                                </div>
+                                <div className="flex-1 min-w-0 flex flex-col gap-4 sm:gap-6">
+                                    <div className="min-w-0">
                                     <h3 onClick={() => setView(prev => ({ ...prev, level: 'products', selectedCatId: cat.id }))} className={`font-black text-xl sm:text-2xl uppercase italic leading-tight cursor-pointer hover:underline transition-all break-words ${catStatus === AuditStatus.DONE ? 'text-slate-900' : catStatus === AuditStatus.IN_PROGRESS ? 'text-blue-900' : 'text-slate-900'} tracking-tight sm:tracking-tighter`}>{cat.name}</h3>
                                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-6 mt-3 items-start">
                                         <div className="flex flex-col min-w-0">
@@ -7768,6 +7773,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     >
                                         {!canFinalize ? 'INICIE A AUDITORIA' : catStatus === AuditStatus.DONE ? 'CONCLUÍDO' : 'FINALIZAR'}
                                     </button>
+                                </div>
                                 </div>
                             </div>
                         )
