@@ -60,6 +60,8 @@ export interface AuditData {
     lastPartialBatchId?: string;
     sharedExcelMetrics?: any;
     sharedGroupExcelMetrics?: Record<string, any>;
+    pendingSync?: boolean;
+    lastLocalUpdate?: string;
 }
 
 export interface ViewState {

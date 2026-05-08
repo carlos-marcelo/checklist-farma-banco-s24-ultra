@@ -898,6 +898,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [data, setData] = useState<AuditData | null>(null);
     const [view, setView] = useState<ViewState>({ level: 'groups' });
     const [isProcessing, setIsProcessing] = useState(false);
+    const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+    const [isSyncing, setIsSyncing] = useState(false);
+    const [showOfflineAlert, setShowOfflineAlert] = useState(false);
     const [isTrierLoading, setIsTrierLoading] = useState(false);
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [trierError, setTrierError] = useState<string | null>(null);
@@ -1028,6 +1031,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
                 lastAuditUpdateRef.current = meta.updated_at;
                 forceFreshFetch = true;
+            }
+
+            const localData = await AuditStorage.loadLocalAuditSession();
+            const hasPendingSync = !!localData?.pendingSync;
+
+            // Se temos dados pendentes localmente e estamos online, tentamos sincronizar antes de carregar
+            if (hasPendingSync && typeof navigator !== 'undefined' && navigator.onLine && localData && !silent) {
+                try {
+                    setIsSyncing(true);
+                    const synced = await upsertAuditSession({
+                        id: dbSessionId,
+                        branch: selectedFilial,
+                        audit_number: nextAuditNumber,
+                        status: 'open',
+                        data: localData,
+                        progress: calculateProgress(localData),
+                        user_email: userEmail,
+                        updated_at: lastAuditUpdateRef.current || undefined
+                    });
+                    if (synced) {
+                        await AuditStorage.saveLocalAuditSession(localData, false);
+                        console.log("Sincronização automática concluída com sucesso.");
+                    }
+                } catch (e) {
+                    console.error("Falha na sincronização automática inicial:", e);
+                } finally {
+                    setIsSyncing(false);
+                }
             }
 
             const cacheKey = `audit_session_${selectedFilial}`;
@@ -1371,11 +1402,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         [branchAuditsHistory]
     );
     // Polling de sincronização entre usuários
+    // Polling de sincronização entre usuários
     useEffect(() => {
         if (!selectedFilial) return;
         const syncNow = () => loadAuditNum(true);
 
-        // Aba ativa: sincroniza rápido. Aba oculta: reduz frequência para economizar.
         const getIntervalMs = () => (document.hidden ? 12000 : 5000);
         let interval = setInterval(syncNow, getIntervalMs());
 
@@ -1400,6 +1431,25 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             window.removeEventListener('focus', handleVisibilityOrFocus);
         };
     }, [selectedFilial, loadAuditNum]);
+
+    // Network Connectivity monitoring
+    useEffect(() => {
+        const updateOnlineStatus = () => {
+            const online = navigator.onLine;
+            setIsOnline(online);
+            if (online) {
+                void loadAuditNum(true);
+            }
+        };
+
+        window.addEventListener('online', updateOnlineStatus);
+        window.addEventListener('offline', updateOnlineStatus);
+
+        return () => {
+            window.removeEventListener('online', updateOnlineStatus);
+            window.removeEventListener('offline', updateOnlineStatus);
+        };
+    }, [loadAuditNum]);
 
     // Derived inventory number (Auto-generated)
     const inventoryNumber = useMemo(() => {
@@ -1561,7 +1611,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     useEffect(() => {
         if (data) {
-            AuditStorage.saveLocalAuditSession(data);
+            // Preserva a flag de pendingSync se ela já existir no data
+            AuditStorage.saveLocalAuditSession(data, !!data.pendingSync);
         }
     }, [data]);
 
@@ -1572,60 +1623,54 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const branch = String(session.branch || '');
         if (!branch || !session.audit_number) return null;
 
-        const latestMeta = await fetchLatestAuditMetadata(branch);
-        const baseUpdatedAt = session.updated_at || lastAuditUpdateRef.current || null;
-        const isSameAudit = !!latestMeta && latestMeta.audit_number === session.audit_number;
-        const allowProgressRegression = !!options?.allowProgressRegression;
-
-        const freshLatest = isSameAudit ? await fetchLatestAudit(branch) : null;
-        const latestSession = freshLatest || await fetchLatestAudit(branch);
-        if (
-            latestSession &&
-            latestSession.status !== 'completed' &&
-            latestSession.audit_number !== session.audit_number
-        ) {
-            setNextAuditNumber(latestSession.audit_number);
-            setDbSessionId(latestSession.id);
-            alert(
-                `Não é permitido criar/iniciar o inventário Nº ${session.audit_number} enquanto o inventário Nº ${latestSession.audit_number} estiver em aberto.\n\n` +
-                `Finalize, reabra o mesmo número ou exclua o inventário aberto para continuar.`
-            );
-            return null;
-        }
         const incomingData = (session.data as AuditData) || null;
         const incomingStrength = getAuditDataStrength(incomingData);
-        const remoteStrength = getAuditDataStrength((freshLatest?.data as AuditData) || null);
-        const incomingGroupsCount = Array.isArray(incomingData?.groups) ? incomingData.groups.length : 0;
         const incomingProgress = Number(session.progress || 0);
-        if (
-            !allowProgressRegression &&
-            freshLatest &&
-            freshLatest.audit_number === session.audit_number &&
-            remoteStrength > 0 &&
-            incomingStrength < remoteStrength &&
-            (incomingStrength <= 0 || incomingGroupsCount === 0 || incomingProgress <= 0.1)
-        ) {
-            const recovered = reconcileAuditStateFromCompletedScopes(freshLatest.data as AuditData);
-            const normalizedRecovered = (normalizeAuditDataStructure(recovered).data || recovered) as AuditData;
-            setData(normalizedRecovered);
-            setTermDrafts(((normalizedRecovered as any).termDrafts || {}) as Record<string, TermForm>);
-            setDbSessionId(freshLatest.id);
-            setNextAuditNumber(freshLatest.audit_number);
-            lastAuditUpdateRef.current = freshLatest.updated_at || latestMeta?.updated_at || null;
-            await CacheService.set(`audit_session_${branch}`, { ...freshLatest, data: normalizedRecovered } as any);
-            await CacheService.set(`audit_session_lastgood_${branch}`, { ...freshLatest, data: normalizedRecovered } as any);
-            alert("Bloqueamos uma sobrescrita de dados parciais para proteger os dados já gravados.");
-            return null;
+
+        // Se estiver offline ou a conexão cair, salvamos apenas localmente com flag
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            if (incomingData) {
+                await AuditStorage.saveLocalAuditSession(incomingData, true);
+                setData(prev => prev ? { ...prev, pendingSync: true } : prev);
+            }
+            return { ...session, updated_at: new Date().toISOString() };
         }
-        if (
-            !allowProgressRegression &&
-            freshLatest &&
-            freshLatest.audit_number === session.audit_number &&
-            incomingProgress <= 0.1 &&
-            Number(freshLatest.progress || 0) >= 1 &&
-            incomingProgress + 0.001 < Number(freshLatest.progress || 0)
-        ) {
-            if (freshLatest?.data) {
+
+        try {
+            setIsSyncing(true);
+            const latestMeta = await fetchLatestAuditMetadata(branch);
+            const baseUpdatedAt = session.updated_at || lastAuditUpdateRef.current || null;
+            const isSameAudit = !!latestMeta && latestMeta.audit_number === session.audit_number;
+            const allowProgressRegression = !!options?.allowProgressRegression;
+
+            const freshLatest = isSameAudit ? await fetchLatestAudit(branch) : null;
+            const latestSession = freshLatest || (isSameAudit ? null : await fetchLatestAudit(branch));
+            
+            if (
+                latestSession &&
+                latestSession.status !== 'completed' &&
+                latestSession.audit_number !== session.audit_number
+            ) {
+                setNextAuditNumber(latestSession.audit_number);
+                setDbSessionId(latestSession.id);
+                alert(
+                    `Não é permitido criar/iniciar o inventário Nº ${session.audit_number} enquanto o inventário Nº ${latestSession.audit_number} estiver em aberto.\n\n` +
+                    `Finalize, reabra o mesmo número ou exclua o inventário aberto para continuar.`
+                );
+                return null;
+            }
+            
+            const remoteStrength = getAuditDataStrength((freshLatest?.data as AuditData) || null);
+            const incomingGroupsCount = Array.isArray(incomingData?.groups) ? incomingData.groups.length : 0;
+            
+            if (
+                !allowProgressRegression &&
+                freshLatest &&
+                freshLatest.audit_number === session.audit_number &&
+                remoteStrength > 0 &&
+                incomingStrength < remoteStrength &&
+                (incomingStrength <= 0 || incomingGroupsCount === 0 || incomingProgress <= 0.1)
+            ) {
                 const recovered = reconcileAuditStateFromCompletedScopes(freshLatest.data as AuditData);
                 const normalizedRecovered = (normalizeAuditDataStructure(recovered).data || recovered) as AuditData;
                 setData(normalizedRecovered);
@@ -1634,46 +1679,84 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 setNextAuditNumber(freshLatest.audit_number);
                 lastAuditUpdateRef.current = freshLatest.updated_at || latestMeta?.updated_at || null;
                 await CacheService.set(`audit_session_${branch}`, { ...freshLatest, data: normalizedRecovered } as any);
+                await CacheService.set(`audit_session_lastgood_${branch}`, { ...freshLatest, data: normalizedRecovered } as any);
+                alert("Bloqueamos uma sobrescrita de dados parciais para proteger os dados já gravados.");
+                return null;
             }
-            alert("Bloqueamos uma sobrescrita de progresso antigo para proteger contagens finalizadas.");
-            return null;
-        }
-
-        if (isSameAudit && latestMeta?.updated_at && baseUpdatedAt) {
-            const remoteTs = new Date(latestMeta.updated_at).getTime();
-            const baseTs = new Date(baseUpdatedAt).getTime();
-            if (Number.isFinite(remoteTs) && Number.isFinite(baseTs) && remoteTs > baseTs + 1000) {
-                const fresh = freshLatest || await fetchLatestAudit(branch);
-                if (fresh?.data) {
-                    const recovered = reconcileAuditStateFromCompletedScopes(fresh.data as AuditData);
+            if (
+                !allowProgressRegression &&
+                freshLatest &&
+                freshLatest.audit_number === session.audit_number &&
+                incomingProgress <= 0.1 &&
+                Number(freshLatest.progress || 0) >= 1 &&
+                incomingProgress + 0.001 < Number(freshLatest.progress || 0)
+            ) {
+                if (freshLatest?.data) {
+                    const recovered = reconcileAuditStateFromCompletedScopes(freshLatest.data as AuditData);
                     const normalizedRecovered = (normalizeAuditDataStructure(recovered).data || recovered) as AuditData;
                     setData(normalizedRecovered);
                     setTermDrafts(((normalizedRecovered as any).termDrafts || {}) as Record<string, TermForm>);
-                    setDbSessionId(fresh.id);
-                    setNextAuditNumber(fresh.audit_number);
-                    lastAuditUpdateRef.current = fresh.updated_at || latestMeta.updated_at || null;
-                    await CacheService.set(`audit_session_${branch}`, { ...fresh, data: normalizedRecovered } as any);
-                    await CacheService.set(`audit_session_lastgood_${branch}`, { ...fresh, data: normalizedRecovered } as any);
+                    setDbSessionId(freshLatest.id);
+                    setNextAuditNumber(freshLatest.audit_number);
+                    lastAuditUpdateRef.current = freshLatest.updated_at || latestMeta?.updated_at || null;
+                    await CacheService.set(`audit_session_${branch}`, { ...freshLatest, data: normalizedRecovered } as any);
                 }
-                alert("A auditoria foi atualizada por outro usuário/aba. Recarregamos os dados mais novos para evitar sobrescrita.");
+                alert("Bloqueamos uma sobrescrita de progresso antigo para proteger contagens finalizadas.");
                 return null;
             }
-        }
 
-        const normalizedIncoming = normalizeAuditDataStructure((session.data as AuditData) || null);
-        const saved = await upsertAuditSession({
-            ...session,
-            data: (normalizedIncoming.data || session.data) as any,
-            updated_at: baseUpdatedAt || undefined
-        });
-        if (saved?.updated_at) {
-            lastAuditUpdateRef.current = saved.updated_at;
-            const reconciled = saved.data ? reconcileAuditStateFromCompletedScopes(saved.data as AuditData) : null;
-            if (reconciled && getAuditDataStrength(reconciled) > 0) {
-                await CacheService.set(`audit_session_lastgood_${branch}`, { ...saved, data: reconciled } as any);
+            if (isSameAudit && latestMeta?.updated_at && baseUpdatedAt) {
+                const remoteTs = new Date(latestMeta.updated_at).getTime();
+                const baseTs = new Date(baseUpdatedAt).getTime();
+                if (Number.isFinite(remoteTs) && Number.isFinite(baseTs) && remoteTs > baseTs + 1000) {
+                    const fresh = freshLatest || await fetchLatestAudit(branch);
+                    if (fresh?.data) {
+                        const recovered = reconcileAuditStateFromCompletedScopes(fresh.data as AuditData);
+                        const normalizedRecovered = (normalizeAuditDataStructure(recovered).data || recovered) as AuditData;
+                        setData(normalizedRecovered);
+                        setTermDrafts(((normalizedRecovered as any).termDrafts || {}) as Record<string, TermForm>);
+                        setDbSessionId(fresh.id);
+                        setNextAuditNumber(fresh.audit_number);
+                        lastAuditUpdateRef.current = fresh.updated_at || latestMeta.updated_at || null;
+                        await CacheService.set(`audit_session_${branch}`, { ...fresh, data: normalizedRecovered } as any);
+                        await CacheService.set(`audit_session_lastgood_${branch}`, { ...fresh, data: normalizedRecovered } as any);
+                    }
+                    alert("A auditoria foi atualizada por outro usuário/aba. Recarregamos os dados mais novos para evitar sobrescrita.");
+                    return null;
+                }
             }
+
+            const normalizedIncoming = normalizeAuditDataStructure((session.data as AuditData) || null);
+            const saved = await upsertAuditSession({
+                ...session,
+                data: (normalizedIncoming.data || session.data) as any,
+                updated_at: baseUpdatedAt || undefined
+            });
+            
+            if (saved?.updated_at) {
+                lastAuditUpdateRef.current = saved.updated_at;
+                const reconciled = saved.data ? reconcileAuditStateFromCompletedScopes(saved.data as AuditData) : null;
+                if (reconciled && getAuditDataStrength(reconciled) > 0) {
+                    await CacheService.set(`audit_session_lastgood_${branch}`, { ...saved, data: reconciled } as any);
+                }
+                // Limpa flag de pendência local ao sincronizar com sucesso
+                if (incomingData) {
+                    await AuditStorage.saveLocalAuditSession(incomingData, false);
+                    setData(prev => prev ? { ...prev, pendingSync: false } : prev);
+                }
+            }
+            return saved;
+        } catch (err) {
+            console.error("Erro ao persistir sessão (possível queda de rede):", err);
+            if (incomingData) {
+                await AuditStorage.saveLocalAuditSession(incomingData, true);
+                setData(prev => prev ? { ...prev, pendingSync: true } : prev);
+            }
+            // Retorna um objeto simulando sucesso para não travar a UI
+            return { ...session, updated_at: new Date().toISOString() };
+        } finally {
+            setIsSyncing(false);
         }
-        return saved;
     }, []);
 
     const handleSafeExit = async () => {
@@ -7209,9 +7292,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 FILIAL <span className="hidden sm:inline">UNIDADE </span>F{data.filial}
                             </span>
                         </div>
-                        <div className="ml-3 md:ml-6 flex flex-col items-center shrink-0">
-                            <div className="w-3 h-3 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_10px_#34d399]"></div>
-                            <span className="text-[8px] font-bold text-emerald-400 mt-1 uppercase">LIVE</span>
+                        <div className="ml-3 md:ml-6 flex flex-col items-center shrink-0 min-w-[32px]">
+                            <div className={`w-3 h-3 rounded-full transition-all duration-500 ${
+                                !isOnline ? 'bg-red-500 shadow-[0_0_10px_#ef4444]' :
+                                isSyncing ? 'bg-blue-400 animate-spin shadow-[0_0_10px_#60a5fa]' : 
+                                data?.pendingSync ? 'bg-amber-400 animate-pulse shadow-[0_0_10px_#fbbf24]' : 
+                                'bg-emerald-400 animate-pulse shadow-[0_0_10px_#34d399]'
+                            }`}></div>
+                            <span className={`text-[8px] font-black mt-1 uppercase tracking-tighter ${
+                                !isOnline ? 'text-red-400' :
+                                isSyncing ? 'text-blue-400' : 
+                                data?.pendingSync ? 'text-amber-400' : 
+                                'text-emerald-400'
+                            }`}>
+                                {!isOnline ? 'OFF' : isSyncing ? 'SYNC' : data?.pendingSync ? 'PEND' : 'LIVE'}
+                            </span>
                         </div>
                     </div>
                     <div className="hidden lg:flex flex-col items-start px-4 py-2 rounded-xl bg-white/5 border border-white/10 min-w-[130px]">

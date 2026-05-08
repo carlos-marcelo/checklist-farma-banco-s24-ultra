@@ -26,7 +26,7 @@ export async function loadLocalAuditSession(): Promise<AuditData | null> {
 /**
  * Salva a sessão de auditoria no IndexedDB
  */
-export async function saveLocalAuditSession(data: AuditData): Promise<void> {
+export async function saveLocalAuditSession(data: AuditData, pendingSync: boolean = false): Promise<void> {
     if (!data) return;
     try {
         // Tenta remover do localStorage caso exista (migração)
@@ -34,7 +34,13 @@ export async function saveLocalAuditSession(data: AuditData): Promise<void> {
             window.localStorage.removeItem(LOCAL_AUDIT_SESSION_KEY);
         } catch (e) { }
 
-        await auditStore.setItem(LOCAL_AUDIT_SESSION_KEY, data);
+        const updatedData = {
+            ...data,
+            pendingSync,
+            lastLocalUpdate: new Date().toISOString()
+        };
+
+        await auditStore.setItem(LOCAL_AUDIT_SESSION_KEY, updatedData);
     } catch (error) {
         console.error('Erro ao salvar sessão no IndexedDB (Audit):', error);
     }
