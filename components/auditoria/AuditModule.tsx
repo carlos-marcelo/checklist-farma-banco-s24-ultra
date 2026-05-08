@@ -307,8 +307,12 @@ const parseHierarchyCell = (value: unknown, fallbackName: string) => {
         .replace(/\s+/g, ' ')
         .trim();
 
+    const isUnclassified = name.toUpperCase().includes('SEM DEPARTAMENTO') || 
+                           name.toUpperCase().includes('SEM CATEGORIA') || 
+                           name.toUpperCase() === 'OUTROS';
+
     return {
-        numericId: numericId !== null ? String(numericId) : '',
+        numericId: (numericId !== null && !isUnclassified) ? String(numericId) : '',
         name: name || raw || fallbackName
     };
 };
@@ -2165,10 +2169,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const normalizeBarcode = (val: any): string => {
         if (val === null || val === undefined) return "";
+        let s = String(val).trim().replace(/^'/, "");
         if (typeof val === 'number' && Number.isFinite(val)) {
             return String(Math.trunc(val)).replace(/^0+/, "");
         }
-        let s = val.toString().trim();
+        if (s.includes('-')) {
+            s = s.split('-')[0];
+        }
         if (s.includes('E+') || s.includes('e+')) {
             s = Number(val).toLocaleString('fullwide', { useGrouping: false });
         }
@@ -2767,6 +2774,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const productsByName: Record<string, ProductScope[]> = {};
             const catReportByReduced: Record<string, { catId: string; catName: string; deptName: string }> = {};
             const deptReportByReduced: Record<string, { deptId: string; deptName: string }> = {};
+            const deptReportByName: Record<string, { deptId: string; deptName: string }> = {};
+            const catReportByName: Record<string, { catId: string; catName: string; deptName: string }> = {};
             const deptIdByDescription: Record<string, string> = {};
             const catIdByDescription: Record<string, string> = {};
             const deptDescEntries: Array<{ key: string; id: string }> = [];
@@ -2774,6 +2783,19 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             const normalizeDescriptionKey = (value: unknown) =>
                 normalizeLookupText(cleanDescription(String(value ?? '')));
+
+            const superClean = (str: unknown) => 
+                normalizeDescriptionKey(str).replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+
+            const isStrictBarcode = (val: any) => {
+                if (val == null || val === '') return false;
+                let s = String(val).trim().replace(/^'/, '');
+                if (/^\d+(?:-\d+)?(?:[.,]0+)?$/.test(s)) {
+                    const numOnly = s.replace(/\D/g, '');
+                    return numOnly.length >= 3;
+                }
+                return false;
+            };
 
             const fillIdByDescription = (
                 rows: any[][],
@@ -2819,12 +2841,56 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     if (deptIdNow !== null) lastDeptId = String(deptIdNow);
                     const deptNameNowRaw = String(row[7] ?? '').trim(); // H
                     if (deptNameNowRaw) lastDeptName = deptNameNowRaw.replace(/^\s*(?:-|:|\/|\.)+\s*/, '').trim();
-                    const reduced = normalizeBarcode(row[2]); // C
-                    if (!reduced) return;
-                    deptReportByReduced[reduced] = {
-                        deptId: lastDeptId,
-                        deptName: lastDeptName
-                    };
+
+                    const firstCell = String(row[0] ?? '').trim();
+                    if (firstCell.toUpperCase().startsWith("DEPARTAMENTO") || /^\d+\s*-\s*[A-Z]/.test(firstCell)) {
+                        const parsed = parseHierarchyCell(firstCell.replace(/^DEPARTAMENTO:?\s*/i, ""), "");
+                        if (parsed.name && parsed.name !== "OUTROS" && parsed.name !== "GERAL") {
+                            lastDeptId = parsed.numericId || lastDeptId;
+                            lastDeptName = parsed.name;
+                        }
+                    }
+                    
+                    let inlineDeptId = lastDeptId;
+                    let inlineDeptName = lastDeptName;
+                    
+                    const cellId18 = parseSheetNumericCode(row[18]);
+                    const cellName18 = parseHierarchyCell(row[18], "").name;
+                    const cellName19 = String(row[19] || "").trim();
+
+                    if (cellId18 !== null) {
+                        inlineDeptId = String(cellId18);
+                    }
+                    if (cellName19 && cellName19.toUpperCase() !== "OUTROS") {
+                        inlineDeptName = cellName19;
+                    } else if (cellName18 && cellName18.toUpperCase() !== "OUTROS") {
+                        inlineDeptName = cellName18;
+                    }
+                    
+                    // Clear numeric ID if it's an unclassified bucket to prevent collision
+                    if (inlineDeptName.toUpperCase().includes('SEM DEPARTAMENTO') || inlineDeptName.toUpperCase().includes('SEM CATEGORIA') || inlineDeptName.toUpperCase() === 'OUTROS') {
+                        inlineDeptId = "";
+                    }
+                    
+                    let rowName = "";
+                    for (let i = 0; i < Math.min(row.length, 10); i++) {
+                        const val = String(row[i] || "").trim().replace(/^'/, '');
+                        if (val.length > 3 && /[a-zA-Z]/.test(val) && val.length > rowName.length) {
+                            rowName = val;
+                        }
+                    }
+                    const nameKey = superClean(rowName);
+
+                    const deptData = { deptId: inlineDeptId, deptName: inlineDeptName };
+
+                    for (let i = 0; i < Math.min(row.length, 20); i++) {
+                        if (isStrictBarcode(row[i])) {
+                            const red = normalizeBarcode(row[i]);
+                            if (red) deptReportByReduced[red] = deptData;
+                        }
+                    }
+
+                    if (nameKey) deptReportByName[nameKey] = deptData;
                 });
             }
 
@@ -2839,14 +2905,61 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     if (catIdNow !== null) lastCatId = String(catIdNow);
                     const catNameNowRaw = String(row[7] ?? '').trim(); // H
                     if (catNameNowRaw) lastCatName = catNameNowRaw.replace(/^\s*(?:-|:|\/|\.)+\s*/, '').trim();
-                    const reduced = normalizeBarcode(row[2]); // C
-                    if (!reduced) return;
-                    const deptName = String(row[19] ?? '').trim(); // T
-                    catReportByReduced[reduced] = {
-                        catId: lastCatId,
-                        catName: lastCatName,
-                        deptName
-                    };
+                    
+                    const firstCell = String(row[0] ?? '').trim();
+                    if (firstCell.toUpperCase().startsWith("CATEGORIA") || /^\d+\s*-\s*[A-Z]/.test(firstCell)) {
+                        const parsed = parseHierarchyCell(firstCell.replace(/^CATEGORIA:?\s*/i, ""), "");
+                        if (parsed.name && parsed.name !== "OUTROS" && parsed.name !== "GERAL") {
+                            lastCatId = parsed.numericId || lastCatId;
+                            lastCatName = parsed.name;
+                        }
+                    }
+
+                    let inlineCatId = lastCatId;
+                    let inlineCatName = lastCatName;
+                    
+                    const cellId22 = parseSheetNumericCode(row[22]);
+                    const cellName22 = parseHierarchyCell(row[22], "").name;
+                    const cellName23 = String(row[23] || "").trim();
+
+                    if (cellId22 !== null) {
+                        inlineCatId = String(cellId22);
+                    }
+                    if (cellName23 && cellName23.toUpperCase() !== "GERAL") {
+                        inlineCatName = cellName23;
+                    } else if (cellName22 && cellName22.toUpperCase() !== "GERAL") {
+                        inlineCatName = cellName22;
+                    }
+                    
+                    // Clear numeric ID if it's an unclassified bucket to prevent collision
+                    if (inlineCatName.toUpperCase().includes('SEM DEPARTAMENTO') || inlineCatName.toUpperCase().includes('SEM CATEGORIA') || inlineCatName.toUpperCase() === 'OUTROS' || inlineCatName.toUpperCase() === 'GERAL') {
+                        inlineCatId = "";
+                    }
+
+                    let rowName = "";
+                    for (let i = 0; i < Math.min(row.length, 10); i++) {
+                        const val = String(row[i] || "").trim().replace(/^'/, '');
+                        if (val.length > 3 && /[a-zA-Z]/.test(val) && val.length > rowName.length) {
+                            rowName = val;
+                        }
+                    }
+                    const nameKey = superClean(rowName);
+
+                    let deptName = String(row[19] ?? '').trim(); // T
+                    if (!deptName && row[18]) {
+                        deptName = parseHierarchyCell(row[18], "").name;
+                    }
+
+                    const catData = { catId: inlineCatId, catName: inlineCatName, deptName };
+
+                    for (let i = 0; i < Math.min(row.length, 20); i++) {
+                        if (isStrictBarcode(row[i])) {
+                            const red = normalizeBarcode(row[i]);
+                            if (red) catReportByReduced[red] = catData;
+                        }
+                    }
+
+                    if (nameKey) catReportByName[nameKey] = catData;
                 });
             }
 
@@ -2877,10 +2990,24 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 rows.forEach((row) => {
                     if (!row || row.length < 4) return;
 
-                    // Cadastro individual: C = reduzido, S = departamento, W = categoria
-                    const reducedFromCadastro = normalizeBarcode(row[2]);
+                    // Cadastro individual: procurar nas primeiras colunas
+                    let reducedFromCadastro = "";
+                    for (let i = 0; i < Math.min(row.length, 20); i++) {
+                        if (isStrictBarcode(row[i])) {
+                            reducedFromCadastro = normalizeBarcode(row[i]);
+                            break;
+                        }
+                    }
                     if (!reducedFromCadastro) return;
-                    const productNameKey = cleanDescription(row[3]?.toString() || "");
+
+                    let productNameKeyStr = "";
+                    for (let i = 0; i < Math.min(row.length, 10); i++) {
+                        const val = String(row[i] || "").trim().replace(/^'/, '');
+                        if (val.length > 3 && /[a-zA-Z]/.test(val) && val.length > productNameKeyStr.length) {
+                            productNameKeyStr = val;
+                        }
+                    }
+                    const productNameKey = superClean(productNameKeyStr);
 
                     const deptCell = parseHierarchyCell(row[18], "OUTROS");
                     const catCell = parseHierarchyCell(row[22], "GERAL");
@@ -2959,7 +3086,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             Object.entries(stockAcc).forEach(([reduced, acc]) => {
                 const avgCost = acc.q > 0 ? (acc.costAmount / acc.q) : 0;
-                const nameKey = cleanDescription(acc.name || "");
+                const nameKey = superClean(acc.name || "");
                 const scopesByReduced = productsByReduced[reduced] || [];
                 const scopesByName = nameKey ? (productsByName[nameKey] || []) : [];
                 const scopes = scopesByReduced.length > 0 ? scopesByReduced : scopesByName;
@@ -2968,7 +3095,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 if (scopes.length > 0) {
                     chosenScope = scopes.find(s => String(s.groupId) === String(acc.groupId)) || scopes[0];
                 } else {
-                    const catFallback = catReportByReduced[reduced];
+                    const catFallback = catReportByReduced[reduced] || (nameKey ? catReportByName[nameKey] : undefined);
                     if (catFallback && acc.groupId && ALLOWED_IDS.includes(Number(acc.groupId))) {
                         const deptFallback = parseHierarchyCell(catFallback.deptName, "OUTROS");
                         chosenScope = {
@@ -2997,8 +3124,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     };
                 }
                 const resolvedScope: ProductScope = { ...chosenScope };
-                const deptByReduced = deptReportByReduced[reduced];
-                const catByReduced = catReportByReduced[reduced];
+                const deptByReduced = deptReportByReduced[reduced] || (nameKey ? deptReportByName[nameKey] : undefined);
+                const catByReduced = catReportByReduced[reduced] || (nameKey ? catReportByName[nameKey] : undefined);
                 if (deptByReduced) {
                     if (!resolvedScope.deptId && deptByReduced.deptId) {
                         resolvedScope.deptId = deptByReduced.deptId;
