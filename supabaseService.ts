@@ -87,6 +87,9 @@ export interface DbStockConferenceSession {
   }[];
   recount_targets?: string[];
   updated_at?: string;
+  created_at?: string;
+  pending_sync?: boolean;
+  last_local_update?: string;
 }
 
 export interface DbStockConferenceReport {
@@ -678,6 +681,23 @@ export async function fetchStockConferenceReportsSummary(page: number = 0, pageS
     return data || [];
   } catch (error) {
     console.error('Error fetching stock conference reports summary:', error);
+    return [];
+  }
+}
+
+export async function fetchUserStockReportsSummary(email: string, limit: number = 5): Promise<Partial<DbStockConferenceReport>[]> {
+  try {
+    const { data, error } = await supabase
+      .from('stock_conference_reports')
+      .select('id, user_email, user_name, branch, area, created_at, pharmacist, manager, summary')
+      .eq('user_email', email)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error('Error fetching user stock reports summary:', error);
     return [];
   }
 }

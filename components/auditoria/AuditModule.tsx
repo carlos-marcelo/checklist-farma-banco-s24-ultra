@@ -977,13 +977,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [auditLookupOpen, setAuditLookupOpen] = useState(false);
     const auditLookupInputRef = useRef<HTMLInputElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
-
     const [selectedEmpresa, setSelectedEmpresa] = useState("Drogaria Cidade");
     const [selectedFilial, setSelectedFilial] = useState(String(initialFilial || '').trim());
     const selectedCompany = useMemo(() => companies.find(c => c.name === selectedEmpresa), [companies, selectedEmpresa]);
     const [branchAuditsHistory, setBranchAuditsHistory] = useState<DbAuditSession[]>([]);
     const [isLoadingBranchAudits, setIsLoadingBranchAudits] = useState(false);
     const [showCompletedAuditsModal, setShowCompletedAuditsModal] = useState(false);
+    const [localPendingAudit, setLocalPendingAudit] = useState<AuditData | null>(null);
     const [isReadOnlyCompletedView, setIsReadOnlyCompletedView] = useState(false);
     const [consultingAuditNumber, setConsultingAuditNumber] = useState<number | null>(null);
     const [allowActiveAuditAutoOpen, setAllowActiveAuditAutoOpen] = useState(false);
@@ -1402,7 +1402,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         [branchAuditsHistory]
     );
     // Polling de sincronização entre usuários
-    // Polling de sincronização entre usuários
     useEffect(() => {
         if (!selectedFilial) return;
         const syncNow = () => loadAuditNum(true);
@@ -1431,6 +1430,59 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             window.removeEventListener('focus', handleVisibilityOrFocus);
         };
     }, [selectedFilial, loadAuditNum]);
+
+    // Carrega rascunho pendente ao abrir o modal de histórico
+    useEffect(() => {
+        if (showCompletedAuditsModal) {
+            void (async () => {
+                const local = await AuditStorage.loadLocalAuditSession();
+                if (local?.pendingSync) {
+                    setLocalPendingAudit(local);
+                } else {
+                    setLocalPendingAudit(null);
+                }
+            })();
+        }
+    }, [showCompletedAuditsModal]);
+
+    const handleManualSync = useCallback(async () => {
+        const local = await AuditStorage.loadLocalAuditSession();
+        if (!local?.pendingSync) return;
+        
+        try {
+            setIsSyncing(true);
+            const branch = local.filial || selectedFilial;
+            const auditNum = Number(local.inventoryNumber) || nextAuditNumber;
+            
+            if (!branch || !auditNum) {
+                alert("Dados de identificação ausentes no rascunho local.");
+                return;
+            }
+
+            const synced = await upsertAuditSession({
+                id: dbSessionId,
+                branch: branch,
+                audit_number: auditNum,
+                status: 'open',
+                data: local,
+                progress: calculateProgress(local),
+                user_email: userEmail,
+                updated_at: lastAuditUpdateRef.current || undefined
+            });
+            
+            if (synced) {
+                await AuditStorage.saveLocalAuditSession(local, false);
+                setLocalPendingAudit(null);
+                alert("Sincronização manual concluída com sucesso!");
+                void loadAuditNum(true);
+            }
+        } catch (e) {
+            console.error("Erro na sincronização manual:", e);
+            alert("Falha ao sincronizar. Verifique sua conexão.");
+        } finally {
+            setIsSyncing(false);
+        }
+    }, [selectedFilial, dbSessionId, nextAuditNumber, userEmail, loadAuditNum]);
 
     // Network Connectivity monitoring
     useEffect(() => {
@@ -1752,7 +1804,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 await AuditStorage.saveLocalAuditSession(incomingData, true);
                 setData(prev => prev ? { ...prev, pendingSync: true } : prev);
             }
-            // Retorna um objeto simulando sucesso para não travar a UI
+            
+            // Se for finalização ('completed'), não fingimos sucesso total
+            if (session.status === 'completed') {
+                throw err;
+            }
+            
+            // Retorna um objeto simulando sucesso parcial para não travar a UI durante a contagem
             return { ...session, updated_at: new Date().toISOString() };
         } finally {
             setIsSyncing(false);
@@ -1903,7 +1961,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (window.confirm(finishMessage)) {
             try {
                 setIsProcessing(true);
-                const savedSession = await persistAuditSession({
+                const isOnlineNow = typeof navigator !== 'undefined' && navigator.onLine;
+                
+                const sessionToPersist: DbAuditSession = {
                     id: dbSessionId,
                     branch: selectedFilial,
                     audit_number: auditNumberToPersist,
@@ -1911,30 +1971,59 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     data: { ...data, termDrafts: composeTermDraftsForPersist(((data as any)?.termDrafts || {}) as Record<string, TermForm>, termDrafts) } as any,
                     progress,
                     user_email: userEmail
-                });
-                if (savedSession) {
-                    await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
+                };
+
+                let savedSession: DbAuditSession | null = null;
+                
+                if (isOnlineNow) {
+                    try {
+                        savedSession = await persistAuditSession(sessionToPersist);
+                    } catch (syncErr) {
+                        console.error("Falha ao sincronizar finalização:", syncErr);
+                        // Se falhou mas salvou localmente como pendente (feito dentro do persistAuditSession)
+                        savedSession = null;
+                    }
+                } else {
+                    // Offline: salva localmente com flag
+                    if (data) {
+                        await AuditStorage.saveLocalAuditSession(data, true);
+                        setData(prev => prev ? { ...prev, pendingSync: true } : prev);
+                    }
+                    savedSession = null;
                 }
 
-                alert("Auditoria finalizada com sucesso!");
+                if (savedSession) {
+                    await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
+                    alert("Auditoria finalizada com sucesso e salva no servidor!");
+                } else {
+                    alert("AVISO: Auditoria finalizada LOCALMENTE.\n\nComo você está sem conexão estável, os dados foram salvos no seu computador. Eles serão enviados ao servidor automaticamente assim que a internet voltar.\n\nNÃO limpe o cache do navegador até ver o status 'LIVE' verde.");
+                }
 
-                // Clear local view state to 'exit'
-                await AuditStorage.clearLocalAuditSession();
-                sessionStorage.removeItem(CONFIRMED_SESSION_KEY);
-                setData(null);
-                setDbSessionId(undefined);
-                setAllowActiveAuditAutoOpen(false);
-                setSelectedFilial("");
-                setGroupFiles(createInitialGroupFiles());
-                setFileStock(null);
-                setFileDeptIds(null);
-                setFileCatIds(null);
-                setInitialDoneUnits(0);
-                setSessionStartTime(Date.now());
-                setView({ level: 'groups' });
+                // Se salvou no servidor, podemos limpar tudo. 
+                // Se ficou pendente, limpamos o estado da tela mas o persistAuditSession já garantiu o backup no IndexedDB.
+                // IMPORTANTE: Só limpamos o local se NÃO houver pendência de sync real (ou se o usuário confirmou que entendeu).
+                
+                if (savedSession || !isOnlineNow || data?.pendingSync) {
+                    sessionStorage.removeItem(CONFIRMED_SESSION_KEY);
+                    setData(null);
+                    setDbSessionId(undefined);
+                    setAllowActiveAuditAutoOpen(false);
+                    setSelectedFilial("");
+                    setGroupFiles(createInitialGroupFiles());
+                    setFileStock(null);
+                    setFileDeptIds(null);
+                    setFileCatIds(null);
+                    setInitialDoneUnits(0);
+                    setSessionStartTime(Date.now());
+                    setView({ level: 'groups' });
+                    // Nota: AuditStorage.clearLocalAuditSession() NÃO deve ser chamado se estiver pendente.
+                    if (savedSession) {
+                        await AuditStorage.clearLocalAuditSession();
+                    }
+                }
             } catch (err) {
                 console.error("Error finishing session:", err);
-                alert("Erro ao finalizar auditoria. Tente novamente.");
+                alert("Erro crítico ao finalizar auditoria. Verifique sua conexão e tente novamente.");
             } finally {
                 setIsProcessing(false);
             }
@@ -7220,8 +7309,36 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             <X className="w-4 h-4 mx-auto" />
                                         </button>
                                     </div>
-                                    <div className="max-h-[60vh] overflow-y-auto p-4 space-y-2">
-                                        {completedAudits.length === 0 ? (
+                                    <div className="max-h-[60vh] overflow-y-auto p-4 space-y-3">
+                                        {localPendingAudit && (
+                                            <div className="rounded-xl border-2 border-amber-400 bg-amber-50 px-4 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-md transition-all">
+                                                <div className="flex items-center gap-3">
+                                                    <div className="w-10 h-10 bg-amber-100 rounded-full flex items-center justify-center shrink-0">
+                                                        <RefreshCw className={`w-5 h-5 text-amber-600 ${isSyncing ? 'animate-spin' : ''}`} />
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-sm font-black text-amber-900 uppercase">
+                                                            Sincronização Pendente (Nº {localPendingAudit.inventoryNumber})
+                                                        </p>
+                                                        <p className="text-[11px] text-amber-700 font-bold">
+                                                            Salvo localmente em {localPendingAudit.lastLocalUpdate ? new Date(localPendingAudit.lastLocalUpdate).toLocaleString('pt-BR') : 'Data indisponível'}
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => void handleManualSync()}
+                                                    disabled={isSyncing || !isOnline}
+                                                    className={`w-full sm:w-auto px-5 py-2.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${isSyncing || !isOnline
+                                                        ? 'bg-amber-200 text-amber-400 cursor-not-allowed'
+                                                        : 'bg-amber-500 text-white hover:bg-amber-600 shadow-lg active:scale-95'}`}
+                                                >
+                                                    {isSyncing ? 'Enviando...' : 'Enviar Agora'}
+                                                </button>
+                                            </div>
+                                        )}
+
+                                        {completedAudits.length === 0 && !localPendingAudit ? (
                                             <p className="text-sm font-semibold text-slate-400 text-center py-8">
                                                 Nenhum inventário concluído encontrado.
                                             </p>

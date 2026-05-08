@@ -39,7 +39,8 @@ import {
   Barcode,
   Package,
   Camera,
-  Smartphone
+  Smartphone,
+  Trash2
 } from 'lucide-react';
 import SignaturePad from './SignaturePad';
 import * as SupabaseService from '../supabaseService';
@@ -102,6 +103,8 @@ interface StockConferenceProps {
   userName?: string;
   companies?: SupabaseService.DbCompany[];
   onReportSaved?: () => Promise<void>;
+  pendingReportsCount?: number;
+  onManualSync?: () => Promise<void>;
 }
 
 type StockSummaryPayload = {
@@ -389,8 +392,64 @@ const safeParseFloat = (value: any): number => {
 
 // --- Main Component ---
 
-export const StockConference = ({ userEmail, userName, companies = [], onReportSaved }: StockConferenceProps) => {
+export const StockConference: React.FC<StockConferenceProps> = ({ 
+  userEmail, 
+  userName, 
+  companies = [], 
+  onReportSaved,
+  pendingReportsCount = 0,
+  onManualSync
+}) => {
   const [step, setStep] = useState<AppStep>('setup');
+  const [isSyncingManual, setIsSyncingManual] = useState(false);
+
+  const resetConferenceState = useCallback(async () => {
+    setStep('setup');
+    setInventory(new Map());
+    setMasterProducts(new Map());
+    setBarcodeIndex(new Map());
+    setStockFile(null);
+    setProductFile(null);
+    setRecountTargets(new Set());
+    setPharmSignature(null);
+    setManagerSignature(null);
+    setPharmacist('');
+    setManager('');
+    setBranch('');
+    setSelectedCompanyId('');
+    setSelectedAreaName('');
+    setSessionId(null);
+    setLastSavedReportId(null);
+    setLastSavedSummary(null);
+    setIsDirty(false);
+    setActiveItem(null);
+    setLastScanned(null);
+    setAccumulationMode(false);
+    setScanInput('');
+    setCountInput('');
+    setIsControlledStock(false);
+    setErrorMsg('');
+    manualSessionStartedRef.current = false;
+    
+    if (userEmail) {
+      await StockStorage.clearLocalStockSession(userEmail);
+      try {
+        await SupabaseService.deleteStockConferenceSession(userEmail);
+      } catch (e) {
+        console.error("Erro ao limpar sessão no Supabase durante reset:", e);
+      }
+    }
+  }, [userEmail]);
+
+  const handleManualSyncClick = async () => {
+    if (!onManualSync) return;
+    setIsSyncingManual(true);
+    try {
+      await onManualSync();
+    } finally {
+      setIsSyncingManual(false);
+    }
+  };
 
   // Header Info State
   const [branch, setBranch] = useState('');
@@ -440,6 +499,9 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
   const lastDetectedCodeRef = useRef<string>('');
   const [isSavingStockReport, setIsSavingStockReport] = useState(false);
   const [isSavingSession, setIsSavingSession] = useState(false);
+  const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [pendingSync, setPendingSync] = useState(false);
   const [isDirty, setIsDirty] = useState(false); // Track if there are unsaved changes
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
@@ -597,9 +659,10 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
     setPharmacist(session.pharmacist || '');
     setManager(session.manager || '');
     setRecountTargets(new Set(session.recount_targets || []));
-    const restoredStep = session.step && session.step !== 'report' ? session.step as AppStep : 'conference';
+    const restoredStep = session.step === 'report' ? 'divergence' : (session.step as AppStep || 'conference');
     setStep(restoredStep);
     setSessionId(session.id || null);
+    setPendingSync(!!session.pending_sync);
     const ts = getSessionTimestamp(session);
     lastSyncTimestampRef.current = ts;
     manualSessionStartedRef.current = true;
@@ -670,6 +733,46 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
       for (const candidate of orderedCandidates) {
         if (!candidate.session) continue;
         if (!isMounted) break;
+
+        // --- NOVA LÓGICA DE AUTO-DETECÇÃO DE SALVAMENTO ---
+        // Verifica se já existe um relatório finalizado para esta sessão
+        if (candidate.session.branch) {
+          try {
+            const recentReports = await SupabaseService.fetchUserStockReportsSummary(userEmail || '', 5);
+            const isAlreadySaved = recentReports.some(report => {
+              const reportBranch = (report.branch || '').trim().toLowerCase();
+              const sessionBranch = (candidate.session!.branch || '').trim().toLowerCase();
+              const reportArea = (report.area || '').trim().toLowerCase();
+              const sessionArea = (candidate.session!.area || '').trim().toLowerCase();
+              
+              if (reportBranch !== sessionBranch || reportArea !== sessionArea) return false;
+
+              // Compara timestamps
+              const sessionUpdate = new Date(candidate.session!.updated_at || candidate.session!.created_at || 0).getTime();
+              const reportCreation = new Date(report.created_at || 0).getTime();
+              
+              // Se o relatório foi criado nos últimos 60 minutos e DEPOIS da última atualização da sessão
+              // ou muito próximo (buffer de 5 min para clocks diferentes), consideramos que já foi salvo.
+              const isRecent = (Date.now() - reportCreation) < 3600000;
+              const isAfterSession = reportCreation > (sessionUpdate - 300000);
+              
+              return isRecent && isAfterSession;
+            });
+
+            if (isAlreadySaved) {
+              stockDebugLog("✨ Auto-discarding session: A matching report was found in the database.");
+              if (candidate.source === "local") {
+                await StockStorage.clearLocalStockSession(userEmail || '');
+              }
+              await SupabaseService.deleteStockConferenceSession(userEmail || '');
+              continue; // Tenta o próximo candidato ou encerra
+            }
+          } catch (e) {
+            console.error("Erro na auto-detecção de salvamento:", e);
+          }
+        }
+        // ------------------------------------------------
+
         const restored = restoreSessionFromData(candidate.session);
         if (!restored) continue;
         stockDebugLog(`✅ Session restored from ${candidate.source === "local" ? "IndexedDB" : "Supabase"}`);
@@ -687,8 +790,22 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
 
     loadSession();
 
+    const updateOnlineStatus = () => {
+      const online = navigator.onLine;
+      setIsOnline(online);
+      if (online) {
+        stockDebugLog("🌐 Network back online, triggering sync...");
+        void persistSession();
+      }
+    };
+
+    window.addEventListener('online', updateOnlineStatus);
+    window.addEventListener('offline', updateOnlineStatus);
+
     return () => {
       isMounted = false;
+      window.removeEventListener('online', updateOnlineStatus);
+      window.removeEventListener('offline', updateOnlineStatus);
     };
   }, [userEmail, companies]);
 
@@ -762,6 +879,17 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
 
     try {
       const nowMs = Date.now();
+      const isOnlineNow = typeof navigator !== 'undefined' && navigator.onLine;
+      
+      if (!isOnlineNow) {
+        stockDebugLog('📡 Offline mode: Saving ONLY to IndexedDB with pendingSync flag');
+        await StockStorage.saveLocalStockSession(userEmail, payload, true);
+        setPendingSync(true);
+        setIsSavingSession(false);
+        return;
+      }
+
+      setIsSyncing(true);
       const shouldCheckConflict = nowMs - lastConflictCheckRef.current > 20000;
       let isConflict = false;
       if (shouldCheckConflict) {
@@ -782,6 +910,7 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
         );
         if (!proceed) {
           setIsSavingSession(false);
+          setIsSyncing(false);
           return;
         }
       }
@@ -791,47 +920,25 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
         setSessionId(saved.id);
         const newTs = getSessionTimestamp(saved);
         lastSyncTimestampRef.current = newTs;
+        setPendingSync(false);
+        // Limpa flag de pendência no local também
+        await StockStorage.saveLocalStockSession(userEmail, payload, false);
         stockDebugLog('✅ Stock session saved to Supabase! ID:', saved.id);
       } else {
         console.error('❌ Supabase returned null - check error details');
       }
     } catch (error: any) {
-      console.error('❌ Error persisting session to Supabase:', error);
-      console.error('Error details:', {
-        message: error?.message,
-        details: error?.details,
-        hint: error?.hint,
-        code: error?.code
-      });
+      console.error('❌ Error persisting session to Supabase (possibly network drop):', error);
+      // Em caso de erro de rede, garante salvamento local com flag
+      await StockStorage.saveLocalStockSession(userEmail, payload, true);
+      setPendingSync(true);
     } finally {
       setIsSavingSession(false);
+      setIsSyncing(false);
     }
   };
 
-  const resetConferenceState = () => {
-    setBranch('');
-    setSelectedCompanyId('');
-    setSelectedAreaName('');
-    setPharmacist('');
-    setManager('');
-    setMasterProducts(new Map());
-    setBarcodeIndex(new Map());
-    setInventory(new Map());
-    setRecountTargets(new Set());
-    setPharmSignature(null);
-    setManagerSignature(null);
-    setActiveItem(null);
-    setLastScanned(null);
-    setAccumulationMode(false);
-    setScanInput('');
-    setCountInput('');
-    setSessionId(null);
-    setProductFile(null);
-    setStockFile(null);
-    setIsControlledStock(false);
-    setErrorMsg('');
-    manualSessionStartedRef.current = false;
-  };
+
 
   useEffect(() => {
     const currentUser = userEmail || null;
@@ -860,10 +967,8 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
       return;
     }
 
-    resetConferenceState();
-    await StockStorage.clearLocalStockSession(userEmail || '');
+    await resetConferenceState();
     if (userEmail) {
-      void SupabaseService.deleteStockConferenceSession(userEmail);
       SupabaseService.insertAppEventLog({
         company_id: selectedCompanyId || null,
         branch: branch || null,
@@ -879,8 +984,6 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
         source: 'web'
       }).catch(() => { });
     }
-
-    setStep('setup');
   };
 
   // --- Handlers: File Upload ---
@@ -1481,95 +1584,134 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
     setIsSavingStockReport(true);
     let reportSaved = false;
 
+    // Define all variables outside try so catch can use them
+    const allItems = Array.from(inventory.values());
+    const matched = allItems.filter(item => item.status === 'matched').length;
+    const divergent = allItems.filter(item => item.status === 'divergent').length;
+    const pending = allItems.filter(item => item.status === 'pending').length;
+    const finalizedAt = new Date();
+    const startTimestamp = sessionStartTime ? new Date(sessionStartTime).toISOString() : null;
+    const endTimestamp = finalizedAt.toISOString();
+    const durationMs = sessionStartTime ? Math.max(0, finalizedAt.getTime() - sessionStartTime) : 0;
+
+    const summary = {
+      total: allItems.length,
+      matched,
+      divergent,
+      pending,
+      percent: stats.percent,
+      duration_ms: durationMs,
+      durationMs,
+      started_at: startTimestamp,
+      startedAt: startTimestamp,
+      ended_at: endTimestamp,
+      endedAt: endTimestamp,
+      signatures: {
+        pharmacist: pharmSignature,
+        manager: managerSignature
+      }
+    };
+
+    const inventorySnapshot = allItems.map(item => {
+      const product = masterProducts.get(item.reducedCode);
+      return {
+        reduced_code: item.reducedCode,
+        barcode: product?.barcode || null,
+        description: product?.description || null,
+        system_qty: item.systemQty,
+        counted_qty: item.countedQty,
+        status: item.status,
+        difference: item.countedQty - item.systemQty,
+        last_updated: item.lastUpdated ? item.lastUpdated.toISOString() : null
+      };
+    });
+
+    const payload = {
+      user_email: userEmail?.trim() || 'desconhecido@empresa.com',
+      user_name: userName?.trim() || 'Operador',
+      branch: branch || 'Filial não informada',
+      area: selectedAreaName || 'Área não informada',
+      pharmacist: pharmacist || 'Farmacêutico não informado',
+      manager: manager || 'Gestor não informado',
+      summary,
+      items: inventorySnapshot
+    };
+
     try {
-      const allItems = Array.from(inventory.values());
-      const matched = allItems.filter(item => item.status === 'matched').length;
-      const divergent = allItems.filter(item => item.status === 'divergent').length;
-      const pending = allItems.filter(item => item.status === 'pending').length;
-      const finalizedAt = new Date();
-      const startTimestamp = sessionStartTime ? new Date(sessionStartTime).toISOString() : null;
-      const endTimestamp = finalizedAt.toISOString();
-      const durationMs = sessionStartTime ? Math.max(0, finalizedAt.getTime() - sessionStartTime) : 0;
+      const isOnlineNow = typeof navigator !== 'undefined' && navigator.onLine;
 
-      const summary = {
-        total: allItems.length,
-        matched,
-        divergent,
-        pending,
-        percent: stats.percent,
-        duration_ms: durationMs,
-        durationMs,
-        started_at: startTimestamp,
-        startedAt: startTimestamp,
-        ended_at: endTimestamp,
-        endedAt: endTimestamp,
-        signatures: {
-          pharmacist: pharmSignature,
-          manager: managerSignature
-        }
-      };
-
-      const inventorySnapshot = allItems.map(item => {
-        const product = masterProducts.get(item.reducedCode);
-        return {
-          reduced_code: item.reducedCode,
-          barcode: product?.barcode || null,
-          description: product?.description || null,
-          system_qty: item.systemQty,
-          counted_qty: item.countedQty,
-          status: item.status,
-          difference: item.countedQty - item.systemQty,
-          last_updated: item.lastUpdated ? item.lastUpdated.toISOString() : null
-        };
-      });
-
-      const payload = {
-        user_email: userEmail?.trim() || 'desconhecido@empresa.com',
-        user_name: userName?.trim() || 'Operador',
-        branch: branch || 'Filial não informada',
-        area: selectedAreaName || 'Área não informada',
-        pharmacist: pharmacist || 'Farmacêutico não informado',
-        manager: manager || 'Gestor não informado',
-        summary,
-        items: inventorySnapshot
-      };
-
-      const saved = await SupabaseService.createStockConferenceReport(payload);
-      if (saved) {
-        reportSaved = true;
-        setLastSavedReportId(saved.id || null);
+      if (!isOnlineNow) {
+        stockDebugLog('📡 Offline mode: Saving report to Pending Queue');
+        const pendingId = await StockStorage.savePendingStockReport(payload);
+        setLastSavedReportId(pendingId);
         setLastSavedSummary(summary);
+        reportSaved = true;
 
+        alert('⚠️ RELATÓRIO SALVO LOCALMENTE\n\nIdentificamos que você está sem internet. Sua conferência foi salva no computador e será enviada automaticamente para o banco de dados assim que a conexão voltar.');
+        
         if (onReportSaved) {
           await onReportSaved();
         }
 
-        if (userEmail) {
-          SupabaseService.insertAppEventLog({
-            company_id: selectedCompanyId || null,
-            branch: branch || null,
-            area: selectedAreaName || null,
-            user_email: userEmail,
-            user_name: userName || null,
-            app: 'conferencia',
-            event_type: 'stock_conference_finished',
-            entity_type: 'stock_report',
-            entity_id: saved.id || null,
-            status: 'success',
-            success: true,
-            source: 'web',
-            event_meta: { total: summary.total, matched: summary.matched, divergent: summary.divergent }
-          }).catch(() => { });
+        await StockStorage.clearLocalStockSession(userEmail || '');
+        return true;
+      }
 
-          await StockStorage.clearLocalStockSession(userEmail);
-          try {
-            await SupabaseService.deleteStockConferenceSession(userEmail);
-          } catch (deleteError) { }
-        }
+      const saved = await SupabaseService.createStockConferenceReport(payload);
+      if (!saved) {
+        throw new Error('Falha ao salvar no servidor (Status 530/502/Timeout)');
+      }
+
+      reportSaved = true;
+      setLastSavedReportId(saved.id || null);
+      setLastSavedSummary(summary);
+
+      if (onReportSaved) {
+        await onReportSaved();
+      }
+
+      if (userEmail) {
+        SupabaseService.insertAppEventLog({
+          company_id: selectedCompanyId || null,
+          branch: branch || null,
+          area: selectedAreaName || null,
+          user_email: userEmail,
+          user_name: userName || null,
+          app: 'conferencia',
+          event_type: 'stock_conference_finished',
+          entity_type: 'stock_report',
+          entity_id: saved.id || null,
+          status: 'success',
+          success: true,
+          source: 'web',
+          event_meta: { total: summary.total, matched: summary.matched, divergent: summary.divergent }
+        }).catch(() => { });
+
+        await StockStorage.clearLocalStockSession(userEmail);
+        try {
+          await SupabaseService.deleteStockConferenceSession(userEmail);
+        } catch (deleteError) { }
       }
     } catch (error) {
       console.error('Erro ao salvar conferência de estoque definitivo:', error);
-      alert('Não foi possível salvar o relatório no servidor de forma definitiva. Verifique sua conexão e tente novamente.');
+      
+      // Fallback para salvamento local em caso de erro de rede (502, 530, timeout)
+      stockDebugLog('⚠️ Network error during finalization, falling back to local storage');
+      
+      const pendingId = await StockStorage.savePendingStockReport(payload);
+      setLastSavedReportId(pendingId);
+      setLastSavedSummary(summary);
+      reportSaved = true;
+      
+      alert('⚠️ RELATÓRIO SALVO COM SUCESSO (LOCAL)\n\nHouve uma falha na comunicação com o servidor, mas não se preocupe: seus dados foram salvos com segurança neste computador. O envio para o banco de dados será concluído automaticamente em instantes.');
+      
+      if (onReportSaved) {
+        await onReportSaved();
+      }
+
+      if (userEmail) {
+        await StockStorage.clearLocalStockSession(userEmail);
+      }
     } finally {
       setIsSavingStockReport(false);
       if (reportSaved) {
@@ -1663,6 +1805,44 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
 
   const renderSetup = () => (
     <div className="flex flex-col items-center justify-center min-h-full max-w-2xl mx-auto p-6 overflow-y-auto w-full">
+      {pendingReportsCount > 0 && (
+        <div className="w-full mb-8 bg-amber-50 border-2 border-amber-200 rounded-2xl p-6 shadow-sm animate-pulse-subtle">
+          <div className="flex items-start gap-4">
+            <div className="bg-amber-100 p-3 rounded-xl">
+              <AlertTriangle className="w-6 h-6 text-amber-600" />
+            </div>
+            <div className="flex-1">
+              <h4 className="text-amber-900 font-black text-lg uppercase tracking-tight mb-1">
+                AÇÃO NECESSÁRIA: SINCRONIZAÇÃO PENDENTE ({pendingReportsCount})
+              </h4>
+              <p className="text-amber-800 text-sm leading-relaxed mb-4">
+                Você possui {pendingReportsCount === 1 ? 'um relatório' : `${pendingReportsCount} relatórios`} que já foi finalizado mas ainda não foi enviado ao servidor principal.
+                <br /><br />
+                Para garantir a integridade dos dados, <strong>você deve sincronizar</strong> esses dados abaixo antes de iniciar um novo trabalho.
+              </p>
+              <div className="flex flex-col sm:flex-row gap-3">
+                <button
+                  onClick={handleManualSyncClick}
+                  disabled={isSyncingManual}
+                  className="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg text-xs font-bold transition flex items-center gap-2 shadow-sm disabled:opacity-50"
+                >
+                  {isSyncingManual ? (
+                    <Clock className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <Save className="w-3 h-3" />
+                  )}
+                  {isSyncingManual ? 'SINCRONIZANDO...' : 'SINCRONIZAR AGORA'}
+                </button>
+                <div className="bg-amber-100/50 px-4 py-2 rounded-lg border border-amber-200 text-amber-800 text-[10px] font-bold flex items-center gap-2">
+                  <div className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-ping" />
+                  AGUARDANDO CONEXÃO AUTOMÁTICA
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="text-center mb-8">
         <h1 className="text-3xl font-bold text-blue-900 mb-2">Conferência de Farmácia</h1>
         <p className="text-gray-500">Informe os dados e importe os arquivos para iniciar.</p>
@@ -1676,9 +1856,10 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
         <div className="space-y-4">
           <div>
             <label className="block text-xs font-bold text-gray-500 uppercase mb-1">Empresa</label>
-            <select
-              value={selectedCompanyId}
-              onChange={(e) => {
+              <select
+                value={selectedCompanyId}
+                disabled={pendingReportsCount > 0}
+                onChange={(e) => {
                 const companyId = e.target.value;
                 setSelectedCompanyId(companyId);
                 setProductFile(null);
@@ -1699,6 +1880,7 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
               <label className="block text-xs font-bold text-gray-500 uppercase mb-1">Filial</label>
               <select
                 value={branchOptions.some(opt => opt.branch === branch) ? branch : ''}
+                disabled={pendingReportsCount > 0}
                 onChange={(e) => handleBranchValueChange(e.target.value)}
                 className="w-full border border-gray-300 rounded-lg p-3 text-sm focus:ring focus:ring-blue-100 outline-none bg-white text-gray-900 transition-all"
               >
@@ -1729,6 +1911,7 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
                 <input
                   type="text"
                   value={pharmacist}
+                  disabled={pendingReportsCount > 0}
                   onChange={(e) => setPharmacist(e.target.value)}
                   placeholder="Nome completo"
                   className="w-full pl-10 pr-4 py-2 border rounded-lg focus:ring focus:ring-blue-100 outline-none bg-white text-gray-900"
@@ -1742,6 +1925,7 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
                 <input
                   type="text"
                   value={manager}
+                  disabled={pendingReportsCount > 0}
                   onChange={(e) => setManager(e.target.value)}
                   placeholder="Nome completo"
                   className="w-full pl-10 pr-4 py-2 border rounded-lg focus:ring focus:ring-blue-100 outline-none bg-white text-gray-900"
@@ -1757,9 +1941,15 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
           <FileSpreadsheet className={`w-10 h-10 mb-3 ${effectiveProductFile ? 'text-green-500' : 'text-gray-400'}`} />
           <h3 className="font-semibold text-gray-700 mb-1 text-sm">Arquivo de Produtos</h3>
           <p className="text-[10px] text-gray-500 text-center mb-3">Base (Excel: C=Red, K=Barra, D=Desc)</p>
-          <label className="cursor-pointer bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-3 py-2 rounded-lg text-xs font-bold transition">
+          <label className={`cursor-pointer bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-3 py-2 rounded-lg text-xs font-bold transition ${pendingReportsCount > 0 ? 'pointer-events-none opacity-50' : ''}`}>
             {productFile ? productFile.name : effectiveProductFile ? effectiveProductFile.name : 'Selecionar Arquivo'}
-            <input type="file" accept=".csv,.txt,.html,.htm,.xls,.xlsx" className="hidden" onChange={(e) => setProductFile(e.target.files?.[0] || null)} />
+            <input 
+              type="file" 
+              accept=".csv,.txt,.html,.htm,.xls,.xlsx" 
+              className="hidden" 
+              disabled={pendingReportsCount > 0}
+              onChange={(e) => setProductFile(e.target.files?.[0] || null)} 
+            />
           </label>
           {isLoadingGlobalProduct && !productFile && (
             <p className="mt-2 text-[10px] text-blue-600 font-semibold">Verificando base global...</p>
@@ -1796,9 +1986,15 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
           </div>
 
           <p className="text-xs text-gray-500 text-center mb-4">Estoque (Excel: B=Red, {isControlledStock ? 'L' : 'O'}=Qtd)</p>
-          <label className="cursor-pointer bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-4 py-2 rounded-lg text-sm transition">
+          <label className={`cursor-pointer bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-4 py-2 rounded-lg text-sm transition ${pendingReportsCount > 0 ? 'pointer-events-none opacity-50' : ''}`}>
             {stockFile ? stockFile.name : 'Selecionar Arquivo'}
-            <input type="file" accept=".csv,.txt,.html,.htm,.xls,.xlsx" className="hidden" onChange={(e) => setStockFile(e.target.files?.[0] || null)} />
+            <input 
+              type="file" 
+              accept=".csv,.txt,.html,.htm,.xls,.xlsx" 
+              className="hidden" 
+              disabled={pendingReportsCount > 0}
+              onChange={(e) => setStockFile(e.target.files?.[0] || null)} 
+            />
           </label>
         </div>
       </div>
@@ -1812,8 +2008,8 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
 
       <button
         onClick={handleFileUpload}
-        disabled={isLoading}
-        className={`w-full py-4 rounded-xl text-lg font-bold shadow-lg transition transform active:scale-95 flex items-center justify-center ${isLoading
+        disabled={isLoading || pendingReportsCount > 0}
+        className={`w-full py-4 rounded-xl text-lg font-bold shadow-lg transition transform active:scale-95 flex items-center justify-center ${isLoading || pendingReportsCount > 0
           ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
           : 'bg-blue-600 text-white hover:bg-blue-700'
           }`}
@@ -1863,17 +2059,27 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
               </p>
               {/* Auto-save indicator */}
               <div className="flex items-center justify-start md:justify-end mt-1">
-                {isSavingSession ? (
+                {isSavingSession || isSyncing ? (
                   <span className="text-[10px] text-blue-600 flex items-center gap-1">
                     <RefreshCw className="w-3 h-3 animate-spin" />
-                    Salvando...
+                    Sincronizando...
                   </span>
-                ) : sessionId ? (
+                ) : !isOnline ? (
+                  <span className="text-[10px] text-red-600 flex items-center gap-1">
+                    <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                    MODO OFFLINE
+                  </span>
+                ) : pendingSync ? (
+                  <span className="text-[10px] text-amber-600 flex items-center gap-1">
+                    <div className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                    PENDENTE DE ENVIO
+                  </span>
+                ) : (
                   <span className="text-[10px] text-green-600 flex items-center gap-1">
                     <CheckCircle className="w-3 h-3" />
-                    Salvo automaticamente
+                    Sincronizado
                   </span>
-                ) : null}
+                )}
               </div>
             </div>
 
@@ -2437,9 +2643,10 @@ export const StockConference = ({ userEmail, userName, companies = [], onReportS
       const wantsPDF = window.confirm("Relatório salvo com sucesso no sistema!\n\nDeseja baixar o arquivo PDF agora?");
       if (wantsPDF) {
         exportPDF();
-      } else {
-        alert("Você pode acessar este relatório mais tarde no Histórico.");
       }
+      
+      // Limpa tudo para permitir nova conferência
+      await resetConferenceState();
     };
 
     const exportPDF = () => {

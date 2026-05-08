@@ -19,6 +19,7 @@ import { CacheService } from './src/cacheService';
 import { ImageUtils } from './src/utils/imageUtils';
 import { CadastrosBaseService } from './src/cadastrosBase/cadastrosBaseService';
 import { PRE_VENCIDOS_MODULE_ENABLED } from './src/featureFlags';
+import * as StockStorage from './src/stockConference/storage';
 
 
 const mergeAccessMatrixWithDefaults = (incoming: Partial<Record<AccessLevelId, Record<string, boolean>>>) => {
@@ -1461,6 +1462,7 @@ const App: React.FC = () => {
     const MOBILE_CHECKLIST_HISTORY_PAGE_SIZE = 4;
     const MOBILE_STOCK_HISTORY_PAGE_SIZE = 4;
     const [stockConferenceHistory, setStockConferenceHistory] = useState<StockConferenceHistoryItem[]>([]);
+    const [pendingStockReports, setPendingStockReports] = useState<StockConferenceHistoryItem[]>([]);
     const [stockConferencePage, setStockConferencePage] = useState(0);
     const [hasMoreStockConferences, setHasMoreStockConferences] = useState(true);
     const [isLoadingMoreStock, setIsLoadingMoreStock] = useState(false);
@@ -1676,11 +1678,70 @@ const App: React.FC = () => {
         }
     };
 
+    const loadPendingStockReports = async () => {
+        try {
+            const pendingRaw = await StockStorage.loadPendingStockReports();
+            if (pendingRaw && pendingRaw.length > 0) {
+                const mapped = mapStockConferenceReports(pendingRaw as any[]);
+                setPendingStockReports(mapped);
+                
+                // If online, try to sync them
+                if (navigator.onLine) {
+                    void syncPendingStockReports(pendingRaw);
+                }
+            } else {
+                setPendingStockReports([]);
+            }
+        } catch (error) {
+            console.error('Error loading pending stock reports:', error);
+        }
+    };
+
+    const syncPendingStockReports = async (reports: any[]) => {
+        if (!navigator.onLine || reports.length === 0) return;
+        
+        console.log('🔄 Syncing', reports.length, 'pending stock reports...');
+        for (const report of reports) {
+            try {
+                // Ensure we don't have the local-only ID when sending to Supabase
+                const { id, pending_sync, saved_at, ...payload } = report;
+                const saved = await SupabaseService.createStockConferenceReport(payload);
+                if (saved) {
+                    await StockStorage.deletePendingStockReport(report.id);
+                    console.log('✅ Pending report synced:', report.id);
+                }
+            } catch (err) {
+                console.error('❌ Failed to sync pending report:', report.id, err);
+            }
+        }
+        // Reload after sync attempt
+        const updatedPending = await StockStorage.loadPendingStockReports();
+        setPendingStockReports(mapStockConferenceReports(updatedPending as any[]));
+        // Also refresh main history to show the now-synced reports
+        void refreshStockConferenceReports();
+    };
+
+    const loadStockConferenceHistory = async () => {
+        const dbStockReports = await SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE);
+        handleStockReportsLoaded(dbStockReports as SupabaseService.DbStockConferenceReport[]);
+        setStockConferencePage(0);
+        setHasMoreStockConferences(dbStockReports.length === STOCK_PAGE_SIZE);
+        
+        // Also load pending local reports
+        void loadPendingStockReports();
+
+        return dbStockReports;
+    };
+
     const refreshStockConferenceReports = async () => {
         const dbStockReports = await SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE);
         handleStockReportsLoaded(dbStockReports as SupabaseService.DbStockConferenceReport[]);
         setStockConferencePage(0);
         setHasMoreStockConferences(dbStockReports.length === STOCK_PAGE_SIZE);
+        
+        // Also load pending local reports
+        void loadPendingStockReports();
+
         return dbStockReports;
     };
 
@@ -1905,7 +1966,8 @@ const App: React.FC = () => {
                     }),
                     CacheService.fetchWithCache('tickets_list', SupabaseService.fetchTickets, (data) => {
                         if (data && data.length > 0) setTickets(data);
-                    })
+                    }),
+                    loadPendingStockReports()
                 ]);
 
                 // 2. Initial State Population (from the result of Promise.all, which could be Cache or Remote)
@@ -2559,7 +2621,8 @@ const App: React.FC = () => {
 
     const stockConferenceBranchOptions = useMemo(() => {
         const map = new Map<string, string>();
-        stockConferenceHistory.forEach(item => {
+        const combined = [...pendingStockReports, ...stockConferenceHistory];
+        combined.forEach(item => {
             const branchValue = sanitizeStockBranch(item.branch);
             const key = normalizeFilterKey(branchValue);
             if (!map.has(key)) {
@@ -2569,12 +2632,13 @@ const App: React.FC = () => {
         return Array.from(map.entries())
             .map(([key, label]) => ({ key, label }))
             .sort((a, b) => a.label.localeCompare(b.label));
-    }, [stockConferenceHistory]);
+    }, [stockConferenceHistory, pendingStockReports]);
     const stockConferenceBranchKeys = useMemo(() => stockConferenceBranchOptions.map(option => option.key), [stockConferenceBranchOptions]);
 
     const stockConferenceAreaOptions = useMemo(() => {
         const map = new Map<string, string>();
-        stockConferenceHistory.forEach(item => {
+        const combined = [...pendingStockReports, ...stockConferenceHistory];
+        combined.forEach(item => {
             const label = canonicalizeFilterLabel(sanitizeStockArea(item.area));
             const key = normalizeFilterKey(label);
             if (!map.has(key)) {
@@ -2584,18 +2648,23 @@ const App: React.FC = () => {
         return Array.from(map.entries())
             .map(([key, label]) => ({ key, label }))
             .sort((a, b) => a.label.localeCompare(b.label));
-    }, [stockConferenceHistory]);
+    }, [stockConferenceHistory, pendingStockReports]);
     const stockConferenceAreaKeys = useMemo(() => stockConferenceAreaOptions.map(option => option.key), [stockConferenceAreaOptions]);
 
     const filteredStockConferenceHistory = useMemo(() => {
-        return stockConferenceHistory.filter(item => {
+        // Pending reports always bypass filters and stay at the top
+        const pending = pendingStockReports.filter(p => p.id && String(p.id).startsWith('pending_'));
+        
+        const filteredFromHistory = stockConferenceHistory.filter(item => {
             const branchKey = normalizeFilterKey(sanitizeStockBranch(item.branch));
             const areaKey = normalizeFilterKey(sanitizeStockArea(item.area));
             const matchesBranch = stockBranchFilters.length === 0 || stockBranchFilters.includes(branchKey);
             const matchesArea = stockAreaFilter === 'all' || areaKey === stockAreaFilter;
             return matchesBranch && matchesArea;
         });
-    }, [stockConferenceHistory, stockBranchFilters, stockAreaFilter]);
+
+        return [...pending, ...filteredFromHistory];
+    }, [stockConferenceHistory, pendingStockReports, stockBranchFilters, stockAreaFilter]);
 
     const stockMobileTotalPages = useMemo(() => {
         return Math.max(1, Math.ceil(filteredStockConferenceHistory.length / MOBILE_STOCK_HISTORY_PAGE_SIZE));
@@ -6541,6 +6610,21 @@ const App: React.FC = () => {
                                 userName={currentUser?.name || ''}
                                 companies={companies}
                                 onReportSaved={async () => { await refreshStockConferenceReports(); }}
+                                pendingReportsCount={pendingStockReports.length}
+                                onManualSync={async () => {
+                                    const raw = await StockStorage.loadPendingStockReports();
+                                    if (raw && raw.length > 0) {
+                                        await syncPendingStockReports(raw);
+                                        const remaining = await StockStorage.loadPendingStockReports();
+                                        if (remaining.length === 0) {
+                                            alert("✅ Sincronização concluída com sucesso! Todos os relatórios foram enviados ao servidor.");
+                                        } else {
+                                            alert("⚠️ Alguns relatórios ainda não puderam ser sincronizados devido a falhas na conexão. Tente novamente em instantes.");
+                                        }
+                                    } else {
+                                        alert("ℹ️ Não há relatórios pendentes para sincronizar.");
+                                    }
+                                }}
                             />
                         </div>
                     )}
@@ -11050,6 +11134,20 @@ const App: React.FC = () => {
                                             </div>
                                             Histórico de Conferências de Estoque
                                         </h2>
+                                        {pendingStockReports.length > 0 && (
+                                            <button
+                                                onClick={async () => {
+                                                    const raw = await StockStorage.loadPendingStockReports();
+                                                    if (raw && raw.length > 0) {
+                                                        await syncPendingStockReports(raw);
+                                                    }
+                                                }}
+                                                className="flex items-center gap-2 bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg text-sm font-bold transition shadow-sm animate-pulse-subtle"
+                                            >
+                                                <Save size={16} />
+                                                SINCRONIZAR PENDENTES ({pendingStockReports.length})
+                                            </button>
+                                        )}
                                     </div>
                                     {stockConferenceHistory.length === 0 ? (
                                         <div className="text-center py-12 text-sm text-gray-500">
@@ -11198,7 +11296,14 @@ const App: React.FC = () => {
                                                                             <td className="px-4 py-3 text-xs text-gray-600 whitespace-nowrap">
                                                                                 {createdDate.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' })} {createdDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
                                                                             </td>
-                                                                            <td className="px-4 py-3 text-sm font-bold text-gray-800 whitespace-nowrap">{item.branch}</td>
+                                                                            <td className="px-4 py-3 text-sm font-bold text-gray-800 whitespace-nowrap">
+                                                                                {item.branch}
+                                                                                {item.id.toString().startsWith('pending_') && (
+                                                                                    <span className="ml-2 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[9px] font-black uppercase tracking-tighter animate-pulse">
+                                                                                        Aguardando Sincronia
+                                                                                    </span>
+                                                                                )}
+                                                                            </td>
                                                                             <td className="px-4 py-3 text-xs text-gray-600 whitespace-nowrap">{item.area}</td>
                                                                             <td className="px-4 py-3 text-sm font-bold text-gray-700 text-center">{item.total}</td>
                                                                             <td className="px-4 py-3 text-sm font-bold text-green-700 text-center">{item.matched}</td>

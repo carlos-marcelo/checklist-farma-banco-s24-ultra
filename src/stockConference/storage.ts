@@ -8,6 +8,12 @@ const stockStore = localforage.createInstance({
     description: 'Persistência de alta performance para sessões de conferência de estoque'
 });
 
+const stockReportsStore = localforage.createInstance({
+    name: 'ChecklistFarma',
+    storeName: 'stock_pending_reports',
+    description: 'Armazenamento temporário de relatórios finalizados aguardando sincronia'
+});
+
 const LOCAL_STOCK_SESSION_PREFIX = 'STOCK_SESSION_';
 const buildLocalSessionKey = (email: string) => `${LOCAL_STOCK_SESSION_PREFIX}${email}`;
 const STOCK_STORAGE_DEBUG = import.meta.env.DEV && Boolean((globalThis as any).__STOCK_DEBUG);
@@ -32,7 +38,7 @@ export async function loadLocalStockSession(email: string): Promise<DbStockConfe
 /**
  * Salva a sessão de estoque no IndexedDB (Suporta objetos gigantes)
  */
-export async function saveLocalStockSession(email: string, session: DbStockConferenceSession): Promise<void> {
+export async function saveLocalStockSession(email: string, session: DbStockConferenceSession, pendingSync: boolean = false): Promise<void> {
     if (!email) return;
     try {
         const key = buildLocalSessionKey(email);
@@ -42,8 +48,15 @@ export async function saveLocalStockSession(email: string, session: DbStockConfe
             window.localStorage.removeItem(key);
         } catch (e) { }
 
-        await stockStore.setItem(key, session);
-        stockStorageDebugLog(`[StockStorage] Sessão salva em IndexedDB para ${email}`);
+        // Anexa metadados de sincronia se necessário
+        const sessionWithMeta: DbStockConferenceSession = {
+            ...session,
+            pending_sync: pendingSync,
+            last_local_update: new Date().toISOString()
+        };
+
+        await stockStore.setItem(key, sessionWithMeta);
+        stockStorageDebugLog(`[StockStorage] Sessão salva em IndexedDB para ${email} (pendingSync: ${pendingSync})`);
     } catch (error) {
         console.error('Erro ao salvar sessão no IndexedDB (Stock):', error);
     }
@@ -58,6 +71,52 @@ export async function clearLocalStockSession(email: string): Promise<void> {
         await stockStore.removeItem(buildLocalSessionKey(email));
     } catch (error) {
         console.error('Erro ao limpar sessão no IndexedDB (Stock):', error);
+    }
+}
+
+/**
+ * Salva um relatório finalizado pendente de sincronia
+ */
+export async function savePendingStockReport(report: any): Promise<string> {
+    const id = report.id || `pending_${Date.now()}`;
+    try {
+        await stockReportsStore.setItem(id, {
+            ...report,
+            id,
+            pending_sync: true,
+            saved_at: new Date().toISOString()
+        });
+        return id;
+    } catch (error) {
+        console.error('Erro ao salvar relatório pendente:', error);
+        return id;
+    }
+}
+
+/**
+ * Carrega todos os relatórios pendentes
+ */
+export async function loadPendingStockReports(): Promise<any[]> {
+    const reports: any[] = [];
+    try {
+        await stockReportsStore.iterate((value) => {
+            reports.push(value);
+        });
+        return reports;
+    } catch (error) {
+        console.error('Erro ao carregar relatórios pendentes:', error);
+        return [];
+    }
+}
+
+/**
+ * Remove um relatório pendente após sincronia
+ */
+export async function deletePendingStockReport(id: string): Promise<void> {
+    try {
+        await stockReportsStore.removeItem(id);
+    } catch (error) {
+        console.error('Erro ao remover relatório pendente:', error);
     }
 }
 
