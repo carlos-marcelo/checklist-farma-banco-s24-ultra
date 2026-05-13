@@ -56,19 +56,19 @@ export const Topbar: React.FC<TopbarProps> = ({
     const isAdmin = currentUser.role === 'ADMINISTRATIVO';
     const canViewAnalise = isMaster || isAdmin;
     const navItems = [
-        { label: 'Dashboard', view: 'dashboard', color: 'blue', icon: <LayoutDashboard size={18} />, shortcut: 'Ctrl + D' },
+        { label: 'Dashboard', view: 'dashboard', color: 'blue', icon: <LayoutDashboard size={18} />, shortcut: 'Shift + D' },
         ...(canViewAnalise ? [{ label: 'Análise de Resultados', view: 'analise_resultados', color: 'blue', icon: <LineChart size={18} /> }] : []),
-        { label: 'Checklists', view: 'checklist', color: 'emerald', icon: <ClipboardList size={18} />, shortcut: 'Ctrl + L' },
+        { label: 'Checklists', view: 'checklist', color: 'emerald', icon: <ClipboardList size={18} />, shortcut: 'Shift + L' },
         { label: 'Visão Geral', view: 'summary', color: 'indigo', icon: <LayoutGrid size={18} /> },
-        { label: 'Conferência', view: 'stock', color: 'cyan', icon: <Search size={18} />, shortcut: 'Ctrl + C' },
-        { label: 'Auditoria', view: 'audit', color: 'indigo', icon: <ClipboardList size={18} />, shortcut: 'Ctrl + A' },
-        { label: 'Histórico', view: 'history', color: 'purple', icon: <History size={18} />, shortcut: 'Ctrl + H' },
+        { label: 'Conferência', view: 'stock', color: 'cyan', icon: <Search size={18} />, shortcut: 'Shift + C' },
+        { label: 'Auditoria', view: 'audit', color: 'indigo', icon: <ClipboardList size={18} />, shortcut: 'Shift + A' },
+        { label: 'Histórico', view: 'history', color: 'purple', icon: <History size={18} />, shortcut: 'Shift + H' },
         { label: 'Suporte', view: 'support', color: 'rose', icon: <MessageSquareQuote size={18} /> }
-    ].concat(PRE_VENCIDOS_MODULE_ENABLED ? [{ label: 'Pré-Vencidos', view: 'pre', color: 'amber', icon: <Package size={18} />, shortcut: 'Ctrl + V' }] : [])
+    ].concat(PRE_VENCIDOS_MODULE_ENABLED ? [{ label: 'Pré-Vencidos', view: 'pre', color: 'amber', icon: <Package size={18} />, shortcut: 'Shift + V' }] : [])
     .filter(item => (item.view !== 'logs' || isMaster));
 
     if (isMaster) {
-        navItems.splice(navItems.findIndex(item => item.view === 'support'), 0, { label: 'Métricas Gerenciais', view: 'logs', color: 'slate', icon: <FileSearch size={18} />, shortcut: 'Ctrl + M' });
+        navItems.splice(navItems.findIndex(item => item.view === 'support'), 0, { label: 'Métricas Gerenciais', view: 'logs', color: 'slate', icon: <FileSearch size={18} />, shortcut: 'Shift + M' });
     }
 
     const commonAdminItems = [
@@ -77,7 +77,7 @@ export const Topbar: React.FC<TopbarProps> = ({
 
     const masterOnlyAdminItems = [
         { label: 'Acessos', view: 'access', color: 'indigo', icon: <Lock size={18} /> },
-        { label: 'Cadastros Base', view: 'cadastros_globais', color: 'slate', icon: <FolderArchive size={18} />, shortcut: 'Ctrl + B' }
+        { label: 'Cadastros Base', view: 'cadastros_globais', color: 'slate', icon: <FolderArchive size={18} />, shortcut: 'Shift + B' }
     ];
 
     const shortcutMap = useMemo<Record<string, string>>(() => {
@@ -112,10 +112,15 @@ export const Topbar: React.FC<TopbarProps> = ({
         };
 
         const onKeyDown = (event: KeyboardEvent) => {
-            if ((!event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey) return;
             if (isEditableTarget(event.target)) return;
+            
             const key = event.key.toLowerCase();
-            const targetView = shortcutMap[key];
+            let targetView: string | undefined;
+
+            if (event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+                targetView = shortcutMap[key];
+            }
+
             if (!targetView) return;
             event.preventDefault();
             handleViewChange(targetView);
