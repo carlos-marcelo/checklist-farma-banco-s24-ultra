@@ -4758,7 +4758,7 @@ const App: React.FC = () => {
 
     const scopedUsers = useMemo(() => {
         if (!currentUser) return [];
-        if (currentUser.role !== 'MASTER') {
+        if (currentUser.role !== 'MASTER' && currentUser.role !== 'ADMINISTRATIVO') {
             return users.filter(u => u.email === currentUser.email);
         }
         if (currentUser.company_id) {
@@ -4806,7 +4806,7 @@ const App: React.FC = () => {
             if (metadataError) throw metadataError;
 
             const metadataRows = (metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>;
-            const scopedMetadata = currentUser.role === 'MASTER'
+            const scopedMetadata = (currentUser.role === 'MASTER' || currentUser.role === 'ADMINISTRATIVO')
                 ? metadataRows
                 : metadataRows.filter(session => {
                     const currentBranch = String(currentUser.filial || '').trim();
@@ -4901,7 +4901,7 @@ const App: React.FC = () => {
             if (metadataError) throw metadataError;
 
             const metadataRows = (metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>;
-            const scopedMetadata = currentUser.role === 'MASTER'
+            const scopedMetadata = (currentUser.role === 'MASTER' || currentUser.role === 'ADMINISTRATIVO')
                 ? metadataRows
                 : metadataRows.filter(session => {
                     const currentBranch = String(currentUser.filial || '').trim();
