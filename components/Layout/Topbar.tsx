@@ -53,9 +53,11 @@ export const Topbar: React.FC<TopbarProps> = ({
     handleLogout
 }) => {
     const isMaster = currentUser.role === 'MASTER';
+    const isAdmin = currentUser.role === 'ADMINISTRATIVO';
+    const canViewAnalise = isMaster || isAdmin;
     const navItems = [
         { label: 'Dashboard', view: 'dashboard', color: 'blue', icon: <LayoutDashboard size={18} />, shortcut: 'Ctrl + D' },
-        ...(isMaster ? [{ label: 'Análise de Resultados', view: 'analise_resultados', color: 'blue', icon: <LineChart size={18} /> }] : []),
+        ...(canViewAnalise ? [{ label: 'Análise de Resultados', view: 'analise_resultados', color: 'blue', icon: <LineChart size={18} /> }] : []),
         { label: 'Checklists', view: 'checklist', color: 'emerald', icon: <ClipboardList size={18} />, shortcut: 'Ctrl + L' },
         { label: 'Visão Geral', view: 'summary', color: 'indigo', icon: <LayoutGrid size={18} /> },
         { label: 'Conferência', view: 'stock', color: 'cyan', icon: <Search size={18} />, shortcut: 'Ctrl + C' },
