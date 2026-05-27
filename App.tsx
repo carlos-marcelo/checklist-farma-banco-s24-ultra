@@ -1045,6 +1045,7 @@ const LoginScreen = ({
     const [shakeButton, setShakeButton] = useState(false);
     const [showPassword, setShowPassword] = useState(false);
     const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+    const [isAuthenticating, setIsAuthenticating] = useState(false);
 
     const handlePhoneChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const val = e.target.value.replace(/\D/g, '');
@@ -1060,7 +1061,13 @@ const LoginScreen = ({
         }
     };
 
-    const handleSubmit = (e: React.FormEvent) => {
+    const triggerFormError = (message: string) => {
+        setError(message);
+        setShakeButton(true);
+        setTimeout(() => setShakeButton(false), 500);
+    };
+
+    const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         setError('');
         setSuccess('');
@@ -1068,9 +1075,7 @@ const LoginScreen = ({
         // --- FORGOT PASSWORD FLOW ---
         if (isForgotPassword) {
             if (!email) {
-                setError('Por favor, digite seu e-mail para recuperar a senha.');
-                setShakeButton(true);
-                setTimeout(() => setShakeButton(false), 500);
+                triggerFormError('Por favor, digite seu e-mail para recuperar a senha.');
                 return;
             }
             // Simulate email sending
@@ -1097,22 +1102,18 @@ const LoginScreen = ({
 
             // Validate Password Length
             if (password.length < 6) {
-                setError('A senha deve ter no mínimo 6 dígitos.');
-                setShakeButton(true);
-                setTimeout(() => setShakeButton(false), 500);
+                triggerFormError('A senha deve ter no mínimo 6 dígitos.');
                 return;
             }
 
             // Validate Passwords Match
             if (password !== confirmPassword) {
-                setError('As senhas não coincidem.');
-                setShakeButton(true);
-                setTimeout(() => setShakeButton(false), 500);
+                triggerFormError('As senhas não coincidem.');
                 return;
             }
 
             if (users.find(u => u.email === email)) {
-                setError('E-mail já cadastrado.');
+                triggerFormError('E-mail já cadastrado.');
                 return;
             }
             onRegister({ email, password, name, phone, role: 'USER', approved: false, rejected: false, company_id: selectedCompanyForRegistration || null });
@@ -1126,17 +1127,36 @@ const LoginScreen = ({
             setSelectedCompanyForRegistration('');
         } else {
             // --- LOGIN FLOW ---
-            const user = users.find(u => u.email === email && u.password === password);
-            if (user) {
-                if (user.rejected) {
-                    setError('Seu acesso foi recusado ou bloqueado. Contate o administrador.');
-                } else if (!user.approved) {
-                    setError('Sua conta ainda não foi aprovada pelo Master.');
-                } else {
-                    onLogin(user);
+            setIsAuthenticating(true);
+            try {
+                const result = await SupabaseService.authenticateUser(email, password);
+
+                if (result.status === 'success') {
+                    onLogin({
+                        ...result.user,
+                        preferredTheme: result.user.preferred_theme as ThemeColor | undefined
+                    });
+                    return;
                 }
-            } else {
-                setError('E-mail ou senha inválidos.');
+
+                if (result.status === 'database_unavailable') {
+                    triggerFormError('Não foi possível conectar ao banco de dados. Avise o administrador que o banco está fora.');
+                    return;
+                }
+
+                if (result.status === 'rejected') {
+                    triggerFormError('Seu acesso foi recusado ou bloqueado. Contate o administrador.');
+                    return;
+                }
+
+                if (result.status === 'pending_approval') {
+                    triggerFormError('Sua conta ainda não foi aprovada pelo Master.');
+                    return;
+                }
+
+                triggerFormError('E-mail ou senha inválidos.');
+            } finally {
+                setIsAuthenticating(false);
             }
         }
     };
@@ -1325,10 +1345,16 @@ const LoginScreen = ({
 
                         <button
                             type="submit"
-                            className={`w-full bg-gradient-to-r from-blue-600 via-blue-700 to-purple-600 text-white font-bold text-lg py-4 rounded-xl hover:from-blue-700 hover:via-purple-700 hover:to-purple-700 transition-all duration-300 shadow-lg hover:shadow-2xl hover:shadow-blue-500/50 hover:-translate-y-1 transform active:scale-95 mt-6 ripple relative overflow-hidden group ${shakeButton ? 'animate-shake !bg-gradient-to-r !from-red-600 !to-red-700' : ''}`}
+                            disabled={isAuthenticating}
+                            className={`w-full bg-gradient-to-r from-blue-600 via-blue-700 to-purple-600 text-white font-bold text-lg py-4 rounded-xl hover:from-blue-700 hover:via-purple-700 hover:to-purple-700 transition-all duration-300 shadow-lg hover:shadow-2xl hover:shadow-blue-500/50 hover:-translate-y-1 transform active:scale-95 mt-6 ripple relative overflow-hidden group disabled:opacity-70 disabled:cursor-wait disabled:hover:translate-y-0 ${shakeButton ? 'animate-shake !bg-gradient-to-r !from-red-600 !to-red-700' : ''}`}
                         >
                             <span className="relative z-10 flex items-center justify-center gap-2">
-                                {isForgotPassword ? (
+                                {isAuthenticating ? (
+                                    <>
+                                        <Loader2 size={20} className="animate-spin" />
+                                        Verificando acesso
+                                    </>
+                                ) : isForgotPassword ? (
                                     <>
                                         <Send size={20} className="transition-transform duration-300 group-hover:scale-110" />
                                         Enviar Link de Redefinição

@@ -349,6 +349,45 @@ export async function fetchUsers(): Promise<DbUser[]> {
   }
 }
 
+export type LoginAuthResult =
+  | { status: 'success'; user: DbUser }
+  | { status: 'invalid_credentials' }
+  | { status: 'pending_approval' }
+  | { status: 'rejected' }
+  | { status: 'database_unavailable'; error: unknown };
+
+export async function authenticateUser(email: string, password: string): Promise<LoginAuthResult> {
+  const normalizedEmail = String(email || '').trim();
+
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', normalizedEmail)
+      .limit(1);
+
+    if (error) throw error;
+
+    const user = data?.[0] as DbUser | undefined;
+    if (!user || user.password !== password) {
+      return { status: 'invalid_credentials' };
+    }
+
+    if (user.rejected) {
+      return { status: 'rejected' };
+    }
+
+    if (!user.approved) {
+      return { status: 'pending_approval' };
+    }
+
+    return { status: 'success', user };
+  } catch (error) {
+    console.error('Error authenticating user:', error);
+    return { status: 'database_unavailable', error };
+  }
+}
+
 export async function createUser(user: DbUser): Promise<DbUser> {
   const { data, error } = await supabase
     .from('users')
