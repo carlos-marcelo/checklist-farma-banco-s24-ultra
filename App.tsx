@@ -1549,6 +1549,9 @@ const App: React.FC = () => {
     const [newUserFilial, setNewUserFilial] = useState('');
     const [internalShake, setInternalShake] = useState(false);
     const [internalPhoneError, setInternalPhoneError] = useState('');
+    const [visibleTeamPasswords, setVisibleTeamPasswords] = useState<Record<string, boolean>>({});
+    const [teamPasswordDrafts, setTeamPasswordDrafts] = useState<Record<string, string>>({});
+    const [savingTeamPasswordEmail, setSavingTeamPasswordEmail] = useState<string | null>(null);
 
     // Filters
     const [userFilterRole, setUserFilterRole] = useState<'ALL' | 'MASTER' | 'ADMINISTRATIVO' | 'USER'>('ALL');
@@ -1557,6 +1560,7 @@ const App: React.FC = () => {
     // Change Password State
     const [newPassInput, setNewPassInput] = useState('');
     const [confirmPassInput, setConfirmPassInput] = useState('');
+    const [showCurrentPassword, setShowCurrentPassword] = useState(false);
     const [showNewPassword, setShowNewPassword] = useState(false);
     const [showConfirmNewPassword, setShowConfirmNewPassword] = useState(false);
     const [saveShake, setSaveShake] = useState(false);
@@ -2636,6 +2640,11 @@ const App: React.FC = () => {
     // Pending users are those NOT approved AND NOT rejected (fresh requests)
     const pendingUsers = users.filter(u => !u.approved && !u.rejected);
     const pendingUsersCount = pendingUsers.length;
+    const getUserRoleRank = (role?: UserRole) => {
+        if (role === 'MASTER') return 3;
+        if (role === 'ADMINISTRATIVO') return 2;
+        return 1;
+    };
 
     const filteredUsers = users.filter(u => {
         if (userFilterRole !== 'ALL' && u.role !== userFilterRole) return false;
@@ -3081,6 +3090,59 @@ const App: React.FC = () => {
          }
      };
 
+    const handleSaveTeamUserPassword = async (targetUser: User) => {
+        if (currentUser?.role !== 'MASTER') return;
+
+        const nextPassword = teamPasswordDrafts[targetUser.email] ?? targetUser.password ?? '';
+        if (nextPassword === targetUser.password) return;
+        if (nextPassword.length < 6) {
+            alert("A senha deve ter pelo menos 6 caracteres.");
+            return;
+        }
+
+        setSavingTeamPasswordEmail(targetUser.email);
+        try {
+            const success = await SupabaseService.updateUser(targetUser.email, { password: nextPassword });
+            if (!success) {
+                alert("Erro ao alterar senha no banco de dados.");
+                return;
+            }
+
+            setUsers(prev => prev.map(u => u.email === targetUser.email ? { ...u, password: nextPassword } : u));
+            setTeamPasswordDrafts(prev => {
+                const next = { ...prev };
+                delete next[targetUser.email];
+                return next;
+            });
+            if (currentUser?.email === targetUser.email) {
+                setCurrentUser(prev => prev ? { ...prev, password: nextPassword } : prev);
+            }
+            if (currentUser?.email) {
+                SupabaseService.insertAppEventLog({
+                    company_id: currentUser.company_id || null,
+                    branch: currentUser.filial || null,
+                    area: currentUser.area || null,
+                    user_email: currentUser.email,
+                    user_name: currentUser.name,
+                    app: 'configuracoes',
+                    event_type: 'user_updated',
+                    entity_type: 'user',
+                    entity_id: targetUser.email,
+                    status: 'success',
+                    success: true,
+                    source: 'web',
+                    event_meta: { field: 'password', target_user: targetUser.email }
+                }).catch(() => { });
+            }
+            alert("Senha alterada com sucesso.");
+        } catch (error) {
+            console.error("Erro ao alterar senha do usuário:", error);
+            alert("Ocorreu um erro ao alterar a senha.");
+        } finally {
+            setSavingTeamPasswordEmail(null);
+        }
+    };
+
     const handleUpdateUserProfile = async (field: keyof User, value: string | null) => {
         if (!currentUser) return;
 
@@ -3211,6 +3273,7 @@ const App: React.FC = () => {
             }
             // Update Password in local state
             setUsers(prevUsers => prevUsers.map(u => u.email === currentUser.email ? { ...u, password: newPassInput } : u));
+            setCurrentUser(prev => prev ? { ...prev, password: newPassInput } : prev);
             // Update Password in Supabase
             await SupabaseService.updateUser(currentUser.email, { password: newPassInput });
         }
@@ -7414,9 +7477,29 @@ const App: React.FC = () => {
 
                                         <div className="border-t border-gray-200 pt-6 mt-4">
                                             <h3 className="text-sm font-bold text-gray-700 uppercase tracking-wide mb-4 flex items-center gap-2">
-                                                <Lock size={16} className="text-gray-400" /> Alterar Senha (Opcional)
+                                                <Lock size={16} className="text-gray-400" /> Senha e Segurança
                                             </h3>
-                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-gray-50 p-4 rounded-xl border border-gray-100">
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 bg-gray-50 p-4 rounded-xl border border-gray-100">
+                                                <div>
+                                                    <label className="block text-xs font-bold text-gray-500 uppercase mb-2">Minha Senha Atual</label>
+                                                    <div className="relative">
+                                                        <input
+                                                            type={showCurrentPassword ? "text" : "password"}
+                                                            value={(users.find(u => u.email === currentUser.email)?.password ?? currentUser.password ?? '')}
+                                                            readOnly
+                                                            className="w-full rounded-lg p-3 pr-12 outline-none shadow-inner-light bg-white border border-gray-300 text-gray-700 focus:ring-2 focus:ring-gray-200"
+                                                        />
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setShowCurrentPassword(!showCurrentPassword)}
+                                                            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition-colors"
+                                                            title={showCurrentPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                                                            aria-label={showCurrentPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                                                        >
+                                                            {showCurrentPassword ? <EyeOff size={20} /> : <Eye size={20} />}
+                                                        </button>
+                                                    </div>
+                                                </div>
                                                 <div>
                                                     <label className="block text-xs font-bold text-gray-500 uppercase mb-2">Nova Senha</label>
                                                     <div className="relative">
@@ -7704,7 +7787,7 @@ const App: React.FC = () => {
                                             <thead className="bg-gray-50/80 border-b border-gray-100">
                                                 <tr>
                                                     <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] min-w-[120px]">Nome</th>
-                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] min-w-[150px]">Contato</th>
+                                                    <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] min-w-[260px]">Usuário / Senha</th>
                                                     <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[90px]">Filial</th>
                                                     <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[90px]">Área</th>
                                                     <th className="px-4 py-4 font-black text-gray-400 uppercase tracking-wider text-[10px] whitespace-nowrap min-w-[110px]">Função</th>
@@ -7721,11 +7804,73 @@ const App: React.FC = () => {
                                                         <td className="px-4 py-4">
                                                             <div className="font-bold text-gray-900 break-words">{u.name}</div>
                                                         </td>
-                                                        <td className="px-4 py-4 min-w-[200px]">
-                                                            <div className="flex flex-col">
-                                                                <span className="text-gray-600 font-medium break-all text-xs" title={u.email}>{u.email}</span>
-                                                                <span className="text-gray-400 text-xs mt-0.5 break-all text-xs" title={u.phone || '-'}>{u.phone || '-'}</span>
-                                                            </div>
+                                                        <td className="px-4 py-4 min-w-[260px]">
+                                                            {(() => {
+                                                                const passwordValue = teamPasswordDrafts[u.email] ?? u.password ?? '';
+                                                                const passwordChanged = passwordValue !== (u.password ?? '');
+                                                                const isSavingPassword = savingTeamPasswordEmail === u.email;
+                                                                const isPasswordVisible = !!visibleTeamPasswords[u.email];
+                                                                const canViewTeamPassword = getUserRoleRank(currentUser?.role) > getUserRoleRank(u.role);
+                                                                const canEditTeamPassword = currentUser?.role === 'MASTER' && canViewTeamPassword;
+
+                                                                return (
+                                                                    <div className="flex flex-col gap-2">
+                                                                        <div className="flex flex-col">
+                                                                            <span className="text-[10px] font-black uppercase tracking-wider text-gray-400">Usuário</span>
+                                                                            <span className="text-gray-700 font-semibold break-all text-xs" title={u.email}>{u.email}</span>
+                                                                            <span className="text-gray-400 text-xs mt-0.5 break-all" title={u.phone || '-'}>{u.phone || '-'}</span>
+                                                                        </div>
+                                                                        {canViewTeamPassword && (
+                                                                            <div className="flex items-center gap-2">
+                                                                                <div className="relative flex-1 min-w-[150px]">
+                                                                                    <input
+                                                                                        type={isPasswordVisible ? 'text' : 'password'}
+                                                                                        value={passwordValue}
+                                                                                        onChange={(e) => {
+                                                                                            if (!canEditTeamPassword) return;
+                                                                                            setTeamPasswordDrafts(prev => ({ ...prev, [u.email]: e.target.value }));
+                                                                                        }}
+                                                                                        readOnly={!canEditTeamPassword}
+                                                                                        className={`w-full rounded-lg border px-3 py-2 pr-9 text-xs font-semibold outline-none transition-colors ${!canEditTeamPassword
+                                                                                            ? 'border-gray-200 bg-gray-50 text-gray-500 cursor-default'
+                                                                                            : passwordChanged
+                                                                                                ? 'border-blue-300 bg-blue-50/60 text-blue-900 focus:border-blue-500'
+                                                                                                : 'border-gray-200 bg-gray-50 text-gray-600 focus:border-gray-300'
+                                                                                            }`}
+                                                                                        autoComplete="new-password"
+                                                                                        aria-label={`Senha de ${u.name}`}
+                                                                                    />
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        onClick={() => setVisibleTeamPasswords(prev => ({ ...prev, [u.email]: !prev[u.email] }))}
+                                                                                        className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-blue-600 transition-colors"
+                                                                                        title={isPasswordVisible ? 'Ocultar senha' : 'Mostrar senha'}
+                                                                                        aria-label={isPasswordVisible ? 'Ocultar senha' : 'Mostrar senha'}
+                                                                                    >
+                                                                                        {isPasswordVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+                                                                                    </button>
+                                                                                </div>
+                                                                                {canEditTeamPassword ? (
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        onClick={() => handleSaveTeamUserPassword(u)}
+                                                                                        disabled={!passwordChanged || isSavingPassword}
+                                                                                        className="h-9 px-3 rounded-lg bg-gray-900 text-white text-[10px] font-black uppercase tracking-wide hover:bg-black disabled:bg-gray-100 disabled:text-gray-300 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-1"
+                                                                                        title={passwordChanged ? 'Salvar nova senha' : 'Nenhuma alteração'}
+                                                                                    >
+                                                                                        {isSavingPassword ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+                                                                                        Salvar
+                                                                                    </button>
+                                                                                ) : (
+                                                                                    <span className="h-9 px-3 rounded-lg bg-gray-100 text-gray-400 text-[10px] font-black uppercase tracking-wide inline-flex items-center justify-center whitespace-nowrap">
+                                                                                        Ver
+                                                                                    </span>
+                                                                                )}
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                );
+                                                            })()}
                                                         </td>
                                                         <td className="px-4 py-4">
                                                             <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold border bg-blue-50/60 text-blue-700 border-blue-100 whitespace-nowrap">
@@ -7819,7 +7964,7 @@ const App: React.FC = () => {
                                                 ))}
                                                 {filteredUsers.length === 0 && (
                                                     <tr>
-                                                        <td colSpan={7} className="px-6 py-12 text-center">
+                                                        <td colSpan={currentUser?.role === 'MASTER' ? 8 : 7} className="px-6 py-12 text-center">
                                                             <div className="flex flex-col items-center justify-center text-gray-400 gap-3">
                                                                 <SearchX size={32} strokeWidth={1.5} className="text-gray-300" />
                                                                 <p className="font-medium">Nenhum usuário encontrado</p>
