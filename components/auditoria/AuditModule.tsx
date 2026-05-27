@@ -297,6 +297,19 @@ const normalizeLookupText = (value: unknown) =>
         .toLowerCase()
         .trim();
 
+const isHierarchyPlaceholderName = (value: unknown, extraInvalid: string[] = []) => {
+    const text = normalizeLookupText(value).replace(/\s+/g, ' ');
+    if (!text) return false;
+    if (
+        text.includes('sem departamento') ||
+        text.includes('sem categoria') ||
+        text.includes('nao classificado')
+    ) {
+        return true;
+    }
+    return extraInvalid.some(invalid => text === normalizeLookupText(invalid));
+};
+
 const parseHierarchyCell = (value: unknown, fallbackName: string) => {
     const raw = (value ?? '').toString().trim();
     if (!raw) return { numericId: '', name: fallbackName };
@@ -307,13 +320,42 @@ const parseHierarchyCell = (value: unknown, fallbackName: string) => {
         .replace(/\s+/g, ' ')
         .trim();
 
-    const isUnclassified = name.toUpperCase().includes('SEM DEPARTAMENTO') || 
-                           name.toUpperCase().includes('SEM CATEGORIA') || 
-                           name.toUpperCase() === 'OUTROS';
+    const isUnclassified = isHierarchyPlaceholderName(name, ['OUTROS']);
 
     return {
         numericId: (numericId !== null && !isUnclassified) ? String(numericId) : '',
         name: name || raw || fallbackName
+    };
+};
+
+const parseHierarchyCells = (
+    codeOrCombinedCell: unknown,
+    nameCell: unknown,
+    fallbackName: string,
+    extraInvalid: string[] = []
+) => {
+    const first = parseHierarchyCell(codeOrCombinedCell, '');
+    const second = parseHierarchyCell(nameCell, '');
+    const invalidLabels = ['OUTROS', ...extraInvalid];
+    const isUsefulName = (value: unknown) => {
+        const text = String(value ?? '').trim();
+        if (!text) return false;
+        if (!/[A-Za-zÀ-ÿ]/.test(text)) return false;
+        if (/^[\d\s.,:/-]+$/.test(text)) return false;
+        return !isHierarchyPlaceholderName(text, invalidLabels);
+    };
+
+    const name = isUsefulName(second.name)
+        ? second.name
+        : isUsefulName(first.name)
+            ? first.name
+            : (second.name || first.name || fallbackName);
+    const normalizedName = String(name || fallbackName).trim() || fallbackName;
+    const isPlaceholder = isHierarchyPlaceholderName(normalizedName, invalidLabels);
+
+    return {
+        numericId: isPlaceholder ? '' : (first.numericId || second.numericId || ''),
+        name: normalizedName
     };
 };
 
@@ -2355,6 +2397,30 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         return s.replace(/\D/g, "").replace(/^0+/, "");
     };
 
+    const collectProductCodeCandidates = (row: any[], maxColumns = 12): string[] => {
+        const candidates = new Set<string>();
+        const add = (index: number) => {
+            if (!row || index < 0 || index >= row.length) return;
+            const raw = row[index];
+            if (raw === null || raw === undefined || raw === '') return;
+            const text = String(raw).trim().replace(/^'/, '');
+            const looksNumericCode =
+                typeof raw === 'number'
+                    ? Number.isFinite(raw)
+                    : /^\d+(?:-\d+)?(?:[.,]0+)?$/.test(text) || /[Ee+]/.test(text);
+            if (!looksNumericCode) return;
+            const code = normalizeBarcode(raw);
+            if (!code || code.length < 3) return;
+            if (GROUP_UPLOAD_IDS.includes(code as GroupUploadId) && index !== 1) return;
+            candidates.add(code);
+        };
+
+        const limit = Math.min(row?.length || 0, maxColumns);
+        for (let i = 0; i < limit; i++) add(i);
+        add(11);
+        return Array.from(candidates);
+    };
+
     const parseStockNumber = (val: any): number => {
         return Number(parseDecimalCell(val));
     };
@@ -3162,15 +3228,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 rows.forEach((row) => {
                     if (!row || row.length < 4) return;
 
-                    // Cadastro individual: procurar nas primeiras colunas
-                    let reducedFromCadastro = "";
-                    for (let i = 0; i < Math.min(row.length, 20); i++) {
-                        if (isStrictBarcode(row[i])) {
-                            reducedFromCadastro = normalizeBarcode(row[i]);
-                            break;
-                        }
-                    }
-                    if (!reducedFromCadastro) return;
+                    const productCodeCandidates = collectProductCodeCandidates(row, 12);
+                    if (productCodeCandidates.length === 0) return;
 
                     let productNameKeyStr = "";
                     for (let i = 0; i < Math.min(row.length, 10); i++) {
@@ -3181,10 +3240,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     }
                     const productNameKey = superClean(productNameKeyStr);
 
-                    const deptCell = parseHierarchyCell(row[18], "OUTROS");
-                    const catCell = parseHierarchyCell(row[22], "GERAL");
-                    const deptResolvedId = deptCell.numericId || resolveIdByDescription(row[18], deptIdByDescription, deptDescEntries);
-                    const catResolvedId = catCell.numericId || resolveIdByDescription(row[22], catIdByDescription, catDescEntries);
+                    const deptCell = parseHierarchyCells(row[18], row[19], "OUTROS", ['GERAL']);
+                    const catCell = parseHierarchyCells(row[22], row[23], "GERAL", ['GERAL']);
+                    const deptResolvedId = deptCell.numericId || resolveIdByDescription(deptCell.name || row[19] || row[18], deptIdByDescription, deptDescEntries);
+                    const catResolvedId = catCell.numericId || resolveIdByDescription(catCell.name || row[23] || row[22], catIdByDescription, catDescEntries);
 
                     const scope: ProductScope = {
                         groupId,
@@ -3195,7 +3254,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         catName: catCell.name
                     };
 
-                    addScope(productsByReduced, reducedFromCadastro, scope);
+                    productCodeCandidates.forEach(codeCandidate => addScope(productsByReduced, codeCandidate, scope));
                     addScope(productsByName, productNameKey, scope);
                 });
             });
@@ -4918,23 +4977,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             const catRaw = String(row[22] ?? '').trim(); // Col W = categoria
                             if (!deptRaw && !catRaw) return;
 
-                            const deptParsed = parseHierarchyCell(deptRaw, 'DIVERSOS (SEM DEPARTAMENTO)');
-                            const catParsed = parseHierarchyCell(catRaw, 'DIVERSOS (SEM CATEGORIA)');
+                            const deptParsed = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
+                            const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
                             const deptName = deptParsed.name;
                             const catName = catParsed.name;
 
-                            const codes = Array.from(new Set(
-                                Array.from({ length: 6 }, (_, idx) => normalizeBarcode(row[idx])).filter(Boolean)
-                            ));
+                            const codes = collectProductCodeCandidates(row, 12);
                             codes.forEach(code => {
                                 if (!code) return;
                                 const current = universalRegistry.get(code) || [];
                                 current.push({
                                     groupId: normalizeScopeId(groupId),
                                     groupName,
-                                    deptId: normalizeScopeId(deptParsed.id),
+                                    deptId: normalizeScopeId(deptParsed.numericId),
                                     deptName,
-                                    catId: normalizeScopeId(catParsed.id),
+                                    catId: normalizeScopeId(catParsed.numericId),
                                     catName
                                 });
                                 universalRegistry.set(code, current);
@@ -5009,28 +5066,19 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             // Skip rows where both dept and cat are empty (header/blank rows)
                             if (!deptRaw && !catRaw) return;
 
-                            const deptParsed = parseHierarchyCell(deptRaw, 'DIVERSOS (SEM DEPARTAMENTO)');
-                            const catParsed = parseHierarchyCell(catRaw, 'DIVERSOS (SEM CATEGORIA)');
+                            const deptParsed = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
+                            const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
                             const deptName = deptParsed.name;
                             const catName = catParsed.name;
 
-                            const candidate = {
-                                groupId: normalizeScopeId(primaryScopeGroupId),
-                                deptId: normalizeScopeId(deptParsed.id),
-                                deptName,
-                                catId: normalizeScopeId(catParsed.id),
-                                catName
-                            };
-                            const rowCodes = Array.from(new Set(
-                                Array.from({ length: 6 }, (_, idx) => normalizeBarcode(row[idx])).filter(Boolean)
-                            ));
+                            const rowCodes = collectProductCodeCandidates(row, 12);
                             rowCodes.forEach((codeCandidate) => {
                                 if (!codeCandidate) return;
                                 const candidate = {
                                     groupId: normalizeScopeId(primaryScopeGroupId),
-                                    deptId: normalizeScopeId(deptParsed.id),
+                                    deptId: normalizeScopeId(deptParsed.numericId),
                                     deptName,
-                                    catId: normalizeScopeId(catParsed.id),
+                                    catId: normalizeScopeId(catParsed.numericId),
                                     catName
                                 };
                                 const current = cadastroLookup.get(codeCandidate);
