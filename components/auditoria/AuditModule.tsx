@@ -4055,9 +4055,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             pendingSkus,
             pendingCost,
             groupsWithDivergence,
-            doneUnits: Number(branchMetrics.doneUnits || 0),
+            doneUnits: Number(branchMetrics.doneUnits || 0) + diffQty,
             totalUnits: Number(branchMetrics.units || 0),
-            doneCost: Number(branchMetrics.doneCost || 0),
+            doneCost: Number(branchMetrics.doneCost || 0) + diffCost,
             totalCost: Number(branchMetrics.cost || 0)
         };
     }, [data, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost]);
@@ -5998,8 +5998,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 ['Conferência Global da Filial', `${Number(branchMetrics.progress || 0).toLocaleString('pt-BR', { maximumFractionDigits: 0 })}%`],
                 ['SKUs Totais (Mix Importado)', fmtInt(Number(branchMetrics.skus || 0))],
                 ['Mix Auditado (Conf./Pend.)', `${fmtInt(Number(branchMetrics.doneSkus || 0))} / ${fmtInt(mixPending)}`],
-                ['Unidades Totais (Conf./Total)', `${fmtInt(Number(branchMetrics.doneUnits || 0))} / ${fmtInt(Number(branchMetrics.units || 0))}`],
-                ['Valor em Custo (Conf./Total)', `${fmtCurrency(Number(branchMetrics.doneCost || 0))} / ${fmtCurrency(Number(branchMetrics.cost || 0))}`],
+                ['Unidades Totais (Conf./Total)', `${fmtInt(Number(filialTotalsMetrics.doneUnits || 0))} / ${fmtInt(Number(branchMetrics.units || 0))}`],
+                ['Valor em Custo (Conf./Total)', `${fmtCurrency(Number(filialTotalsMetrics.doneCost || 0))} / ${fmtCurrency(Number(branchMetrics.cost || 0))}`],
                 ['Total Conferido R$', fmtCurrency(Number(filialTotalsMetrics.doneCost || 0))],
                 ['Falta Conferir R$', fmtCurrency(Number(filialTotalsMetrics.pendingCost || 0))],
                 ['Qtde Divergência', `${Number(filialTotalsMetrics.diffQty || 0) > 0 ? '+' : ''}${fmtInt(Number(filialTotalsMetrics.diffQty || 0))} un.`],
@@ -6722,9 +6722,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const summaryData = [
             ["PREVISÃO DE TÉRMINO", `${Math.ceil(productivity.etaDays)} dias restantes`, "CONFERÊNCIA (SKUs)", `${Math.round(branchMetrics.progress)}%`],
             ["SKUs TOTAIS (Relatório)", branchMetrics.skus.toLocaleString(), "UNIDADES TOTAIS (Relatório)", Math.round(branchMetrics.units).toLocaleString()],
-            ["SKUs CONFERIDOS", branchMetrics.doneSkus.toLocaleString(), "UNIDADES CONFERIDAS", Math.round(branchMetrics.doneUnits).toLocaleString()],
+            ["SKUs CONFERIDOS", branchMetrics.doneSkus.toLocaleString(), "UNIDADES CONFERIDAS", Math.round(filialTotalsMetrics.doneUnits).toLocaleString()],
             ["SKUs FALTANTES", branchMetrics.pendingSkus.toLocaleString(), "UNIDADES FALTANTES", Math.round(branchMetrics.pendingUnits).toLocaleString()],
-            ["VALOR TOTAL (Custo)", `R$ ${branchMetrics.cost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`, "VALOR CONFERIDO", `R$ ${branchMetrics.doneCost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`]
+            ["VALOR TOTAL (Custo)", `R$ ${branchMetrics.cost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`, "VALOR CONFERIDO", `R$ ${filialTotalsMetrics.doneCost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`]
         ];
 
         autoTable(doc, { startY: 40, body: summaryData, theme: 'grid', styles: { fontSize: 9, cellPadding: 2 }, headStyles: { fillColor: [79, 70, 229] } });
@@ -6791,6 +6791,431 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         doc.save(fileName);
     };
 
+    const handleExportDetailedExcel = () => {
+        if (!data) {
+            alert("Nenhum dado de auditoria disponível para exportação.");
+            return;
+        }
+
+        try {
+            const getScopeCategoriesLocal = (groupId?: string, deptId?: string, catId?: string) => {
+                const g = data.groups.find(gr => String(gr.id) === String(groupId));
+                if (!g) return [];
+                if (catId) {
+                    const targetDept = deptId
+                        ? g.departments?.find((d: any) => String(d.id) === String(deptId))
+                        : g.departments?.find((d: any) => d.categories?.some((c: any) => String(c.id) === String(catId)));
+                    const cat = targetDept?.categories?.find((c: any) => String(c.id) === String(catId));
+                    return targetDept && cat ? [cat] : [];
+                }
+                if (deptId) {
+                    const dept = g.departments?.find((d: any) => String(d.id) === String(deptId));
+                    if (!dept) return [];
+                    return dept.categories || [];
+                }
+                return g.departments?.flatMap((d: any) => d.categories || []) || [];
+            };
+
+            const allProductsData: any[] = [];
+            let totalSysQty = 0;
+            let totalCountedQty = 0;
+            let totalSysCost = 0;
+            let totalCountedCost = 0;
+            let totalFaltaQty = 0;
+            let totalFaltaCost = 0;
+            let totalSobraQty = 0;
+            let totalSobraCost = 0;
+            let divergentSkusCount = 0;
+
+            const coveredCategories = new Set<string>();
+
+            // Helper de deduplicacao
+            const normalizeDigitsLocal = (value: unknown) => String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
+            const normalizeScopeIdLocal = (value: unknown) => String(value ?? '').trim().toLowerCase();
+            const normalizeTextLocal = (value: unknown) =>
+                String(value ?? '')
+                    .normalize('NFD')
+                    .replace(/[̀-ͯ]/g, '')
+                    .toLowerCase()
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+            const mergeExcelMetricsPoolsLocal = (poolsList: any[]) => {
+                const validPools = (poolsList || []).filter(Boolean);
+                if (validPools.length === 0) return null;
+                if (validPools.length === 1) return validPools[0];
+
+                const uniqueItems = new Map<string, any>();
+                validPools.forEach((pool: any) => {
+                    (Array.isArray(pool?.items) ? pool.items : []).forEach((it: any) => {
+                        const keyObj = {
+                            code: normalizeDigitsLocal(it?.code || it?.reducedCode),
+                            groupId: normalizeScopeIdLocal(it?.groupId),
+                            deptId: normalizeScopeIdLocal(it?.deptId),
+                            catId: normalizeScopeIdLocal(it?.catId),
+                            groupName: normalizeTextLocal(it?.groupName),
+                            deptName: normalizeTextLocal(it?.deptName),
+                            catName: normalizeTextLocal(it?.catName),
+                            sysQty: Number(it?.sysQty || 0),
+                            countedQty: Number(it?.countedQty || 0),
+                            diffQty: Number(it?.diffQty || 0),
+                            sysCost: Number(it?.sysCost || 0),
+                            countedCost: Number(it?.countedCost || 0),
+                            diffCost: Number(it?.diffCost || 0)
+                        };
+                        const key = JSON.stringify(keyObj);
+                        if (!uniqueItems.has(key)) uniqueItems.set(key, it);
+                    });
+                });
+                return { items: Array.from(uniqueItems.values()) };
+            };
+
+            const isItemInScope = (item: any, draftKey: string, groupsList: any[]) => {
+                const normalizeTextLocal = (value: unknown) =>
+                    String(value ?? '')
+                        .normalize('NFD')
+                        .replace(/[̀-ͯ]/g, '')
+                        .toLowerCase()
+                        .replace(/\s+/g, ' ')
+                        .trim();
+
+                if (draftKey.startsWith('custom|')) {
+                    const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
+                    const scopesPart = typeof match?.[2] === 'string' ? match[2] : (match?.[1] || '');
+                    const allowedCatIds = new Set<string>();
+                    scopesPart.split(',').filter(Boolean).forEach(scopeKey => {
+                        const [g, d, c] = scopeKey.split('|');
+                        const expanded = getScopeCategoriesLocal(g, d, c);
+                        expanded.forEach(cat => allowedCatIds.add(cat.id));
+                    });
+                    return item.catId ? allowedCatIds.has(item.catId) : false;
+                }
+
+                const [type, groupId, deptId, catId] = draftKey.split('|');
+                if (!type) return true;
+
+                const scopeCategories = getScopeCategoriesLocal(groupId || undefined, deptId || undefined, catId || undefined);
+                const allowedCatIds = new Set(
+                    scopeCategories.map(cat => cat.id)
+                );
+
+                if (item.catId && allowedCatIds.has(item.catId)) return true;
+
+                return scopeCategories.some(cat => 
+                    normalizeTextLocal(item.catName) === normalizeTextLocal(cat.name || '')
+                );
+            };
+
+            const pools: any[] = [];
+            Object.entries(termDrafts || {}).forEach(([draftKey, draftValue]) => {
+                if (draftValue?.excelMetrics && !draftValue?.excelMetricsRemovedAt) {
+                    const cleanItems = (draftValue.excelMetrics.items || []).filter((item: any) => {
+                        return isItemInScope(item, draftKey, data.groups);
+                    });
+                    pools.push({ ...draftValue.excelMetrics, items: cleanItems });
+                    
+                    // Marcar categorias cobertas
+                    if (draftKey.startsWith('custom|')) {
+                        const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
+                        const scopesPart = typeof match?.[2] === 'string' ? match[2] : (match?.[1] || '');
+                        scopesPart.split(',').filter(Boolean).forEach(scopeKey => {
+                            const [g, d, c] = scopeKey.split('|');
+                            const expanded = getScopeCategoriesLocal(g, d, c);
+                            expanded.forEach(cat => coveredCategories.add(cat.id));
+                        });
+                    } else {
+                        const [type, g, d, c] = draftKey.split('|');
+                        if (type && type !== 'custom') {
+                            const expanded = getScopeCategoriesLocal(g || undefined, d || undefined, c || undefined);
+                            expanded.forEach(cat => coveredCategories.add(cat.id));
+                        }
+                    }
+                }
+            });
+
+const merged = mergeExcelMetricsPoolsLocal(pools);
+            const uniqueExcelItems = merged?.items || [];
+
+            const metadataKeywords = [
+                'filial:', 'grupo de produtos:', 'departamento:', 'categoria:',
+                'tipo de produto:', 'grupo de preço:', 'início contagem:',
+                'conferência de estoque', 'código', 'página 1 de', 'produto:'
+            ];
+
+            const isMetadataRow = (item: any) => {
+                const codigo = String(item.code || '').trim().toLowerCase();
+                const descricao = String(item.description || '').trim().toLowerCase();
+
+                if (metadataKeywords.some(keyword => codigo.startsWith(keyword) || descricao.startsWith(keyword))) {
+                    return true;
+                }
+                if ((!codigo && !descricao) || codigo === '-' || descricao === '-' || (codigo === '' && descricao === '-')) {
+                    return true;
+                }
+                return false;
+            };
+
+            const cleanExcelItems = uniqueExcelItems.filter((item: any) => !isMetadataRow(item));
+
+            cleanExcelItems.forEach((item: any) => {
+                const sysQty = Number(item.sysQty || 0);
+                const countedQty = Number(item.countedQty || 0);
+                const diffQty = Number(item.diffQty || 0);
+                const cost = Number(item.cost || 0);
+                const sysCost = Number(item.sysCost || 0);
+                const countedCost = Number(item.countedCost || 0);
+                const diffCost = Number(item.diffCost || 0);
+
+                let faltaQty = 0;
+                let faltaCost = 0;
+                let sobraQty = 0;
+                let sobraCost = 0;
+
+                if (diffQty < 0) {
+                    faltaQty = Math.abs(diffQty);
+                    faltaCost = Math.abs(diffCost);
+                } else if (diffQty > 0) {
+                    sobraQty = diffQty;
+                    sobraCost = diffCost;
+                }
+
+                allProductsData.push({
+                    code: item.code || '',
+                    reducedCode: item.reducedCode || '',
+                    name: item.description || item.name || '',
+                    groupName: item.groupName || 'DIVERSOS (SEM GRUPO)',
+                    deptName: item.deptName || 'DIVERSOS (SEM DEPARTAMENTO)',
+                    catName: item.catName || 'DIVERSOS (SEM CATEGORIA)',
+                    cost,
+                    sysQty,
+                    countedQty,
+                    diffQty,
+                    sysCost,
+                    countedCost,
+                    diffCost,
+                    faltaQty,
+                    faltaCost,
+                    sobraQty,
+                    sobraCost,
+                    status: diffQty === 0 ? 'CORRETO' : (diffQty < 0 ? 'FALTA' : 'SOBRA')
+                });
+            });
+
+            // 2. Processar categorias do banco que NÃO foram cobertas por planilhas Excel dos termos
+            data.groups.forEach(g => {
+                g.departments?.forEach(d => {
+                    d.categories?.forEach(c => {
+                        if (!coveredCategories.has(c.id)) {
+                            const isCatDone = isDoneStatus(c.status);
+                            c.products?.forEach(p => {
+                                const sysQty = Number(p.quantity || 0);
+                                const countedQty = isCatDone ? sysQty : 0;
+                                const cost = Number(p.cost || 0);
+                                const sysCost = sysQty * cost;
+                                const countedCost = countedQty * cost;
+                                const diffQty = countedQty - sysQty;
+                                const diffCost = countedCost - sysCost;
+
+                                let faltaQty = 0;
+                                let faltaCost = 0;
+                                let sobraQty = 0;
+                                let sobraCost = 0;
+
+                                if (diffQty < 0) {
+                                    faltaQty = Math.abs(diffQty);
+                                    faltaCost = Math.abs(diffCost);
+                                } else if (diffQty > 0) {
+                                    sobraQty = diffQty;
+                                    sobraCost = diffCost;
+                                }
+
+                                allProductsData.push({
+                                    code: p.code || '',
+                                    reducedCode: p.reducedCode || p.code || '',
+                                    name: p.name || '',
+                                    groupName: g.name || 'DIVERSOS (SEM GRUPO)',
+                                    deptName: d.name || 'DIVERSOS (SEM DEPARTAMENTO)',
+                                    catName: c.name || 'DIVERSOS (SEM CATEGORIA)',
+                                    cost,
+                                    sysQty,
+                                    countedQty,
+                                    diffQty,
+                                    sysCost,
+                                    countedCost,
+                                    diffCost,
+                                    faltaQty,
+                                    faltaCost,
+                                    sobraQty,
+                                    sobraCost,
+                                    status: diffQty === 0 ? 'CORRETO' : (diffQty < 0 ? 'FALTA' : 'SOBRA')
+                                });
+                            });
+                        }
+                    });
+                });
+            });
+
+            // Acumular totais a partir de allProductsData
+            allProductsData.forEach(p => {
+                totalSysQty += p.sysQty;
+                totalCountedQty += p.countedQty;
+                totalSysCost += p.sysCost;
+                totalCountedCost += p.countedCost;
+                totalFaltaQty += p.faltaQty;
+                totalFaltaCost += p.faltaCost;
+                totalSobraQty += p.sobraQty;
+                totalSobraCost += p.sobraCost;
+                if (p.diffQty !== 0) {
+                    divergentSkusCount++;
+                }
+            });
+
+            // 3. Agrupamentos
+            const groupMap: Record<string, any> = {};
+            const deptMap: Record<string, any> = {};
+            const catMap: Record<string, any> = {};
+
+            allProductsData.forEach(p => {
+                // Grupo
+                if (!groupMap[p.groupName]) {
+                    groupMap[p.groupName] = { Grupo: p.groupName, 'Qtd Sistema': 0, 'Qtd Conferida': 0, 'Divergência Qtd': 0, 'Custo Sistema (R$)': 0, 'Custo Conferido (R$)': 0, 'Divergência R$': 0, 'Qtd Faltas (Perdas)': 0, 'Valor Faltas (R$)': 0, 'Qtd Sobras': 0, 'Valor Sobras (R$)': 0 };
+                }
+                const g = groupMap[p.groupName];
+                g['Qtd Sistema'] += p.sysQty;
+                g['Qtd Conferida'] += p.countedQty;
+                g['Divergência Qtd'] += p.diffQty;
+                g['Custo Sistema (R$)'] += p.sysCost;
+                g['Custo Conferido (R$)'] += p.countedCost;
+                g['Divergência R$'] += p.diffCost;
+                g['Qtd Faltas (Perdas)'] += p.faltaQty;
+                g['Valor Faltas (R$)'] += p.faltaCost;
+                g['Qtd Sobras'] += p.sobraQty;
+                g['Valor Sobras (R$)'] += p.sobraCost;
+
+                // Departamento
+                const deptKey = `${p.groupName} | ${p.deptName}`;
+                if (!deptMap[deptKey]) {
+                    deptMap[deptKey] = { Grupo: p.groupName, Departamento: p.deptName, 'Qtd Sistema': 0, 'Qtd Conferida': 0, 'Divergência Qtd': 0, 'Custo Sistema (R$)': 0, 'Custo Conferido (R$)': 0, 'Divergência R$': 0, 'Qtd Faltas (Perdas)': 0, 'Valor Faltas (R$)': 0, 'Qtd Sobras': 0, 'Valor Sobras (R$)': 0 };
+                }
+                const d = deptMap[deptKey];
+                d['Qtd Sistema'] += p.sysQty;
+                d['Qtd Conferida'] += p.countedQty;
+                d['Divergência Qtd'] += p.diffQty;
+                d['Custo Sistema (R$)'] += p.sysCost;
+                d['Custo Conferido (R$)'] += p.countedCost;
+                d['Divergência R$'] += p.diffCost;
+                d['Qtd Faltas (Perdas)'] += p.faltaQty;
+                d['Valor Faltas (R$)'] += p.faltaCost;
+                d['Qtd Sobras'] += p.sobraQty;
+                d['Valor Sobras (R$)'] += p.sobraCost;
+
+                // Categoria
+                const catKey = `${p.groupName} | ${p.deptName} | ${p.catName}`;
+                if (!catMap[catKey]) {
+                    catMap[catKey] = { Grupo: p.groupName, Departamento: p.deptName, Categoria: p.catName, 'Qtd Sistema': 0, 'Qtd Conferida': 0, 'Divergência Qtd': 0, 'Custo Sistema (R$)': 0, 'Custo Conferido (R$)': 0, 'Divergência R$': 0, 'Qtd Faltas (Perdas)': 0, 'Valor Faltas (R$)': 0, 'Qtd Sobras': 0, 'Valor Sobras (R$)': 0 };
+                }
+                const c = catMap[catKey];
+                c['Qtd Sistema'] += p.sysQty;
+                c['Qtd Conferida'] += p.countedQty;
+                c['Divergência Qtd'] += p.diffQty;
+                c['Custo Sistema (R$)'] += p.sysCost;
+                c['Custo Conferido (R$)'] += p.countedCost;
+                c['Divergência R$'] += p.diffCost;
+                c['Qtd Faltas (Perdas)'] += p.faltaQty;
+                c['Valor Faltas (R$)'] += p.faltaCost;
+                c['Qtd Sobras'] += p.sobraQty;
+                c['Valor Sobras (R$)'] += p.sobraCost;
+            });
+
+            // 4. Criar workbook
+            const wb = XLSX.utils.book_new();
+
+            // Aba 1: Resumo Geral
+            const overallDiffCost = totalCountedCost - totalSysCost;
+            const deviationPercent = totalSysCost > 0 ? (overallDiffCost / totalSysCost) * 100 : 0;
+            const summaryData = [
+                ['MÉTRICA', 'VALOR'],
+                ['EMPRESA', data.empresa || 'Sem Empresa'],
+                ['FILIAL / LOJA', data.filial || 'Sem Filial'],
+                ['NÚMERO DA AUDITORIA', accessedAuditNumber !== null ? String(accessedAuditNumber) : 'N/A'],
+                ['STATUS DA SESSÃO', isReadOnlyCompletedView ? 'CONCLUÍDO (MODO CONSULTA)' : 'ABERTO'],
+                ['DATA DE EXPORTAÇÃO', new Date().toLocaleString('pt-BR')],
+                ['TOTAL SKUS CADASTRADOS', allProductsData.length],
+                ['TOTAL DE SKUS COM DIVERGÊNCIA', divergentSkusCount],
+                ['QUANTIDADE TOTAL SISTEMA', totalSysQty],
+                ['QUANTIDADE TOTAL CONFERIDA', totalCountedQty],
+                ['DIVERGÊNCIA LÍQUIDA QTD', totalCountedQty - totalSysQty],
+                ['VALOR TOTAL SISTEMA (CUSTO)', totalSysCost],
+                ['VALOR TOTAL CONFERIDO (CUSTO)', totalCountedCost],
+                ['DIVERGÊNCIA LÍQUIDA FINANCEIRA (R$)', overallDiffCost],
+                ['REPRESENTAÇÃO DIVERGÊNCIA (%)', deviationPercent],
+                ['FALTAS / PERDAS - QTD UNIDADES', totalFaltaQty],
+                ['FALTAS / PERDAS - VALOR (R$)', totalFaltaCost],
+                ['SOBRAS - QTD UNIDADES', totalSobraQty],
+                ['SOBRAS - VALOR (R$)', totalSobraCost]
+            ];
+            const wsSummary = XLSX.utils.aoa_to_sheet(summaryData);
+            XLSX.utils.book_append_sheet(wb, wsSummary, "Resumo Geral");
+
+            // Aba 2: Por Grupo
+            const wsGroup = XLSX.utils.json_to_sheet(Object.values(groupMap));
+            XLSX.utils.book_append_sheet(wb, wsGroup, "Por Grupo");
+
+            // Aba 3: Por Departamento
+            const wsDept = XLSX.utils.json_to_sheet(Object.values(deptMap));
+            XLSX.utils.book_append_sheet(wb, wsDept, "Por Departamento");
+
+            // Aba 4: Por Categoria
+            const wsCat = XLSX.utils.json_to_sheet(Object.values(catMap));
+            XLSX.utils.book_append_sheet(wb, wsCat, "Por Categoria");
+
+            // Aba 5: Itens Detalhado
+            const detailedItems = allProductsData.map(p => ({
+                'Código de Barras': p.code,
+                'Código Reduzido': p.reducedCode,
+                'Descrição do Produto': p.name,
+                'Grupo': p.groupName,
+                'Departamento': p.deptName,
+                'Categoria': p.catName,
+                'Custo Unitário (R$)': p.cost,
+                'Qtd Sistema': p.sysQty,
+                'Qtd Físico': p.countedQty,
+                'Divergência Qtd': p.diffQty,
+                'Total Sistema (R$)': p.sysCost,
+                'Total Físico (R$)': p.countedCost,
+                'Divergência Financeira (R$)': p.diffCost,
+                'Qtd Faltas (Perdas)': p.faltaQty,
+                'Valor Faltas (R$)': p.faltaCost,
+                'Qtd Sobras': p.sobraQty,
+                'Valor Sobras (R$)': p.sobraCost,
+                'Status': p.status
+            }));
+            const wsDetailed = XLSX.utils.json_to_sheet(detailedItems);
+            XLSX.utils.book_append_sheet(wb, wsDetailed, "Itens Detalhado");
+
+            const fileName = `Auditoria_F${data.filial}_N${accessedAuditNumber || 'DETALHADA'}_Detalhado.xlsx`;
+            XLSX.writeFile(wb, fileName);
+
+            insertAppEventLog({
+                company_id: selectedCompany?.id || null,
+                branch: selectedFilial || null,
+                area: null,
+                user_email: userEmail,
+                user_name: userName || null,
+                app: 'auditoria',
+                event_type: 'audit_report_printed',
+                entity_type: 'audit_report',
+                entity_id: fileName,
+                status: 'success',
+                success: true,
+                source: 'web'
+            }).catch(() => { });
+
+        } catch (error) {
+            console.error("Erro ao exportar planilha Excel detalhada:", error);
+            alert("Erro ao gerar o relatório detalhado em Excel.");
+        }
+    };
     const selectedGroup = useMemo(() => data?.groups.find(g => g.id === view.selectedGroupId), [data, view.selectedGroupId]);
     const selectedDept = useMemo(() => selectedGroup?.departments.find(d => d.id === view.selectedDeptId), [selectedGroup, view.selectedDeptId]);
     const selectedCat = useMemo(() => selectedDept?.categories.find(c => c.id === view.selectedCatId), [selectedDept, view.selectedCatId]);
@@ -7546,6 +7971,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     <button onClick={handleExportPDF} className="bg-white/10 hover:bg-white/20 px-3 md:px-5 py-2 rounded-xl text-white font-black text-[9px] uppercase tracking-widest flex items-center gap-2 transition-all border border-white/10 whitespace-nowrap">
                         <FileBox className="w-4 h-4" /> <span className="hidden sm:inline">PDF ANALÍTICO</span><span className="sm:hidden">PDF</span>
                     </button>
+                    <button onClick={handleExportDetailedExcel} className="bg-white/10 hover:bg-white/20 px-3 md:px-5 py-2 rounded-xl text-white font-black text-[9px] uppercase tracking-widest flex items-center gap-2 transition-all border border-white/10 whitespace-nowrap" title="Exportar planilha Excel completa com perdas e sobras">
+                        <FileSpreadsheet className="w-4 h-4" /> <span className="hidden sm:inline">EXCEL DETALHADO</span><span className="sm:hidden">EXCEL</span>
+                    </button>
                     <button onClick={handleSafeExit} className="w-10 h-10 rounded-xl bg-red-600/20 text-red-500 border border-red-500/30 flex items-center justify-center hover:bg-red-600 hover:text-white transition-all shadow-lg active:scale-90" title="Sair e Salvar">
                         <Power className="w-5 h-5" />
                     </button>
@@ -7743,7 +8171,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     <div className="flex flex-col items-center border-l border-slate-100 px-2 min-w-0">
                         <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest italic text-center">Unidades Totais</span>
                         <div className="flex flex-nowrap items-center justify-center gap-2 mt-1 text-center leading-none whitespace-nowrap">
-                            <span className="text-[clamp(0.9rem,1.25vw,1.2rem)] font-black text-indigo-700 tabular-nums leading-none whitespace-nowrap">{Math.round(branchMetrics.doneUnits).toLocaleString()}</span>
+                            <span className="text-[clamp(0.9rem,1.25vw,1.2rem)] font-black text-indigo-700 tabular-nums leading-none whitespace-nowrap">{Math.round(filialTotalsMetrics.doneUnits).toLocaleString()}</span>
                             <span className="text-slate-200 text-[clamp(0.7rem,1vw,0.9rem)] leading-none whitespace-nowrap">/</span>
                             <span className="text-[clamp(0.8rem,1.1vw,1.05rem)] font-black text-slate-300 tabular-nums leading-none whitespace-nowrap">{Math.round(branchMetrics.units).toLocaleString()}</span>
                         </div>
@@ -7753,7 +8181,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     <div className="flex flex-col items-center border-l border-slate-100 px-2 min-w-0">
                         <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest italic text-center">Valor em Custo</span>
                         <div className="flex flex-nowrap items-center justify-center gap-2 mt-1 text-center leading-none whitespace-nowrap">
-                            <span className="text-[clamp(0.88rem,1.2vw,1.15rem)] font-black text-emerald-700 tabular-nums leading-none whitespace-nowrap">R$ {branchMetrics.doneCost.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                            <span className="text-[clamp(0.88rem,1.2vw,1.15rem)] font-black text-emerald-700 tabular-nums leading-none whitespace-nowrap">R$ {filialTotalsMetrics.doneCost.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                             <span className="text-slate-200 text-[clamp(0.7rem,1vw,0.9rem)] leading-none whitespace-nowrap">/</span>
                             <span className="text-[clamp(0.8rem,1.05vw,1.05rem)] font-black text-slate-300 tabular-nums leading-none whitespace-nowrap">{branchMetrics.cost.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                         </div>

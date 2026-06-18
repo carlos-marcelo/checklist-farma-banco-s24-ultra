@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom';
 import { Camera, FileText, CheckSquare, Printer, Clipboard, ClipboardList, Image as ImageIcon, Trash2, Menu, X, ChevronRight, Download, Star, AlertTriangle, CheckCircle, AlertCircle, LayoutDashboard, FileCheck, Settings, LogOut, Users, Palette, Upload, UserPlus, History, RotateCcw, Save, Search, Eye, EyeOff, Phone, User as UserIcon, Ban, Check, Filter, UserX, Undo2, CheckSquare as CheckSquareIcon, Trophy, Frown, PartyPopper, Lock, Loader2, Building2, MapPin, Store, MessageSquare, Send, ThumbsUp, ThumbsDown, Clock, CheckCheck, Lightbulb, MessageSquareQuote, Package, ArrowRight, ArrowLeft, ShieldCheck, HelpCircle, Info, LayoutGrid, UserCircle, FileSearch, ChevronDown, Calendar, RefreshCw, UserCircle2, Plus, SearchX, WifiOff, LineChart } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import * as XLSX from 'xlsx';
+import { FileSpreadsheet } from 'lucide-react';
 import { CHECKLISTS as BASE_CHECKLISTS, THEMES, ACCESS_MODULES, ACCESS_LEVELS, INPUT_TYPE_LABELS, generateId } from './constants';
 import { ChecklistData, ChecklistImages, InputType, ChecklistSection, ChecklistDefinition, ChecklistItem, ThemeColor, AppConfig, User, ReportHistoryItem, StockConferenceHistoryItem, CompanyArea, AccessLevelId, AccessModule, AccessLevelMeta, UserRole, StockConferenceSummary } from './types';
 import AuditModule from './components/auditoria/AuditModule';
@@ -4279,6 +4281,522 @@ const App: React.FC = () => {
         }
     };
 
+    const handleExportAllCompletedAuditsExcel = () => {
+        if (!dashboardCompletedAuditSessions || dashboardCompletedAuditSessions.length === 0) {
+            alert("Nenhum dado de auditoria concluída disponível no momento.");
+            return;
+        }
+
+        try {
+            const getScopeCategoriesLocal = (groupsList: any[], groupId?: string, deptId?: string, catId?: string) => {
+                const g = groupsList.find(gr => String(gr.id) === String(groupId));
+                if (!g) return [];
+                if (catId) {
+                    const targetDept = deptId
+                        ? g.departments?.find((d: any) => String(d.id) === String(deptId))
+                        : g.departments?.find((d: any) => d.categories?.some((c: any) => String(c.id) === String(catId)));
+                    const cat = targetDept?.categories?.find((c: any) => String(c.id) === String(catId));
+                    return targetDept && cat ? [cat] : [];
+                }
+                if (deptId) {
+                    const dept = g.departments?.find((d: any) => String(d.id) === String(deptId));
+                    if (!dept) return [];
+                    return dept.categories || [];
+                }
+                return g.departments?.flatMap((d: any) => d.categories || []) || [];
+            };
+
+            const latestByBranch = new Map<string, SupabaseService.DbAuditSession>();
+            dashboardCompletedAuditSessions.forEach(session => {
+                if (completedAuditNumberFilter !== 'all' && String(session.audit_number || 0) !== completedAuditNumberFilter) {
+                    return;
+                }
+                const branchLabel = normalizeBranchLabel(session.branch);
+                const prev = latestByBranch.get(branchLabel);
+                if (!prev) {
+                    latestByBranch.set(branchLabel, session);
+                    return;
+                }
+                const prevAudit = Number(prev.audit_number || 0);
+                const curAudit = Number(session.audit_number || 0);
+                if (curAudit > prevAudit) {
+                    latestByBranch.set(branchLabel, session);
+                    return;
+                }
+                if (curAudit < prevAudit) return;
+                const prevTs = Date.parse(String(prev.updated_at || prev.created_at || '')) || 0;
+                const curTs = Date.parse(String(session.updated_at || session.created_at || '')) || 0;
+                if (curTs > prevTs || (curTs === prevTs && Number(session.audit_number || 0) > Number(prev.audit_number || 0))) {
+                    latestByBranch.set(branchLabel, session);
+                }
+            });
+
+            if (latestByBranch.size === 0) {
+                alert("Nenhuma auditoria encontrada com os filtros selecionados.");
+                return;
+            }
+
+            const allProductsData: any[] = [];
+            const branchSummaries: any[] = [];
+            let globalSysQty = 0;
+            let globalCountedQty = 0;
+            let globalSysCost = 0;
+            let globalCountedCost = 0;
+            let globalFaltaQty = 0;
+            let globalFaltaCost = 0;
+            let globalSobraQty = 0;
+            let globalSobraCost = 0;
+            let globalDivergentSkusCount = 0;
+
+            latestByBranch.forEach((session, branchLabel) => {
+                const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+                const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
+                const termDrafts = parsedData?.termDrafts || {};
+
+                const coveredCategories = new Set<string>();
+                const sessionProducts: any[] = [];
+
+                // Helper de deduplicacao
+                const normalizeDigitsLocal = (value: unknown) => String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
+                const normalizeScopeIdLocal = (value: unknown) => String(value ?? '').trim().toLowerCase();
+                const normalizeTextLocal = (value: unknown) =>
+                    String(value ?? '')
+                        .normalize('NFD')
+                        .replace(/[̀-ͯ]/g, '')
+                        .toLowerCase()
+                        .replace(/\s+/g, ' ')
+                        .trim();
+
+                const mergeExcelMetricsPoolsLocal = (poolsList: any[]) => {
+                    const validPools = (poolsList || []).filter(Boolean);
+                    if (validPools.length === 0) return null;
+                    if (validPools.length === 1) return validPools[0];
+
+                    const uniqueItems = new Map<string, any>();
+                    validPools.forEach((pool: any) => {
+                        (Array.isArray(pool?.items) ? pool.items : []).forEach((it: any) => {
+                            const keyObj = {
+                                code: normalizeDigitsLocal(it?.code || it?.reducedCode),
+                                groupId: normalizeScopeIdLocal(it?.groupId),
+                                deptId: normalizeScopeIdLocal(it?.deptId),
+                                catId: normalizeScopeIdLocal(it?.catId),
+                                groupName: normalizeTextLocal(it?.groupName),
+                                deptName: normalizeTextLocal(it?.deptName),
+                                catName: normalizeTextLocal(it?.catName),
+                                sysQty: Number(it?.sysQty || 0),
+                                countedQty: Number(it?.countedQty || 0),
+                                diffQty: Number(it?.diffQty || 0),
+                                sysCost: Number(it?.sysCost || 0),
+                                countedCost: Number(it?.countedCost || 0),
+                                diffCost: Number(it?.diffCost || 0)
+                            };
+                            const key = JSON.stringify(keyObj);
+                            if (!uniqueItems.has(key)) uniqueItems.set(key, it);
+                        });
+                    });
+                    return { items: Array.from(uniqueItems.values()) };
+                };
+
+                const isItemInScope = (item: any, draftKey: string, groupsList: any[]) => {
+                    const normalizeTextLocal = (value: unknown) =>
+                        String(value ?? '')
+                            .normalize('NFD')
+                            .replace(/[̀-ͯ]/g, '')
+                            .toLowerCase()
+                            .replace(/\s+/g, ' ')
+                            .trim();
+
+                    if (draftKey.startsWith('custom|')) {
+                        const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
+                        const scopesPart = typeof match?.[2] === 'string' ? match[2] : (match?.[1] || '');
+                        const allowedCatIds = new Set<string>();
+                        scopesPart.split(',').filter(Boolean).forEach(scopeKey => {
+                            const [g, d, c] = scopeKey.split('|');
+                            const expanded = getScopeCategoriesLocal(groupsList, g, d, c);
+                            expanded.forEach(cat => allowedCatIds.add(cat.id));
+                        });
+                        return item.catId ? allowedCatIds.has(item.catId) : false;
+                    }
+
+                    const [type, groupId, deptId, catId] = draftKey.split('|');
+                    if (!type) return true;
+
+                    const scopeCategories = getScopeCategoriesLocal(groupsList, groupId || undefined, deptId || undefined, catId || undefined);
+                    const allowedCatIds = new Set(
+                        scopeCategories.map(cat => cat.id)
+                    );
+
+                    if (item.catId && allowedCatIds.has(item.catId)) return true;
+
+                    return scopeCategories.some(cat => 
+                        normalizeTextLocal(item.catName) === normalizeTextLocal(cat.name || '')
+                    );
+                };
+
+                const pools: any[] = [];
+                Object.entries(termDrafts || {}).forEach(([draftKey, draftValue]: [string, any]) => {
+                    if (draftValue?.excelMetrics && !draftValue?.excelMetricsRemovedAt) {
+                        const cleanItems = (draftValue.excelMetrics.items || []).filter((item: any) => {
+                            return isItemInScope(item, draftKey, groups);
+                        });
+                        pools.push({ ...draftValue.excelMetrics, items: cleanItems });
+                        
+                        // Marcar categorias cobertas
+                        if (draftKey.startsWith('custom|')) {
+                            const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
+                            const scopesPart = typeof match?.[2] === 'string' ? match[2] : (match?.[1] || '');
+                            scopesPart.split(',').filter(Boolean).forEach(scopeKey => {
+                                const [g, d, c] = scopeKey.split('|');
+                                const expanded = getScopeCategoriesLocal(groups, g, d, c);
+                                expanded.forEach(cat => coveredCategories.add(cat.id));
+                            });
+                        } else {
+                            const [type, g, d, c] = draftKey.split('|');
+                            if (type && type !== 'custom') {
+                                const expanded = getScopeCategoriesLocal(groups, g || undefined, d || undefined, c || undefined);
+                                expanded.forEach(cat => coveredCategories.add(cat.id));
+                            }
+                        }
+                    }
+                });
+
+const merged = mergeExcelMetricsPoolsLocal(pools);
+                const uniqueExcelItems = merged?.items || [];
+
+                const metadataKeywords = [
+                    'filial:', 'grupo de produtos:', 'departamento:', 'categoria:',
+                    'tipo de produto:', 'grupo de preço:', 'início contagem:',
+                    'conferência de estoque', 'código', 'página 1 de', 'produto:'
+                ];
+
+                const isMetadataRow = (item: any) => {
+                    const codigo = String(item.code || '').trim().toLowerCase();
+                    const descricao = String(item.description || '').trim().toLowerCase();
+
+                    if (metadataKeywords.some(keyword => codigo.startsWith(keyword) || descricao.startsWith(keyword))) {
+                        return true;
+                    }
+                    if ((!codigo && !descricao) || codigo === '-' || descricao === '-' || (codigo === '' && descricao === '-')) {
+                        return true;
+                    }
+                    return false;
+                };
+
+                const cleanExcelItems = uniqueExcelItems.filter((item: any) => !isMetadataRow(item));
+
+                cleanExcelItems.forEach((item: any) => {
+                    const sysQty = Number(item.sysQty || 0);
+                    const countedQty = Number(item.countedQty || 0);
+                    const diffQty = Number(item.diffQty || 0);
+                    const cost = Number(item.cost || 0);
+                    const sysCost = Number(item.sysCost || 0);
+                    const countedCost = Number(item.countedCost || 0);
+                    const diffCost = Number(item.diffCost || 0);
+
+                    let faltaQty = 0;
+                    let faltaCost = 0;
+                    let sobraQty = 0;
+                    let sobraCost = 0;
+
+                    if (diffQty < 0) {
+                        faltaQty = Math.abs(diffQty);
+                        faltaCost = Math.abs(diffCost);
+                    } else if (diffQty > 0) {
+                        sobraQty = diffQty;
+                        sobraCost = diffCost;
+                    }
+
+                    sessionProducts.push({
+                        branch: branchLabel,
+                        auditNumber: session.audit_number || 0,
+                        code: item.code || '',
+                        reducedCode: item.reducedCode || '',
+                        name: item.description || item.name || '',
+                        groupName: item.groupName || 'DIVERSOS (SEM GRUPO)',
+                        deptName: item.deptName || 'DIVERSOS (SEM DEPARTAMENTO)',
+                        catName: item.catName || 'DIVERSOS (SEM CATEGORIA)',
+                        cost,
+                        sysQty,
+                        countedQty,
+                        diffQty,
+                        sysCost,
+                        countedCost,
+                        diffCost,
+                        faltaQty,
+                        faltaCost,
+                        sobraQty,
+                        sobraCost,
+                        status: diffQty === 0 ? 'CORRETO' : (diffQty < 0 ? 'FALTA' : 'SOBRA')
+                    });
+                });
+
+                // 2. Processar categorias do banco que NÃO foram cobertas por planilhas Excel dos termos
+                groups.forEach((g: any) => {
+                    g.departments?.forEach((d: any) => {
+                        d.categories?.forEach((c: any) => {
+                            if (!coveredCategories.has(c.id)) {
+                                const isCatDone = c.status === 'concluido' || c.status === 'completed';
+                                c.products?.forEach((p: any) => {
+                                    const sysQty = Number(p.quantity || 0);
+                                    const countedQty = isCatDone ? sysQty : 0;
+                                    const cost = Number(p.cost || 0);
+                                    const sysCost = sysQty * cost;
+                                    const countedCost = countedQty * cost;
+                                    const diffQty = countedQty - sysQty;
+                                    const diffCost = countedCost - sysCost;
+
+                                    let faltaQty = 0;
+                                    let faltaCost = 0;
+                                    let sobraQty = 0;
+                                    let sobraCost = 0;
+
+                                    if (diffQty < 0) {
+                                        faltaQty = Math.abs(diffQty);
+                                        faltaCost = Math.abs(diffCost);
+                                    } else if (diffQty > 0) {
+                                        sobraQty = diffQty;
+                                        sobraCost = diffCost;
+                                    }
+
+                                    sessionProducts.push({
+                                        branch: branchLabel,
+                                        auditNumber: session.audit_number || 0,
+                                        code: p.code || '',
+                                        reducedCode: p.reducedCode || p.code || '',
+                                        name: p.name || '',
+                                        groupName: g.name || 'DIVERSOS (SEM GRUPO)',
+                                        deptName: d.name || 'DIVERSOS (SEM DEPARTAMENTO)',
+                                        catName: c.name || 'DIVERSOS (SEM CATEGORIA)',
+                                        cost,
+                                        sysQty,
+                                        countedQty,
+                                        diffQty,
+                                        sysCost,
+                                        countedCost,
+                                        diffCost,
+                                        faltaQty,
+                                        faltaCost,
+                                        sobraQty,
+                                        sobraCost,
+                                        status: diffQty === 0 ? 'CORRETO' : (diffQty < 0 ? 'FALTA' : 'SOBRA')
+                                    });
+                                });
+                            }
+                        });
+                    });
+                });
+
+                // Acumuladores locais da filial baseados na lista real gerada
+                let branchSysQty = 0;
+                let branchCountedQty = 0;
+                let branchSysCost = 0;
+                let branchCountedCost = 0;
+                let branchFaltaQty = 0;
+                let branchFaltaCost = 0;
+                let branchSobraQty = 0;
+                let branchSobraCost = 0;
+                let branchDivergentSkus = 0;
+
+                sessionProducts.forEach(p => {
+                    branchSysQty += p.sysQty;
+                    branchCountedQty += p.countedQty;
+                    branchSysCost += p.sysCost;
+                    branchCountedCost += p.countedCost;
+                    branchFaltaQty += p.faltaQty;
+                    branchFaltaCost += p.faltaCost;
+                    branchSobraQty += p.sobraQty;
+                    branchSobraCost += p.sobraCost;
+                    if (p.diffQty !== 0) {
+                        branchDivergentSkus++;
+                        globalDivergentSkusCount++;
+                    }
+                    allProductsData.push(p);
+                });
+
+                globalSysQty += branchSysQty;
+                globalCountedQty += branchCountedQty;
+                globalSysCost += branchSysCost;
+                globalCountedCost += branchCountedCost;
+                globalFaltaQty += branchFaltaQty;
+                globalFaltaCost += branchFaltaCost;
+                globalSobraQty += branchSobraQty;
+                globalSobraCost += branchSobraCost;
+
+                branchSummaries.push({
+                    'Filial / Loja': branchLabel,
+                    'Nº Auditoria': session.audit_number || 0,
+                    'Total SKUs': sessionProducts.length,
+                    'SKUs c/ Divergência': branchDivergentSkus,
+                    'Qtd Sistema': branchSysQty,
+                    'Qtd Conferida': branchCountedQty,
+                    'Divergência Qtd': branchCountedQty - branchSysQty,
+                    'Custo Sistema (R$)': branchSysCost,
+                    'Custo Conferido (R$)': branchCountedCost,
+                    'Divergência Financeira (R$)': branchCountedCost - branchSysCost,
+                    'Qtd Faltas (Perdas)': branchFaltaQty,
+                    'Valor Faltas (R$)': branchFaltaCost,
+                    'Qtd Sobras': branchSobraQty,
+                    'Valor Sobras (R$)': branchSobraCost
+                });
+            });
+
+            if (allProductsData.length === 0) {
+                alert("Nenhum item encontrado nos inventários concluídos.");
+                return;
+            }
+
+            // 3. Agrupamentos
+            const groupMap: Record<string, any> = {};
+            const deptMap: Record<string, any> = {};
+            const catMap: Record<string, any> = {};
+
+            allProductsData.forEach(p => {
+                // Grupo
+                if (!groupMap[p.groupName]) {
+                    groupMap[p.groupName] = { Grupo: p.groupName, 'Qtd Sistema': 0, 'Qtd Conferida': 0, 'Divergência Qtd': 0, 'Custo Sistema (R$)': 0, 'Custo Conferido (R$)': 0, 'Divergência R$': 0, 'Qtd Faltas (Perdas)': 0, 'Valor Faltas (R$)': 0, 'Qtd Sobras': 0, 'Valor Sobras (R$)': 0 };
+                }
+                const g = groupMap[p.groupName];
+                g['Qtd Sistema'] += p.sysQty;
+                g['Qtd Conferida'] += p.countedQty;
+                g['Divergência Qtd'] += p.diffQty;
+                g['Custo Sistema (R$)'] += p.sysCost;
+                g['Custo Conferido (R$)'] += p.countedCost;
+                g['Divergência R$'] += p.diffCost;
+                g['Qtd Faltas (Perdas)'] += p.faltaQty;
+                g['Valor Faltas (R$)'] += p.faltaCost;
+                g['Qtd Sobras'] += p.sobraQty;
+                g['Valor Sobras (R$)'] += p.sobraCost;
+
+                // Departamento
+                const deptKey = `${p.groupName} | ${p.deptName}`;
+                if (!deptMap[deptKey]) {
+                    deptMap[deptKey] = { Grupo: p.groupName, Departamento: p.deptName, 'Qtd Sistema': 0, 'Qtd Conferida': 0, 'Divergência Qtd': 0, 'Custo Sistema (R$)': 0, 'Custo Conferido (R$)': 0, 'Divergência R$': 0, 'Qtd Faltas (Perdas)': 0, 'Valor Faltas (R$)': 0, 'Qtd Sobras': 0, 'Valor Sobras (R$)': 0 };
+                }
+                const d = deptMap[deptKey];
+                d['Qtd Sistema'] += p.sysQty;
+                d['Qtd Conferida'] += p.countedQty;
+                d['Divergência Qtd'] += p.diffQty;
+                d['Custo Sistema (R$)'] += p.sysCost;
+                d['Custo Conferido (R$)'] += p.countedCost;
+                d['Divergência R$'] += p.diffCost;
+                d['Qtd Faltas (Perdas)'] += p.faltaQty;
+                d['Valor Faltas (R$)'] += p.faltaCost;
+                d['Qtd Sobras'] += p.sobraQty;
+                d['Valor Sobras (R$)'] += p.sobraCost;
+
+                // Categoria
+                const catKey = `${p.groupName} | ${p.deptName} | ${p.catName}`;
+                if (!catMap[catKey]) {
+                    catMap[catKey] = { Grupo: p.groupName, Departamento: p.deptName, Categoria: p.catName, 'Qtd Sistema': 0, 'Qtd Conferida': 0, 'Divergência Qtd': 0, 'Custo Sistema (R$)': 0, 'Custo Conferido (R$)': 0, 'Divergência R$': 0, 'Qtd Faltas (Perdas)': 0, 'Valor Faltas (R$)': 0, 'Qtd Sobras': 0, 'Valor Sobras (R$)': 0 };
+                }
+                const c = catMap[catKey];
+                c['Qtd Sistema'] += p.sysQty;
+                c['Qtd Conferida'] += p.countedQty;
+                c['Divergência Qtd'] += p.diffQty;
+                c['Custo Sistema (R$)'] += p.sysCost;
+                c['Custo Conferido (R$)'] += p.countedCost;
+                c['Divergência R$'] += p.diffCost;
+                c['Qtd Faltas (Perdas)'] += p.faltaQty;
+                c['Valor Faltas (R$)'] += p.faltaCost;
+                c['Qtd Sobras'] += p.sobraQty;
+                c['Valor Sobras (R$)'] += p.sobraCost;
+            });
+
+            // 4. Criar workbook
+            const wb = XLSX.utils.book_new();
+
+            // Aba 1: Resumo Consolidado Geral
+            const overallDiffCost = globalCountedCost - globalSysCost;
+            const deviationPercent = globalSysCost > 0 ? (overallDiffCost / globalSysCost) * 100 : 0;
+            
+            const summaryTitleData = [
+                ['MÉTRICA REDE / CONSOLIDADA', 'VALOR'],
+                ['TOTAL DE FILIAIS ANALISADAS', latestByBranch.size],
+                ['NÚMERO DA AUDITORIA FILTRADO', completedAuditNumberFilter === 'all' ? 'TODAS AS AUDITORIAS' : `AUDITORIA ${completedAuditNumberFilter}`],
+                ['DATA DE EXPORTAÇÃO', new Date().toLocaleString('pt-BR')],
+                ['TOTAL DE SKUS CONSOLIDADO', allProductsData.length],
+                ['TOTAL DE SKUS COM DIVERGÊNCIA', globalDivergentSkusCount],
+                ['QUANTIDADE TOTAL SISTEMA', globalSysQty],
+                ['QUANTIDADE TOTAL CONFERIDA', globalCountedQty],
+                ['DIVERGÊNCIA LÍQUIDA QTD', globalCountedQty - globalSysQty],
+                ['VALOR TOTAL SISTEMA (CUSTO)', globalSysCost],
+                ['VALOR TOTAL CONFERIDO (CUSTO)', globalCountedCost],
+                ['DIVERGÊNCIA LÍQUIDA FINANCEIRA (R$)', overallDiffCost],
+                ['REPRESENTAÇÃO DIVERGÊNCIA CONSOLIDADA (%)', deviationPercent],
+                ['FALTAS / PERDAS REDE - QTD UNIDADES', globalFaltaQty],
+                ['FALTAS / PERDAS REDE - VALOR (R$)', globalFaltaCost],
+                ['SOBRAS REDE - QTD UNIDADES', globalSobraQty],
+                ['SOBRAS REDE - VALOR (R$)', globalSobraCost],
+                [],
+                ['RESUMO FINANCEIRO POR FILIAL / LOJA']
+            ];
+            
+            const wsSummary = XLSX.utils.aoa_to_sheet(summaryTitleData);
+            XLSX.utils.sheet_add_json(wsSummary, branchSummaries, { origin: 'A20' });
+            XLSX.utils.book_append_sheet(wb, wsSummary, "Resumo Consolidado");
+
+            // Aba 2: Por Grupo
+            const wsGroup = XLSX.utils.json_to_sheet(Object.values(groupMap));
+            XLSX.utils.book_append_sheet(wb, wsGroup, "Consolidado por Grupo");
+
+            // Aba 3: Por Departamento
+            const wsDept = XLSX.utils.json_to_sheet(Object.values(deptMap));
+            XLSX.utils.book_append_sheet(wb, wsDept, "Consolidado por Depto");
+
+            // Aba 4: Por Categoria
+            const wsCat = XLSX.utils.json_to_sheet(Object.values(catMap));
+            XLSX.utils.book_append_sheet(wb, wsCat, "Consolidado por Categoria");
+
+            // Aba 5: Itens Detalhado
+            const detailedItems = allProductsData.map(p => ({
+                'Filial / Loja': p.branch,
+                'Nº Auditoria': p.auditNumber,
+                'Código de Barras': p.code,
+                'Código Reduzido': p.reducedCode,
+                'Descrição do Produto': p.name,
+                'Grupo': p.groupName,
+                'Departamento': p.deptName,
+                'Categoria': p.catName,
+                'Custo Unitário (R$)': p.cost,
+                'Qtd Sistema': p.sysQty,
+                'Qtd Físico': p.countedQty,
+                'Divergência Qtd': p.diffQty,
+                'Total Sistema (R$)': p.sysCost,
+                'Total Físico (R$)': p.countedCost,
+                'Divergência Financeira (R$)': p.diffCost,
+                'Qtd Faltas (Perdas)': p.faltaQty,
+                'Valor Faltas (R$)': p.faltaCost,
+                'Qtd Sobras': p.sobraQty,
+                'Valor Sobras (R$)': p.sobraCost,
+                'Status': p.status
+            }));
+            const wsDetailed = XLSX.utils.json_to_sheet(detailedItems);
+            XLSX.utils.book_append_sheet(wb, wsDetailed, "Itens Detalhado (Multiloja)");
+
+            const filterName = completedAuditNumberFilter === 'all' ? 'TODAS' : `N${completedAuditNumberFilter}`;
+            const fileName = `Auditoria_Consolidada_Rede_${filterName}_Detalhado.xlsx`;
+            XLSX.writeFile(wb, fileName);
+
+            SupabaseService.insertAppEventLog({
+                company_id: currentUser?.company_id || null,
+                branch: null,
+                area: null,
+                user_email: currentUser?.email || 'sistema',
+                user_name: currentUser?.name || null,
+                app: 'auditoria',
+                event_type: 'audit_report_printed',
+                entity_type: 'audit_report',
+                entity_id: fileName,
+                status: 'success',
+                success: true,
+                source: 'web'
+            }).catch(() => { });
+
+        } catch (error) {
+            console.error("Erro ao exportar planilha Excel consolidada:", error);
+            alert("Erro ao gerar o relatório detalhado consolidado em Excel.");
+        }
+    };
     const handleViewChange = (view: typeof currentView) => {
         if (view === 'pre' && !PRE_VENCIDOS_MODULE_ENABLED) {
             alert('Módulo Pré-Vencidos está desativado por tempo indeterminado.');
@@ -5778,13 +6296,13 @@ const App: React.FC = () => {
                 countedSkus,
                 pendingSkus,
                 totalUnits,
-                countedUnits,
+                countedUnits: countedUnits + diffQty,
                 pendingUnits,
                 totalCost,
                 pendingCost,
                 diffQty,
                 diffCost,
-                countedCost,
+                countedCost: countedCost + diffCost,
                 divergencePct,
                 termsWithExcel
             });
@@ -6356,13 +6874,13 @@ const App: React.FC = () => {
                 countedSkus,
                 pendingSkus,
                 totalUnits,
-                countedUnits,
+                countedUnits: countedUnits + diffQty,
                 pendingUnits,
                 totalCost,
                 pendingCost,
                 diffQty,
                 diffCost,
-                countedCost,
+                countedCost: countedCost + diffCost,
                 divergencePct,
                 termsWithExcel
             });
@@ -10508,6 +11026,15 @@ const App: React.FC = () => {
                                             <h3 className="text-xl font-black text-gray-900">Resumo de Auditorias Concluídas</h3>
                                         </div>
                                         <div className="flex items-center justify-end gap-3">
+                                            <button
+                                                type="button"
+                                                onClick={handleExportAllCompletedAuditsExcel}
+                                                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all shadow-md active:scale-95 whitespace-nowrap"
+                                                title="Exportar planilha consolidada de perdas/sobras de todas as filiais concluídas"
+                                            >
+                                                <FileSpreadsheet size={14} />
+                                                Excel Detalhado Rede
+                                            </button>
                                             <select value={completedAuditNumberFilter} onChange={e => setCompletedAuditNumberFilter(e.target.value)} className="px-3 py-2 rounded-xl border border-gray-200 text-xs font-bold text-gray-700 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
                                                 <option value="all">Todas as auditorias</option>
                                                 {Array.from(new Set(dashboardCompletedAuditSessions.map(s => String(s.audit_number || 0)))).sort((a,b)=>Number(b)-Number(a)).map(num => (<option key={num} value={num}>Auditoria {num}</option>))}
