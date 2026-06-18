@@ -6798,24 +6798,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
 
         try {
-            const getScopeCategoriesLocal = (groupId?: string, deptId?: string, catId?: string) => {
-                const g = data.groups.find(gr => String(gr.id) === String(groupId));
-                if (!g) return [];
-                if (catId) {
-                    const targetDept = deptId
-                        ? g.departments?.find((d: any) => String(d.id) === String(deptId))
-                        : g.departments?.find((d: any) => d.categories?.some((c: any) => String(c.id) === String(catId)));
-                    const cat = targetDept?.categories?.find((c: any) => String(c.id) === String(catId));
-                    return targetDept && cat ? [cat] : [];
-                }
-                if (deptId) {
-                    const dept = g.departments?.find((d: any) => String(d.id) === String(deptId));
-                    if (!dept) return [];
-                    return dept.categories || [];
-                }
-                return g.departments?.flatMap((d: any) => d.categories || []) || [];
-            };
-
             const allProductsData: any[] = [];
             let totalSysQty = 0;
             let totalCountedQty = 0;
@@ -6826,8 +6808,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             let totalSobraQty = 0;
             let totalSobraCost = 0;
             let divergentSkusCount = 0;
-
-            const coveredCategories = new Set<string>();
 
             // Helper de deduplicacao
             const normalizeDigitsLocal = (value: unknown) => String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
@@ -6870,70 +6850,26 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return { items: Array.from(uniqueItems.values()) };
             };
 
-            const isItemInScope = (item: any, draftKey: string, groupsList: any[]) => {
-                const normalizeTextLocal = (value: unknown) =>
-                    String(value ?? '')
-                        .normalize('NFD')
-                        .replace(/[̀-ͯ]/g, '')
-                        .toLowerCase()
-                        .replace(/\s+/g, ' ')
-                        .trim();
-
-                if (draftKey.startsWith('custom|')) {
-                    const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
-                    const scopesPart = typeof match?.[2] === 'string' ? match[2] : (match?.[1] || '');
-                    const allowedCatIds = new Set<string>();
-                    scopesPart.split(',').filter(Boolean).forEach(scopeKey => {
-                        const [g, d, c] = scopeKey.split('|');
-                        const expanded = getScopeCategoriesLocal(g, d, c);
-                        expanded.forEach(cat => allowedCatIds.add(cat.id));
-                    });
-                    return item.catId ? allowedCatIds.has(item.catId) : false;
-                }
-
-                const [type, groupId, deptId, catId] = draftKey.split('|');
-                if (!type) return true;
-
-                const scopeCategories = getScopeCategoriesLocal(groupId || undefined, deptId || undefined, catId || undefined);
-                const allowedCatIds = new Set(
-                    scopeCategories.map(cat => cat.id)
-                );
-
-                if (item.catId && allowedCatIds.has(item.catId)) return true;
-
-                return scopeCategories.some(cat => 
-                    normalizeTextLocal(item.catName) === normalizeTextLocal(cat.name || '')
-                );
-            };
-
-            const pools: any[] = [];
+            const metricsByKey = new Map<string, any>();
+            Object.entries((((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>)).forEach(([draftKey, metrics]) => {
+                if (metrics) metricsByKey.set(draftKey, metrics);
+            });
             Object.entries(termDrafts || {}).forEach(([draftKey, draftValue]) => {
-                if (draftValue?.excelMetrics && !draftValue?.excelMetricsRemovedAt) {
-                    const cleanItems = (draftValue.excelMetrics.items || []).filter((item: any) => {
-                        return isItemInScope(item, draftKey, data.groups);
-                    });
-                    pools.push({ ...draftValue.excelMetrics, items: cleanItems });
-                    
-                    // Marcar categorias cobertas
-                    if (draftKey.startsWith('custom|')) {
-                        const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
-                        const scopesPart = typeof match?.[2] === 'string' ? match[2] : (match?.[1] || '');
-                        scopesPart.split(',').filter(Boolean).forEach(scopeKey => {
-                            const [g, d, c] = scopeKey.split('|');
-                            const expanded = getScopeCategoriesLocal(g, d, c);
-                            expanded.forEach(cat => coveredCategories.add(cat.id));
-                        });
-                    } else {
-                        const [type, g, d, c] = draftKey.split('|');
-                        if (type && type !== 'custom') {
-                            const expanded = getScopeCategoriesLocal(g || undefined, d || undefined, c || undefined);
-                            expanded.forEach(cat => coveredCategories.add(cat.id));
-                        }
-                    }
+                if (draftValue?.excelMetricsRemovedAt && !draftValue?.excelMetrics) {
+                    metricsByKey.delete(draftKey);
+                    return;
                 }
+                if (draftValue?.excelMetrics) metricsByKey.set(draftKey, draftValue.excelMetrics);
             });
 
-const merged = mergeExcelMetricsPoolsLocal(pools);
+            const metricEntries = Array.from(metricsByKey.entries()).filter(([, metrics]) => !!metrics);
+            const globalUnifiedEntries = metricEntries.filter(([draftKey]) =>
+                draftKey.startsWith('custom|') && draftKey.includes(GLOBAL_UNIFIED_TERM_BATCH_ID)
+            );
+            const pools = (globalUnifiedEntries.length > 0 ? globalUnifiedEntries : metricEntries)
+                .map(([, metrics]) => metrics);
+
+            const merged = mergeExcelMetricsPoolsLocal(pools);
             const uniqueExcelItems = merged?.items || [];
 
             const metadataKeywords = [
@@ -6997,61 +6933,9 @@ const merged = mergeExcelMetricsPoolsLocal(pools);
                     faltaCost,
                     sobraQty,
                     sobraCost,
-                    status: diffQty === 0 ? 'CORRETO' : (diffQty < 0 ? 'FALTA' : 'SOBRA')
-                });
-            });
-
-            // 2. Processar categorias do banco que NÃO foram cobertas por planilhas Excel dos termos
-            data.groups.forEach(g => {
-                g.departments?.forEach(d => {
-                    d.categories?.forEach(c => {
-                        if (!coveredCategories.has(c.id)) {
-                            const isCatDone = isDoneStatus(c.status);
-                            c.products?.forEach(p => {
-                                const sysQty = Number(p.quantity || 0);
-                                const countedQty = isCatDone ? sysQty : 0;
-                                const cost = Number(p.cost || 0);
-                                const sysCost = sysQty * cost;
-                                const countedCost = countedQty * cost;
-                                const diffQty = countedQty - sysQty;
-                                const diffCost = countedCost - sysCost;
-
-                                let faltaQty = 0;
-                                let faltaCost = 0;
-                                let sobraQty = 0;
-                                let sobraCost = 0;
-
-                                if (diffQty < 0) {
-                                    faltaQty = Math.abs(diffQty);
-                                    faltaCost = Math.abs(diffCost);
-                                } else if (diffQty > 0) {
-                                    sobraQty = diffQty;
-                                    sobraCost = diffCost;
-                                }
-
-                                allProductsData.push({
-                                    code: p.code || '',
-                                    reducedCode: p.reducedCode || p.code || '',
-                                    name: p.name || '',
-                                    groupName: g.name || 'DIVERSOS (SEM GRUPO)',
-                                    deptName: d.name || 'DIVERSOS (SEM DEPARTAMENTO)',
-                                    catName: c.name || 'DIVERSOS (SEM CATEGORIA)',
-                                    cost,
-                                    sysQty,
-                                    countedQty,
-                                    diffQty,
-                                    sysCost,
-                                    countedCost,
-                                    diffCost,
-                                    faltaQty,
-                                    faltaCost,
-                                    sobraQty,
-                                    sobraCost,
-                                    status: diffQty === 0 ? 'CORRETO' : (diffQty < 0 ? 'FALTA' : 'SOBRA')
-                                });
-                            });
-                        }
-                    });
+                    status: Math.abs(diffQty) > 0.01 || Math.abs(diffCost) > 0.01
+                        ? (diffQty < 0 ? 'FALTA' : diffQty > 0 ? 'SOBRA' : 'DIVERGÊNCIA FINANCEIRA')
+                        : 'CORRETO'
                 });
             });
 
@@ -7065,7 +6949,7 @@ const merged = mergeExcelMetricsPoolsLocal(pools);
                 totalFaltaCost += p.faltaCost;
                 totalSobraQty += p.sobraQty;
                 totalSobraCost += p.sobraCost;
-                if (p.diffQty !== 0) {
+                if (Math.abs(Number(p.diffQty || 0)) > 0.01 || Math.abs(Number(p.diffCost || 0)) > 0.01) {
                     divergentSkusCount++;
                 }
             });
