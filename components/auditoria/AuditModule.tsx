@@ -1078,12 +1078,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const localData = await AuditStorage.loadLocalAuditSession();
             const hasPendingSync = !!localData?.pendingSync;
 
-            // Se temos dados pendentes localmente e estamos online, tentamos sincronizar antes de carregar
+            // Se temos dados pendentes localmente e estamos online, tentamos sincronizar antes de carregar.
+            // Nunca cria um novo inventário nesse fluxo: criação deve passar pelo botão de iniciar/carregar.
             if (hasPendingSync && typeof navigator !== 'undefined' && navigator.onLine && localData && !silent) {
                 try {
                     setIsSyncing(true);
+                    const existingTarget = await fetchAuditSession(selectedFilial, nextAuditNumber);
+                    if (!dbSessionId && (!existingTarget || existingTarget.status === 'completed')) {
+                        console.warn(
+                            `Sincronização local pendente ignorada: não há inventário aberto Nº ${nextAuditNumber} na filial ${selectedFilial}.`
+                        );
+                        return;
+                    }
                     const synced = await upsertAuditSession({
-                        id: dbSessionId,
+                        id: dbSessionId || existingTarget?.id,
                         branch: selectedFilial,
                         audit_number: nextAuditNumber,
                         status: 'open',
@@ -1501,8 +1509,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return;
             }
 
+            const existingTarget = await fetchAuditSession(branch, auditNum);
+            if (!dbSessionId && (!existingTarget || existingTarget.status === 'completed')) {
+                alert(
+                    `O rascunho local não foi enviado porque não existe inventário aberto Nº ${auditNum} na filial ${branch}.\n\n` +
+                    `Isso evita criar uma cópia indevida de inventário concluído. Inicie ou reabra o inventário correto antes de sincronizar.`
+                );
+                return;
+            }
+
             const synced = await upsertAuditSession({
-                id: dbSessionId,
+                id: dbSessionId || existingTarget?.id,
                 branch: branch,
                 audit_number: auditNum,
                 status: 'open',
@@ -1712,7 +1729,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const persistAuditSession = useCallback(async (
         session: DbAuditSession,
-        options?: { allowProgressRegression?: boolean }
+        options?: { allowProgressRegression?: boolean; allowCreate?: boolean; allowReopen?: boolean }
     ): Promise<DbAuditSession | null> => {
         const branch = String(session.branch || '');
         if (!branch || !session.audit_number) return null;
@@ -1736,9 +1753,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const baseUpdatedAt = session.updated_at || lastAuditUpdateRef.current || null;
             const isSameAudit = !!latestMeta && latestMeta.audit_number === session.audit_number;
             const allowProgressRegression = !!options?.allowProgressRegression;
+            const allowCreate = !!options?.allowCreate;
+            const allowReopen = !!options?.allowReopen;
 
             const freshLatest = isSameAudit ? await fetchLatestAudit(branch) : null;
             const latestSession = freshLatest || (isSameAudit ? null : await fetchLatestAudit(branch));
+            const exactSession = await fetchAuditSession(branch, session.audit_number);
+
+            if (!session.id && exactSession?.id) {
+                session = { ...session, id: exactSession.id };
+            }
+
+            if (!allowCreate && !session.id && session.status === 'open') {
+                alert(
+                    `Bloqueamos a criação automática do inventário Nº ${session.audit_number} na filial ${branch}.\n\n` +
+                    `Para criar um inventário novo, use o botão de iniciar/carregar inventário.`
+                );
+                return null;
+            }
+
+            if (session.status === 'open' && exactSession?.status === 'completed' && !allowReopen) {
+                alert(
+                    `Inventário Nº ${session.audit_number} já está concluído.\n\n` +
+                    `Abra em modo consulta ou use a opção Reabrir para alterar esse inventário.`
+                );
+                return null;
+            }
             
             if (
                 latestSession &&
@@ -2122,7 +2162,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 data: target.data,
                 progress: Number(target.progress || 0),
                 user_email: userEmail
-            }, { allowProgressRegression: true });
+            }, { allowProgressRegression: true, allowReopen: true });
 
             if (!reopened) {
                 alert("Não foi possível reabrir o inventário agora.");
@@ -3469,7 +3509,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 data: persistedData,
                 progress: progress,
                 user_email: userEmail
-            }, { allowProgressRegression: !!shouldReclassifyOpen });
+            }, { allowProgressRegression: !!shouldReclassifyOpen, allowCreate: !shouldReclassifyOpen });
             if (!savedSession) {
                 throw new Error("Falha ao salvar auditoria inicial no Banco de Dados.");
             }
@@ -3561,7 +3601,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 data: { ...nextData, termDrafts: composeTermDraftsForPersist((((nextData as any)?.termDrafts || {}) as Record<string, TermForm>), (((data as any)?.termDrafts || {}) as Record<string, TermForm>), termDrafts) } as any,
                 progress: progress,
                 user_email: userEmail
-            });
+            }, { allowCreate: !dbSessionId });
             if (!savedSession) {
                 throw new Error("Falha ao salvar dados iniciais do Trier no Supabase.");
             }
