@@ -1,9 +1,9 @@
 import pathlib
 import re
 
-content = pathlib.Path('components/auditoria/AuditModule.tsx').read_text(encoding='utf-8')
-print("Length:", len(content))
+app_content = pathlib.Path('components/auditoria/AuditModule.tsx').read_text(encoding='utf-8')
 
-for m in re.finditer(r'Conferido|countedCost', content, re.IGNORECASE):
-    print(content[m.start()-50:m.end()+100])
-    print("-" * 50)
+# Let's find AuditModule component definition
+idx = app_content.find('export default function AuditModule')
+if idx != -1:
+    print(app_content[idx:idx+2000])

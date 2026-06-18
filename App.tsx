@@ -6181,9 +6181,11 @@ const App: React.FC = () => {
             const pendingSkus = Math.max(0, totalSkus - countedSkus);
             const pendingUnits = Math.max(0, totalUnits - countedUnits);
             const pendingCost = Math.max(0, totalCost - countedCost);
-            const progressPct = totalUnits > 0
-                ? (countedUnits / totalUnits) * 100
-                : Number(session.progress || 0);
+            // O progresso deve ser baseado em SKUs (como no AuditModule).
+            // Para as auditorias "CONCLUIDA", o progresso real quando foram concluídas foi 100%.
+            const isCompleted = session.status === 'CONCLUIDA' || session.status === 'FECHADA';
+            const calculatedProgress = totalSkus > 0 ? (countedSkus / totalSkus) * 100 : Number(session.progress || 0);
+            const progressPct = isCompleted ? 100 : calculatedProgress;
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
 
             branches.push({
@@ -6291,8 +6293,9 @@ const App: React.FC = () => {
             diffCost: 0
         });
 
-        const accumulatedPct = summary.totalUnits > 0
-            ? (summary.countedUnits / summary.totalUnits) * 100
+        // Usa SKUs para consistência com o restante do sistema
+        const accumulatedPct = summary.totalSkus > 0
+            ? (summary.countedSkus / summary.totalSkus) * 100
             : 0;
         const uniqueTotalSkus = uniqueSkuSet.size;
         const uniqueCountedSkus = uniqueSkuDoneSet.size;
@@ -6766,9 +6769,11 @@ const App: React.FC = () => {
             const pendingSkus = Math.max(0, totalSkus - countedSkus);
             const pendingUnits = Math.max(0, totalUnits - countedUnits);
             const pendingCost = Math.max(0, totalCost - countedCost);
-            const progressPct = totalUnits > 0
-                ? (countedUnits / totalUnits) * 100
-                : Number(session.progress || 0);
+            // O progresso deve ser baseado em SKUs (como no AuditModule).
+            // Para as auditorias "CONCLUIDA", o progresso real quando foram concluídas foi 100%.
+            const isCompleted = session.status === 'CONCLUIDA' || session.status === 'FECHADA';
+            const calculatedProgress = totalSkus > 0 ? (countedSkus / totalSkus) * 100 : Number(session.progress || 0);
+            const progressPct = isCompleted ? 100 : calculatedProgress;
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
 
             branches.push({
@@ -6876,9 +6881,8 @@ const App: React.FC = () => {
             diffCost: 0
         });
 
-        const accumulatedPct = summary.totalUnits > 0
-            ? (summary.countedUnits / summary.totalUnits) * 100
-            : 0;
+        // Usa SKUs para consistência, mas para concluídas já força 100%
+        const accumulatedPct = 100;
         const uniqueTotalSkus = uniqueSkuSet.size;
         const uniqueCountedSkus = uniqueSkuDoneSet.size;
         const uniquePendingSkus = Math.max(0, uniqueTotalSkus - uniqueCountedSkus);
@@ -10852,7 +10856,7 @@ const App: React.FC = () => {
                                                     <p className="text-sm font-semibold text-gray-400">Sem auditorias abertas no momento.</p>
                                                 ) : (
                                                     dashboardAuditOverview.areas.map(area => {
-                                                        const pct = area.totalUnits > 0 ? (area.countedUnits / area.totalUnits) * 100 : 0;
+                                                        const pct = area.totalSkus > 0 ? (area.countedSkus / area.totalSkus) * 100 : 0;
                                                         const areaDivergencePct = area.auditedBaseCost > 0 ? (area.diffCost / area.auditedBaseCost) * 100 : 0;
                                                         return (
                                                             <div key={area.area} className="rounded-xl border border-gray-100 px-3 py-2">
@@ -11026,7 +11030,7 @@ const App: React.FC = () => {
                                                     <p className="text-sm font-semibold text-gray-400">Nenhuma filial com auditoria concluída.</p>
                                                 ) : (
                                                     dashboardCompletedAuditOverview.areas.map(area => {
-                                                        const pct = area.totalUnits > 0 ? (area.countedUnits / area.totalUnits) * 100 : 0;
+                                                        const pct = 100;
                                                         const areaDivergencePct = area.auditedBaseCost > 0 ? (area.diffCost / area.auditedBaseCost) * 100 : 0;
                                                         return (
                                                             <div key={area.area} className="rounded-xl border border-gray-100 px-3 py-2">
