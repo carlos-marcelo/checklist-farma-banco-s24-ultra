@@ -1088,21 +1088,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         console.warn(
                             `Sincronização local pendente ignorada: não há inventário aberto Nº ${nextAuditNumber} na filial ${selectedFilial}.`
                         );
-                        return;
-                    }
-                    const synced = await upsertAuditSession({
-                        id: dbSessionId || existingTarget?.id,
-                        branch: selectedFilial,
-                        audit_number: nextAuditNumber,
-                        status: 'open',
-                        data: localData,
-                        progress: calculateProgress(localData),
-                        user_email: userEmail,
-                        updated_at: lastAuditUpdateRef.current || undefined
-                    });
-                    if (synced) {
-                        await AuditStorage.saveLocalAuditSession(localData, false);
-                        console.log("Sincronização automática concluída com sucesso.");
+                    } else {
+                        const synced = await upsertAuditSession({
+                            id: dbSessionId || existingTarget?.id,
+                            branch: selectedFilial,
+                            audit_number: nextAuditNumber,
+                            status: 'open',
+                            data: localData,
+                            progress: calculateProgress(localData),
+                            user_email: userEmail,
+                            updated_at: lastAuditUpdateRef.current || undefined
+                        });
+                        if (synced) {
+                            await AuditStorage.saveLocalAuditSession(localData, false);
+                            console.log("Sincronização automática concluída com sucesso.");
+                        }
                     }
                 } catch (e) {
                     console.error("Falha na sincronização automática inicial:", e);
@@ -7056,7 +7056,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             // Aba 1: Resumo Geral
             const overallDiffCost = totalCountedCost - totalSysCost;
-            const deviationPercent = totalSysCost > 0 ? (overallDiffCost / totalSysCost) * 100 : 0;
+            const diffType = overallDiffCost < 0 ? 'Prejuízo (Falta)' : overallDiffCost > 0 ? 'Sobra (Excesso)' : 'Zero';
+            const fmtCurrency = (value: number) => Number(value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+            const fmtInt = (value: number) => Math.round(Number(value || 0)).toLocaleString('pt-BR');
+            const fmtPercent = (value: number | null) => value === null
+                ? 'N/A'
+                : `${Number(value || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
+            const signedInt = (value: number) => `${Number(value || 0) > 0 ? '+' : ''}${fmtInt(Number(value || 0))}`;
+            const mixPending = Math.max(0, Number(branchMetrics.skus || 0) - Number(branchMetrics.doneSkus || 0));
+            const termRepresentativity = getFinancialRepresentativity(Number(branchMetrics.doneCost || branchMetrics.cost || 0), overallDiffCost);
             const summaryData = [
                 ['MÉTRICA', 'VALOR'],
                 ['EMPRESA', data.empresa || 'Sem Empresa'],
@@ -7064,21 +7072,39 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 ['NÚMERO DA AUDITORIA', accessedAuditNumber !== null ? String(accessedAuditNumber) : 'N/A'],
                 ['STATUS DA SESSÃO', isReadOnlyCompletedView ? 'CONCLUÍDO (MODO CONSULTA)' : 'ABERTO'],
                 ['DATA DE EXPORTAÇÃO', new Date().toLocaleString('pt-BR')],
-                ['TOTAL SKUS CADASTRADOS', allProductsData.length],
-                ['TOTAL DE SKUS COM DIVERGÊNCIA', divergentSkusCount],
-                ['QUANTIDADE TOTAL SISTEMA', totalSysQty],
-                ['QUANTIDADE TOTAL CONFERIDA', totalCountedQty],
-                ['DIVERGÊNCIA LÍQUIDA QTD', totalCountedQty - totalSysQty],
-                ['VALOR TOTAL SISTEMA (CUSTO)', totalSysCost],
-                ['VALOR TOTAL CONFERIDO (CUSTO)', totalCountedCost],
-                ['DIVERGÊNCIA LÍQUIDA FINANCEIRA (R$)', overallDiffCost],
-                ['REPRESENTAÇÃO DIVERGÊNCIA (%)', deviationPercent],
-                ['FALTAS / PERDAS - QTD UNIDADES', totalFaltaQty],
-                ['FALTAS / PERDAS - VALOR (R$)', totalFaltaCost],
-                ['SOBRAS - QTD UNIDADES', totalSobraQty],
-                ['SOBRAS - VALOR (R$)', totalSobraCost]
+                [],
+                ['RESUMO FINANCEIRO DA CONFERÊNCIA', ''],
+                ['INDICADORES DA FILIAL', ''],
+                ['Conferência Global da Filial', `${Number(branchMetrics.progress || 0).toLocaleString('pt-BR', { maximumFractionDigits: 0 })}%`],
+                ['SKUs Totais (Mix Importado)', fmtInt(Number(branchMetrics.skus || 0))],
+                ['Mix Auditado (Conf./Pend.)', `${fmtInt(Number(branchMetrics.doneSkus || 0))} / ${fmtInt(mixPending)}`],
+                ['Unidades Totais (Conf./Total)', `${fmtInt(Number(filialTotalsMetrics.doneUnits || 0))} / ${fmtInt(Number(branchMetrics.units || 0))}`],
+                ['Valor em Custo (Conf./Total)', `${fmtCurrency(Number(filialTotalsMetrics.doneCost || 0))} / ${fmtCurrency(Number(branchMetrics.cost || 0))}`],
+                ['Total Conferido R$', fmtCurrency(Number(filialTotalsMetrics.doneCost || 0))],
+                ['Falta Conferir R$', fmtCurrency(Number(filialTotalsMetrics.pendingCost || 0))],
+                ['Qtde Divergência', `${signedInt(Number(filialTotalsMetrics.diffQty || 0))} un.`],
+                ['Divergência R$', fmtCurrency(Number(filialTotalsMetrics.diffCost || 0))],
+                ['Rep. Divergência', fmtPercent(Number(filialTotalsMetrics.repDivergencePct || 0))],
+                [],
+                ['DADOS DO TERMO (ESCOPO)', ''],
+                ['Estoque Sistema (Qtde)', fmtInt(totalSysQty)],
+                ['Custo Total Sistema', fmtCurrency(totalSysCost)],
+                ['Estoque Físico (Qtde)', fmtInt(totalCountedQty)],
+                ['Custo Total Físico', fmtCurrency(totalCountedCost)],
+                ['Diferença de Estoque (Qtde)', signedInt(totalCountedQty - totalSysQty)],
+                ['Resultado Financeiro', `${fmtCurrency(overallDiffCost)} (${diffType})`],
+                ['Representatividade no Auditado', fmtPercent(termRepresentativity)],
+                [],
+                ['DETALHAMENTO DAS DIVERGÊNCIAS', ''],
+                ['TOTAL DE ITENS NO TERMO', allProductsData.length],
+                ['TOTAL DE ITENS COM DIVERGÊNCIA', divergentSkusCount],
+                ['FALTAS / PERDAS - QTD UNIDADES', fmtInt(totalFaltaQty)],
+                ['FALTAS / PERDAS - VALOR (R$)', fmtCurrency(totalFaltaCost)],
+                ['SOBRAS - QTD UNIDADES', fmtInt(totalSobraQty)],
+                ['SOBRAS - VALOR (R$)', fmtCurrency(totalSobraCost)]
             ];
             const wsSummary = XLSX.utils.aoa_to_sheet(summaryData);
+            wsSummary['!cols'] = [{ wch: 42 }, { wch: 38 }];
             XLSX.utils.book_append_sheet(wb, wsSummary, "Resumo Geral");
 
             // Aba 2: Por Grupo
