@@ -809,6 +809,13 @@ const getFinancialRepresentativity = (auditedBaseCost?: number, diffCost?: numbe
     return (diff / base) * 100;
 };
 
+const getAuditNumberFromInventoryLabel = (value: unknown): number | null => {
+    const parts = String(value ?? '').trim().match(/\d+/g);
+    if (!parts || parts.length === 0) return null;
+    const auditNumber = Number(parts[parts.length - 1]);
+    return Number.isFinite(auditNumber) && auditNumber > 0 ? auditNumber : null;
+};
+
 const getAuditDataStrength = (auditData: AuditData | null | undefined): number => {
     if (!auditData) return 0;
     const groupsCount = Array.isArray(auditData.groups) ? auditData.groups.length : 0;
@@ -1083,16 +1090,22 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (hasPendingSync && typeof navigator !== 'undefined' && navigator.onLine && localData && !silent) {
                 try {
                     setIsSyncing(true);
-                    const existingTarget = await fetchAuditSession(selectedFilial, nextAuditNumber);
+                    const localBranch = String(localData.filial || selectedFilial || '').trim();
+                    const localAuditNumber = getAuditNumberFromInventoryLabel((localData as any).inventoryNumber) || nextAuditNumber;
+                    const existingTarget = localBranch
+                        ? await fetchAuditSession(localBranch, localAuditNumber)
+                        : null;
                     if (!dbSessionId && (!existingTarget || existingTarget.status === 'completed')) {
                         console.warn(
-                            `Sincronização local pendente ignorada: não há inventário aberto Nº ${nextAuditNumber} na filial ${selectedFilial}.`
+                            `Sincronização local pendente ignorada: não há inventário aberto Nº ${localAuditNumber} na filial ${localBranch || selectedFilial}.`
                         );
+                        await AuditStorage.saveLocalAuditSession(localData, false);
+                        setLocalPendingAudit(null);
                     } else {
                         const synced = await upsertAuditSession({
                             id: dbSessionId || existingTarget?.id,
-                            branch: selectedFilial,
-                            audit_number: nextAuditNumber,
+                            branch: localBranch || selectedFilial,
+                            audit_number: localAuditNumber,
                             status: 'open',
                             data: localData,
                             progress: calculateProgress(localData),
@@ -1372,7 +1385,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 if (latest !== undefined) {
                     if (isStaleRequest()) return;
                     if (isReadOnlyCompletedView && consultingAuditNumber !== null) {
-                        setNextAuditNumber(consultingAuditNumber);
+                        setNextAuditNumber(latest ? latest.audit_number + 1 : consultingAuditNumber + 1);
                         if (!silent) {
                             setDbSessionId(undefined);
                         }
@@ -1502,7 +1515,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         try {
             setIsSyncing(true);
             const branch = local.filial || selectedFilial;
-            const auditNum = Number(local.inventoryNumber) || nextAuditNumber;
+            const auditNum = getAuditNumberFromInventoryLabel((local as any).inventoryNumber) || nextAuditNumber;
             
             if (!branch || !auditNum) {
                 alert("Dados de identificação ausentes no rascunho local.");
@@ -1563,10 +1576,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, [loadAuditNum]);
 
     // Derived inventory number (Auto-generated)
-    const inventoryNumber = useMemo(() => {
-        return selectedFilial ? `${new Date().getFullYear()}-${selectedFilial.padStart(4, '0')}-${String(nextAuditNumber).padStart(4, '0')}` : '';
-    }, [selectedFilial, nextAuditNumber]);
     const accessedAuditNumber = consultingAuditNumber ?? nextAuditNumber;
+    const inventoryNumber = useMemo(() => {
+        return selectedFilial ? `${new Date().getFullYear()}-${selectedFilial.padStart(4, '0')}-${String(accessedAuditNumber).padStart(4, '0')}` : '';
+    }, [selectedFilial, accessedAuditNumber]);
 
     // Dummy setter to keep existing logic working without massive refactor
     const setInventoryNumber = (val: string) => { };
@@ -1765,7 +1778,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
 
             if (!allowCreate && !session.id && session.status === 'open') {
-                alert(
+                console.warn(
                     `Bloqueamos a criação automática do inventário Nº ${session.audit_number} na filial ${branch}.\n\n` +
                     `Para criar um inventário novo, use o botão de iniciar/carregar inventário.`
                 );
@@ -2270,7 +2283,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const reconciled = reconcileAuditStateFromCompletedScopes(payload);
             setData(reconciled);
             setTermDrafts(((reconciled as any)?.termDrafts || {}) as Record<string, TermForm>);
-            setNextAuditNumber(target.audit_number);
+            setNextAuditNumber(current => Math.max(Number(current || 0), target.audit_number + 1));
             setDbSessionId(target.id);
             setView({ level: 'groups' });
             setAllowActiveAuditAutoOpen(false);
@@ -7526,7 +7539,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     <div>
                                         <p className="text-[10px] font-black uppercase tracking-widest text-indigo-500">Inventários da Filial {selectedFilial}</p>
                                         <p className="text-xs font-semibold text-slate-600">
-                                            Próximo automático: <span className="font-black text-indigo-700">Nº {nextAuditNumber}</span>
+                                            {isReadOnlyCompletedView && consultingAuditNumber !== null ? (
+                                                <>Visualizando: <span className="font-black text-indigo-700">Nº {consultingAuditNumber}</span></>
+                                            ) : (
+                                                <>Próximo automático: <span className="font-black text-indigo-700">Nº {nextAuditNumber}</span></>
+                                            )}
                                         </p>
                                     </div>
                                     <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">

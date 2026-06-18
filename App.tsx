@@ -4329,10 +4329,22 @@ const App: React.FC = () => {
             let globalSobraQty = 0;
             let globalSobraCost = 0;
             let globalDivergentSkusCount = 0;
+            let globalAuditedBaseCost = 0;
 
             latestByBranch.forEach((session, branchLabel) => {
                 const parsedData = parseJsonValue<any>(session.data) || session.data || {};
                 const termDrafts = parsedData?.termDrafts || {};
+                const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
+                let branchAuditedBaseCost = 0;
+                groups.forEach((group: any) => {
+                    (group?.departments || []).forEach((dept: any) => {
+                        (dept?.categories || []).forEach((cat: any) => {
+                            if (normalizeAuditCategoryStatus(cat?.status) === 'done') {
+                                branchAuditedBaseCost += Number(cat?.totalCost || 0);
+                            }
+                        });
+                    });
+                });
 
                 const sessionProducts: any[] = [];
 
@@ -4503,6 +4515,8 @@ const App: React.FC = () => {
                 globalFaltaCost += branchFaltaCost;
                 globalSobraQty += branchSobraQty;
                 globalSobraCost += branchSobraCost;
+                globalAuditedBaseCost += branchAuditedBaseCost;
+                const branchDiffCost = branchCountedCost - branchSysCost;
 
                 branchSummaries.push({
                     'Filial / Loja': branchLabel,
@@ -4512,9 +4526,11 @@ const App: React.FC = () => {
                     'Qtd Sistema': branchSysQty,
                     'Qtd Conferida': branchCountedQty,
                     'Divergência Qtd': branchCountedQty - branchSysQty,
+                    'Base Auditada Filial (R$)': branchAuditedBaseCost,
                     'Custo Sistema (R$)': branchSysCost,
                     'Custo Conferido (R$)': branchCountedCost,
-                    'Divergência Financeira (R$)': branchCountedCost - branchSysCost,
+                    'Divergência Financeira (R$)': branchDiffCost,
+                    'Rep. Divergência (%)': branchAuditedBaseCost > 0 ? (branchDiffCost / branchAuditedBaseCost) * 100 : 0,
                     'Qtd Faltas (Perdas)': branchFaltaQty,
                     'Valor Faltas (R$)': branchFaltaCost,
                     'Qtd Sobras': branchSobraQty,
@@ -4589,7 +4605,7 @@ const App: React.FC = () => {
 
             // Aba 1: Resumo Consolidado Geral
             const overallDiffCost = globalCountedCost - globalSysCost;
-            const deviationPercent = globalSysCost > 0 ? (overallDiffCost / globalSysCost) * 100 : 0;
+            const deviationPercent = globalAuditedBaseCost > 0 ? (overallDiffCost / globalAuditedBaseCost) * 100 : 0;
             
             const summaryTitleData = [
                 ['MÉTRICA REDE / CONSOLIDADA', 'VALOR'],
@@ -4601,10 +4617,11 @@ const App: React.FC = () => {
                 ['QUANTIDADE TOTAL SISTEMA', globalSysQty],
                 ['QUANTIDADE TOTAL CONFERIDA', globalCountedQty],
                 ['DIVERGÊNCIA LÍQUIDA QTD', globalCountedQty - globalSysQty],
+                ['BASE AUDITADA FILIAIS CONCLUÍDAS (R$)', globalAuditedBaseCost],
                 ['VALOR TOTAL SISTEMA (CUSTO)', globalSysCost],
                 ['VALOR TOTAL CONFERIDO (CUSTO)', globalCountedCost],
                 ['DIVERGÊNCIA LÍQUIDA FINANCEIRA (R$)', overallDiffCost],
-                ['REPRESENTAÇÃO DIVERGÊNCIA CONSOLIDADA (%)', deviationPercent],
+                ['REP. DIVERGÊNCIA CONSOLIDADA (%)', deviationPercent],
                 ['FALTAS / PERDAS REDE - QTD UNIDADES', globalFaltaQty],
                 ['FALTAS / PERDAS REDE - VALOR (R$)', globalFaltaCost],
                 ['SOBRAS REDE - QTD UNIDADES', globalSobraQty],
@@ -4614,7 +4631,7 @@ const App: React.FC = () => {
             ];
             
             const wsSummary = XLSX.utils.aoa_to_sheet(summaryTitleData);
-            XLSX.utils.sheet_add_json(wsSummary, branchSummaries, { origin: 'A20' });
+            XLSX.utils.sheet_add_json(wsSummary, branchSummaries, { origin: 'A21' });
             XLSX.utils.book_append_sheet(wb, wsSummary, "Resumo Consolidado");
 
             // Aba 2: Por Grupo
@@ -5714,6 +5731,7 @@ const App: React.FC = () => {
             pendingUnits: number;
             totalCost: number;
             pendingCost: number;
+            auditedBaseCost: number;
             diffQty: number;
             diffCost: number;
             countedCost: number;
@@ -6182,6 +6200,7 @@ const App: React.FC = () => {
                 pendingUnits,
                 totalCost,
                 pendingCost,
+                auditedBaseCost: countedCost,
                 diffQty,
                 diffCost,
                 countedCost: countedCost + diffCost,
@@ -6205,6 +6224,7 @@ const App: React.FC = () => {
             totalUnits: number;
             countedUnits: number;
             pendingUnits: number;
+            auditedBaseCost: number;
             countedCost: number;
             diffQty: number;
             diffCost: number;
@@ -6220,6 +6240,7 @@ const App: React.FC = () => {
                 totalUnits: 0,
                 countedUnits: 0,
                 pendingUnits: 0,
+                auditedBaseCost: 0,
                 countedCost: 0,
                 diffQty: 0,
                 diffCost: 0
@@ -6231,6 +6252,7 @@ const App: React.FC = () => {
             current.totalUnits += item.totalUnits;
             current.countedUnits += item.countedUnits;
             current.pendingUnits += item.pendingUnits;
+            current.auditedBaseCost += item.auditedBaseCost;
             current.countedCost += item.countedCost;
             current.diffQty += item.diffQty;
             current.diffCost += item.diffCost;
@@ -6248,6 +6270,7 @@ const App: React.FC = () => {
             acc.pendingUnits += item.pendingUnits;
             acc.totalCost += item.totalCost;
             acc.pendingCost += item.pendingCost;
+            acc.auditedBaseCost += item.auditedBaseCost;
             acc.countedCost += item.countedCost;
             acc.diffQty += item.diffQty;
             acc.diffCost += item.diffCost;
@@ -6262,6 +6285,7 @@ const App: React.FC = () => {
             pendingUnits: 0,
             totalCost: 0,
             pendingCost: 0,
+            auditedBaseCost: 0,
             countedCost: 0,
             diffQty: 0,
             diffCost: 0
@@ -6273,8 +6297,8 @@ const App: React.FC = () => {
         const uniqueTotalSkus = uniqueSkuSet.size;
         const uniqueCountedSkus = uniqueSkuDoneSet.size;
         const uniquePendingSkus = Math.max(0, uniqueTotalSkus - uniqueCountedSkus);
-        const summaryDivergencePct = summary.countedCost > 0
-            ? (summary.diffCost / summary.countedCost) * 100
+        const summaryDivergencePct = summary.auditedBaseCost > 0
+            ? (summary.diffCost / summary.auditedBaseCost) * 100
             : 0;
 
         return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
@@ -6295,6 +6319,7 @@ const App: React.FC = () => {
             pendingUnits: number;
             totalCost: number;
             pendingCost: number;
+            auditedBaseCost: number;
             diffQty: number;
             diffCost: number;
             countedCost: number;
@@ -6760,6 +6785,7 @@ const App: React.FC = () => {
                 pendingUnits,
                 totalCost,
                 pendingCost,
+                auditedBaseCost: countedCost,
                 diffQty,
                 diffCost,
                 countedCost: countedCost + diffCost,
@@ -6783,6 +6809,7 @@ const App: React.FC = () => {
             totalUnits: number;
             countedUnits: number;
             pendingUnits: number;
+            auditedBaseCost: number;
             countedCost: number;
             diffQty: number;
             diffCost: number;
@@ -6798,6 +6825,7 @@ const App: React.FC = () => {
                 totalUnits: 0,
                 countedUnits: 0,
                 pendingUnits: 0,
+                auditedBaseCost: 0,
                 countedCost: 0,
                 diffQty: 0,
                 diffCost: 0
@@ -6809,6 +6837,7 @@ const App: React.FC = () => {
             current.totalUnits += item.totalUnits;
             current.countedUnits += item.countedUnits;
             current.pendingUnits += item.pendingUnits;
+            current.auditedBaseCost += item.auditedBaseCost;
             current.countedCost += item.countedCost;
             current.diffQty += item.diffQty;
             current.diffCost += item.diffCost;
@@ -6826,6 +6855,7 @@ const App: React.FC = () => {
             acc.pendingUnits += item.pendingUnits;
             acc.totalCost += item.totalCost;
             acc.pendingCost += item.pendingCost;
+            acc.auditedBaseCost += item.auditedBaseCost;
             acc.countedCost += item.countedCost;
             acc.diffQty += item.diffQty;
             acc.diffCost += item.diffCost;
@@ -6840,6 +6870,7 @@ const App: React.FC = () => {
             pendingUnits: 0,
             totalCost: 0,
             pendingCost: 0,
+            auditedBaseCost: 0,
             countedCost: 0,
             diffQty: 0,
             diffCost: 0
@@ -6851,8 +6882,8 @@ const App: React.FC = () => {
         const uniqueTotalSkus = uniqueSkuSet.size;
         const uniqueCountedSkus = uniqueSkuDoneSet.size;
         const uniquePendingSkus = Math.max(0, uniqueTotalSkus - uniqueCountedSkus);
-        const summaryDivergencePct = summary.countedCost > 0
-            ? (summary.diffCost / summary.countedCost) * 100
+        const summaryDivergencePct = summary.auditedBaseCost > 0
+            ? (summary.diffCost / summary.auditedBaseCost) * 100
             : 0;
 
         return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
@@ -10822,7 +10853,7 @@ const App: React.FC = () => {
                                                 ) : (
                                                     dashboardAuditOverview.areas.map(area => {
                                                         const pct = area.totalUnits > 0 ? (area.countedUnits / area.totalUnits) * 100 : 0;
-                                                        const areaDivergencePct = area.countedCost > 0 ? (area.diffCost / area.countedCost) * 100 : 0;
+                                                        const areaDivergencePct = area.auditedBaseCost > 0 ? (area.diffCost / area.auditedBaseCost) * 100 : 0;
                                                         return (
                                                             <div key={area.area} className="rounded-xl border border-gray-100 px-3 py-2">
                                                                 <div className="flex items-center justify-between">
@@ -10996,7 +11027,7 @@ const App: React.FC = () => {
                                                 ) : (
                                                     dashboardCompletedAuditOverview.areas.map(area => {
                                                         const pct = area.totalUnits > 0 ? (area.countedUnits / area.totalUnits) * 100 : 0;
-                                                        const areaDivergencePct = area.countedCost > 0 ? (area.diffCost / area.countedCost) * 100 : 0;
+                                                        const areaDivergencePct = area.auditedBaseCost > 0 ? (area.diffCost / area.auditedBaseCost) * 100 : 0;
                                                         return (
                                                             <div key={area.area} className="rounded-xl border border-gray-100 px-3 py-2">
                                                                 <div className="flex items-center justify-between">
