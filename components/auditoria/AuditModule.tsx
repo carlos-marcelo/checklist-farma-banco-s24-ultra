@@ -2372,15 +2372,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 });
             }
             const reconciled = reconcileAuditStateFromCompletedScopes(payload);
-            setData(reconciled);
-            setTermDrafts(((reconciled as any)?.termDrafts || {}) as Record<string, TermForm>);
+            setIsReadOnlyCompletedView(true);
             setConsultingAuditNumber(target.audit_number);
             setNextAuditNumber(target.audit_number);
             setDbSessionId(target.id);
-            setView({ level: 'groups' });
             setAllowActiveAuditAutoOpen(false);
             setIsUpdatingStock(false);
-            setIsReadOnlyCompletedView(true);
+            setData(reconciled);
+            setTermDrafts(((reconciled as any)?.termDrafts || {}) as Record<string, TermForm>);
+            setView({ level: 'groups' });
             setShowCompletedAuditsModal(false);
             alert(
                 isMaster
@@ -2673,6 +2673,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
     ) => {
         if (!data) return false;
+        if (isReadOnlyCompletedView || consultingAuditNumber !== null) {
+            setIsUpdatingStock(false);
+            if (options?.notify !== false) {
+                alert("Inventário concluído em modo consulta não pode receber reclassificação de estoque.");
+            }
+            return false;
+        }
         const source = options?.source || 'local_upload';
         const syncedAt = options?.syncedAt || null;
         const shouldNotify = options?.notify !== false;
@@ -2788,6 +2795,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     useEffect(() => {
         if (!selectedFilial || !data || isProcessing || isUpdatingStock) return;
+        if (isReadOnlyCompletedView || consultingAuditNumber !== null) return;
         if (!isMaster) return;
         if (fileStock) return; // upload local sempre prevalece
         if (!globalStockFile || !globalStockMeta) return;
@@ -2833,7 +2841,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         fileStock,
         globalStockFile,
         globalStockMeta,
-        dbSessionId
+        dbSessionId,
+        isReadOnlyCompletedView,
+        consultingAuditNumber
     ]);
 
     const handleStartAudit = async () => {
