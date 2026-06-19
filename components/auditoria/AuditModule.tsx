@@ -767,6 +767,95 @@ const parseCustomDraftKeyMeta = (draftKey: string): null | { batchId?: string; s
 
 const GLOBAL_UNIFIED_TERM_BATCH_ID = '__global_unified_term__';
 
+const roundAuditMoney = (value: unknown) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+const TERM_METADATA_KEYWORDS = [
+    'filial:', 'grupo de produtos:', 'departamento:', 'categoria:',
+    'tipo de produto:', 'grupo de preço:', 'início contagem:',
+    'conferência de estoque', 'código', 'página 1 de', 'produto:'
+];
+
+const isTermMetadataRow = (item: any) => {
+    const codigo = String(item?.code || '').trim().toLowerCase();
+    const descricao = String(item?.description || item?.name || '').trim().toLowerCase();
+
+    if (TERM_METADATA_KEYWORDS.some(keyword => codigo.startsWith(keyword) || descricao.startsWith(keyword))) {
+        return true;
+    }
+    if ((!codigo && !descricao) || codigo === '-' || descricao === '-' || (codigo === '' && descricao === '-')) {
+        return true;
+    }
+    return false;
+};
+
+const summarizeTermRows = (rows: any[]) => {
+    const totals = rows.reduce((acc: any, item: any) => ({
+        sysQty: acc.sysQty + Number(item?.sysQty || 0),
+        sysCost: acc.sysCost + Number(item?.sysCost || 0),
+        countedQty: acc.countedQty + Number(item?.countedQty || 0),
+        countedCost: acc.countedCost + Number(item?.countedCost || 0),
+        diffQty: acc.diffQty + Number(item?.diffQty || 0),
+        diffCost: acc.diffCost + Number(item?.diffCost || 0)
+    }), { sysQty: 0, sysCost: 0, countedQty: 0, countedCost: 0, diffQty: 0, diffCost: 0 });
+
+    return {
+        ...totals,
+        sysCost: roundAuditMoney(totals.sysCost),
+        countedCost: roundAuditMoney(totals.countedCost),
+        diffCost: roundAuditMoney(totals.diffCost)
+    };
+};
+
+const getAuthoritativeTermMetrics = (
+    sourceData: any,
+    sourceDrafts?: Record<string, TermForm>
+) => {
+    const metricsByKey = new Map<string, any>();
+    Object.entries(((sourceData?.termExcelMetricsByKey || {}) as Record<string, any>)).forEach(([draftKey, metrics]) => {
+        if (metrics) metricsByKey.set(draftKey, metrics);
+    });
+    const mergedDrafts = {
+        ...(((sourceData?.termDrafts || {}) as Record<string, TermForm>) || {}),
+        ...((sourceDrafts || {}) as Record<string, TermForm>)
+    };
+    Object.entries(mergedDrafts || {}).forEach(([draftKey, draftValue]) => {
+        if (draftValue?.excelMetricsRemovedAt && !draftValue?.excelMetrics) {
+            metricsByKey.delete(draftKey);
+            return;
+        }
+        if (draftValue?.excelMetrics) metricsByKey.set(draftKey, draftValue.excelMetrics);
+    });
+
+    const metricEntries = Array.from(metricsByKey.entries()).filter(([, metrics]) => !!metrics);
+    if (metricEntries.length === 0) return null;
+
+    const globalUnifiedEntries = metricEntries.filter(([draftKey]) =>
+        draftKey.startsWith('custom|') && draftKey.includes(GLOBAL_UNIFIED_TERM_BATCH_ID)
+    );
+    const pools = (globalUnifiedEntries.length > 0 ? globalUnifiedEntries : metricEntries)
+        .map(([, metrics]) => metrics);
+    const merged = mergeExcelMetricsPools(pools);
+    if (!merged) return null;
+
+    const cleanItems = (Array.isArray(merged.items) ? merged.items : []).filter((item: any) => !isTermMetadataRow(item));
+    const totals = cleanItems.length > 0
+        ? summarizeTermRows(cleanItems)
+        : {
+            sysQty: Number(merged.sysQty || 0),
+            sysCost: roundAuditMoney(merged.sysCost),
+            countedQty: Number(merged.countedQty || 0),
+            countedCost: roundAuditMoney(merged.countedCost),
+            diffQty: Number(merged.diffQty || 0),
+            diffCost: roundAuditMoney(merged.diffCost)
+        };
+
+    return {
+        ...totals,
+        items: cleanItems,
+        source: globalUnifiedEntries.length > 0 ? 'global_unified' : 'terms'
+    };
+};
+
 const draftKeyTouchesGroup = (draftKey: string, groupId?: string | number): boolean => {
     const target = normalizeScopeId(groupId);
     if (!target) return false;
@@ -1385,7 +1474,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 if (latest !== undefined) {
                     if (isStaleRequest()) return;
                     if (isReadOnlyCompletedView && consultingAuditNumber !== null) {
-                        setNextAuditNumber(latest ? latest.audit_number + 1 : consultingAuditNumber + 1);
+                        setNextAuditNumber(consultingAuditNumber);
                         if (!silent) {
                             setDbSessionId(undefined);
                         }
@@ -1576,7 +1665,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, [loadAuditNum]);
 
     // Derived inventory number (Auto-generated)
-    const accessedAuditNumber = consultingAuditNumber ?? nextAuditNumber;
+    const accessedAuditNumber = isReadOnlyCompletedView && consultingAuditNumber !== null
+        ? consultingAuditNumber
+        : nextAuditNumber;
     const inventoryNumber = useMemo(() => {
         return selectedFilial ? `${new Date().getFullYear()}-${selectedFilial.padStart(4, '0')}-${String(accessedAuditNumber).padStart(4, '0')}` : '';
     }, [selectedFilial, accessedAuditNumber]);
@@ -2283,13 +2374,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const reconciled = reconcileAuditStateFromCompletedScopes(payload);
             setData(reconciled);
             setTermDrafts(((reconciled as any)?.termDrafts || {}) as Record<string, TermForm>);
-            setNextAuditNumber(current => Math.max(Number(current || 0), target.audit_number + 1));
+            setConsultingAuditNumber(target.audit_number);
+            setNextAuditNumber(target.audit_number);
             setDbSessionId(target.id);
             setView({ level: 'groups' });
             setAllowActiveAuditAutoOpen(false);
             setIsUpdatingStock(false);
             setIsReadOnlyCompletedView(true);
-            setConsultingAuditNumber(target.audit_number);
             setShowCompletedAuditsModal(false);
             alert(
                 isMaster
@@ -3663,19 +3754,43 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const branchMetrics = useMemo(() => {
         if (!data) return { skus: 0, units: 0, cost: 0, doneSkus: 0, doneUnits: 0, doneCost: 0, progress: 0, pendingUnits: 0, pendingSkus: 0, pendingCost: 0, totalCategories: 0, doneCategories: 0 };
-        let skus = 0, units = 0, cost = 0, doneSkus = 0, doneUnits = 0, doneCost = 0, totalCats = 0, doneCats = 0;
+        let fallbackSkus = 0, fallbackDoneSkus = 0, units = 0, cost = 0, doneUnits = 0, doneCost = 0, totalCats = 0, doneCats = 0;
+        const skuCodes = new Set<string>();
+        const doneSkuCodes = new Set<string>();
+        const normalizeProductCodeLocal = (value: unknown) =>
+            String(value ?? '')
+                .trim()
+                .replace(/\D/g, '')
+                .replace(/^0+/, '');
         data.groups.forEach(g => g.departments.forEach(d => d.categories.forEach(c => {
-            skus += c.itemsCount;
+            const done = isDoneStatus(c.status);
+            const products = Array.isArray(c.products) ? c.products : [];
+            if (products.length > 0) {
+                products.forEach((product: any) => {
+                    const code = normalizeProductCodeLocal(product?.reducedCode || product?.code);
+                    if (!code) {
+                        fallbackSkus += 1;
+                        if (done) fallbackDoneSkus += 1;
+                        return;
+                    }
+                    skuCodes.add(code);
+                    if (done) doneSkuCodes.add(code);
+                });
+            } else {
+                fallbackSkus += Number(c.itemsCount || 0);
+                if (done) fallbackDoneSkus += Number(c.itemsCount || 0);
+            }
             units += c.totalQuantity;
             cost += (c.totalCost || 0);
             totalCats++;
-            if (isDoneStatus(c.status)) {
-                doneSkus += c.itemsCount;
+            if (done) {
                 doneUnits += c.totalQuantity;
                 doneCost += (c.totalCost || 0);
                 doneCats++;
             }
         })));
+        const skus = skuCodes.size + fallbackSkus;
+        const doneSkus = doneSkuCodes.size + fallbackDoneSkus;
         return {
             skus, units, cost, doneSkus, doneUnits, doneCost,
             pendingUnits: units - doneUnits,
@@ -4061,6 +4176,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         return hasRelevantMismatch ? byDepartments : direct;
     }, [getScopedMetrics, sumExcelMetrics]);
 
+    const authoritativeTermMetrics = useMemo(
+        () => getAuthoritativeTermMetrics(data, termDrafts),
+        [data, termDrafts]
+    );
+
     const filialTotalsMetrics = useMemo(() => {
         if (!data) {
             return {
@@ -4081,17 +4201,24 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         let diffQty = 0;
         let diffCost = 0;
         let groupsWithDivergence = 0;
-        data.groups.forEach(group => {
-            const metrics = getGroupVerifiedMetrics(group);
-            if (!metrics) return;
-            const currentDiffQty = Number(metrics.diffQty || 0);
-            const currentDiffCost = Number(metrics.diffCost || 0);
-            diffQty += currentDiffQty;
-            diffCost += currentDiffCost;
-            if (Math.abs(currentDiffQty) > 0.01 || Math.abs(currentDiffCost) > 0.01) {
-                groupsWithDivergence += 1;
-            }
-        });
+        if (authoritativeTermMetrics) {
+            diffQty = Number(authoritativeTermMetrics.diffQty || 0);
+            diffCost = roundAuditMoney(authoritativeTermMetrics.diffCost);
+            groupsWithDivergence = Math.abs(diffQty) > 0.01 || Math.abs(diffCost) > 0.01 ? 1 : 0;
+        } else {
+            data.groups.forEach(group => {
+                const metrics = getGroupVerifiedMetrics(group);
+                if (!metrics) return;
+                const currentDiffQty = Number(metrics.diffQty || 0);
+                const currentDiffCost = Number(metrics.diffCost || 0);
+                diffQty += currentDiffQty;
+                diffCost += currentDiffCost;
+                if (Math.abs(currentDiffQty) > 0.01 || Math.abs(currentDiffCost) > 0.01) {
+                    groupsWithDivergence += 1;
+                }
+            });
+            diffCost = roundAuditMoney(diffCost);
+        }
 
         const pendingUnits = Math.max(0, Number(branchMetrics.units || 0) - Number(branchMetrics.doneUnits || 0));
         const pendingSkus = Math.max(0, Number(branchMetrics.skus || 0) - Number(branchMetrics.doneSkus || 0));
@@ -4110,10 +4237,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             groupsWithDivergence,
             doneUnits: Number(branchMetrics.doneUnits || 0) + diffQty,
             totalUnits: Number(branchMetrics.units || 0),
-            doneCost: Number(branchMetrics.doneCost || 0) + diffCost,
+            doneCost: roundAuditMoney(Number(branchMetrics.doneCost || 0) + diffCost),
             totalCost: Number(branchMetrics.cost || 0)
         };
-    }, [data, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost]);
+    }, [data, authoritativeTermMetrics, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost]);
 
     const createDefaultTermForm = (): TermForm => ({
         inventoryNumber: inventoryNumber || data?.inventoryNumber || '',
@@ -6950,10 +7077,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const sysQty = Number(item.sysQty || 0);
                 const countedQty = Number(item.countedQty || 0);
                 const diffQty = Number(item.diffQty || 0);
-                const cost = Number(item.cost || 0);
-                const sysCost = Number(item.sysCost || 0);
-                const countedCost = Number(item.countedCost || 0);
-                const diffCost = Number(item.diffCost || 0);
+                const cost = roundAuditMoney(item.cost);
+                const sysCost = roundAuditMoney(item.sysCost);
+                const countedCost = roundAuditMoney(item.countedCost);
+                const diffCost = roundAuditMoney(item.diffCost);
 
                 let faltaQty = 0;
                 let faltaCost = 0;
@@ -6996,12 +7123,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             allProductsData.forEach(p => {
                 totalSysQty += p.sysQty;
                 totalCountedQty += p.countedQty;
-                totalSysCost += p.sysCost;
-                totalCountedCost += p.countedCost;
+                totalSysCost = roundAuditMoney(totalSysCost + p.sysCost);
+                totalCountedCost = roundAuditMoney(totalCountedCost + p.countedCost);
                 totalFaltaQty += p.faltaQty;
-                totalFaltaCost += p.faltaCost;
+                totalFaltaCost = roundAuditMoney(totalFaltaCost + p.faltaCost);
                 totalSobraQty += p.sobraQty;
-                totalSobraCost += p.sobraCost;
+                totalSobraCost = roundAuditMoney(totalSobraCost + p.sobraCost);
                 if (Math.abs(Number(p.diffQty || 0)) > 0.01 || Math.abs(Number(p.diffCost || 0)) > 0.01) {
                     divergentSkusCount++;
                 }
@@ -7021,13 +7148,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 g['Qtd Sistema'] += p.sysQty;
                 g['Qtd Conferida'] += p.countedQty;
                 g['Divergência Qtd'] += p.diffQty;
-                g['Custo Sistema (R$)'] += p.sysCost;
-                g['Custo Conferido (R$)'] += p.countedCost;
-                g['Divergência R$'] += p.diffCost;
+                g['Custo Sistema (R$)'] = roundAuditMoney(g['Custo Sistema (R$)'] + p.sysCost);
+                g['Custo Conferido (R$)'] = roundAuditMoney(g['Custo Conferido (R$)'] + p.countedCost);
+                g['Divergência R$'] = roundAuditMoney(g['Divergência R$'] + p.diffCost);
                 g['Qtd Faltas (Perdas)'] += p.faltaQty;
-                g['Valor Faltas (R$)'] += p.faltaCost;
+                g['Valor Faltas (R$)'] = roundAuditMoney(g['Valor Faltas (R$)'] + p.faltaCost);
                 g['Qtd Sobras'] += p.sobraQty;
-                g['Valor Sobras (R$)'] += p.sobraCost;
+                g['Valor Sobras (R$)'] = roundAuditMoney(g['Valor Sobras (R$)'] + p.sobraCost);
 
                 // Departamento
                 const deptKey = `${p.groupName} | ${p.deptName}`;
@@ -7038,13 +7165,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 d['Qtd Sistema'] += p.sysQty;
                 d['Qtd Conferida'] += p.countedQty;
                 d['Divergência Qtd'] += p.diffQty;
-                d['Custo Sistema (R$)'] += p.sysCost;
-                d['Custo Conferido (R$)'] += p.countedCost;
-                d['Divergência R$'] += p.diffCost;
+                d['Custo Sistema (R$)'] = roundAuditMoney(d['Custo Sistema (R$)'] + p.sysCost);
+                d['Custo Conferido (R$)'] = roundAuditMoney(d['Custo Conferido (R$)'] + p.countedCost);
+                d['Divergência R$'] = roundAuditMoney(d['Divergência R$'] + p.diffCost);
                 d['Qtd Faltas (Perdas)'] += p.faltaQty;
-                d['Valor Faltas (R$)'] += p.faltaCost;
+                d['Valor Faltas (R$)'] = roundAuditMoney(d['Valor Faltas (R$)'] + p.faltaCost);
                 d['Qtd Sobras'] += p.sobraQty;
-                d['Valor Sobras (R$)'] += p.sobraCost;
+                d['Valor Sobras (R$)'] = roundAuditMoney(d['Valor Sobras (R$)'] + p.sobraCost);
 
                 // Categoria
                 const catKey = `${p.groupName} | ${p.deptName} | ${p.catName}`;
@@ -7055,20 +7182,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 c['Qtd Sistema'] += p.sysQty;
                 c['Qtd Conferida'] += p.countedQty;
                 c['Divergência Qtd'] += p.diffQty;
-                c['Custo Sistema (R$)'] += p.sysCost;
-                c['Custo Conferido (R$)'] += p.countedCost;
-                c['Divergência R$'] += p.diffCost;
+                c['Custo Sistema (R$)'] = roundAuditMoney(c['Custo Sistema (R$)'] + p.sysCost);
+                c['Custo Conferido (R$)'] = roundAuditMoney(c['Custo Conferido (R$)'] + p.countedCost);
+                c['Divergência R$'] = roundAuditMoney(c['Divergência R$'] + p.diffCost);
                 c['Qtd Faltas (Perdas)'] += p.faltaQty;
-                c['Valor Faltas (R$)'] += p.faltaCost;
+                c['Valor Faltas (R$)'] = roundAuditMoney(c['Valor Faltas (R$)'] + p.faltaCost);
                 c['Qtd Sobras'] += p.sobraQty;
-                c['Valor Sobras (R$)'] += p.sobraCost;
+                c['Valor Sobras (R$)'] = roundAuditMoney(c['Valor Sobras (R$)'] + p.sobraCost);
             });
 
             // 4. Criar workbook
             const wb = XLSX.utils.book_new();
 
             // Aba 1: Resumo Geral
-            const overallDiffCost = totalCountedCost - totalSysCost;
+            const overallDiffCost = roundAuditMoney(totalCountedCost - totalSysCost);
             const diffType = overallDiffCost < 0 ? 'Prejuízo (Falta)' : overallDiffCost > 0 ? 'Sobra (Excesso)' : 'Zero';
             const fmtCurrency = (value: number) => Number(value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
             const fmtInt = (value: number) => Math.round(Number(value || 0)).toLocaleString('pt-BR');
