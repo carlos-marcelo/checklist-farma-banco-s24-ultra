@@ -1141,6 +1141,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const lastAuditUpdateRef = useRef<string | null>(null);
     const activeFilialRef = useRef<string>('');
     const skipNextStockPromptRef = useRef(false);
+    const completedAuditConsultationRef = useRef(false);
 
     useEffect(() => {
         activeFilialRef.current = selectedFilial || '';
@@ -1303,6 +1304,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             if (isStaleRequest()) return;
             if (latest && latest.status !== 'completed') {
+                completedAuditConsultationRef.current = false;
                 let canAutoOpenActive = allowActiveAuditAutoOpen;
                 if (!canAutoOpenActive) {
                     if (silent) return;
@@ -1505,6 +1507,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setTermModal(null);
         setTermForm(null);
         setTermComparisonMetrics(null);
+        completedAuditConsultationRef.current = false;
         setIsReadOnlyCompletedView(false);
         setConsultingAuditNumber(null);
         setAllowActiveAuditAutoOpen(false);
@@ -2291,6 +2294,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 });
             }
             const reconciled = reconcileAuditStateFromCompletedScopes(payload);
+            completedAuditConsultationRef.current = false;
             setAllowActiveAuditAutoOpen(true);
             setConsultingAuditNumber(null);
             setIsReadOnlyCompletedView(false);
@@ -2362,6 +2366,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
 
             const payload = (target.data || {}) as AuditData;
+            completedAuditConsultationRef.current = true;
             if (payload.groups) {
                 payload.groups.forEach((g: any) => {
                     g.departments?.forEach((d: any) => {
@@ -2436,6 +2441,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 });
             }
             const reconciled = reconcileAuditStateFromCompletedScopes(payload);
+            completedAuditConsultationRef.current = false;
             setData(reconciled);
             setTermDrafts(((reconciled as any)?.termDrafts || {}) as Record<string, TermForm>);
             setNextAuditNumber(target.audit_number);
@@ -2795,7 +2801,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     useEffect(() => {
         if (!selectedFilial || !data || isProcessing || isUpdatingStock) return;
-        if (isReadOnlyCompletedView || consultingAuditNumber !== null) return;
+        const currentInventoryAuditNumber = getAuditNumberFromInventoryLabel((data as any)?.inventoryNumber);
+        const isCompletedLoadedFromHistory = branchAuditsHistory.some(item => {
+            if (item.status !== 'completed') return false;
+            if (dbSessionId && item.id === dbSessionId) return true;
+            return !!currentInventoryAuditNumber && Number(item.audit_number || 0) === currentInventoryAuditNumber;
+        });
+        if (
+            completedAuditConsultationRef.current ||
+            isReadOnlyCompletedView ||
+            consultingAuditNumber !== null ||
+            isCompletedLoadedFromHistory
+        ) {
+            return;
+        }
         if (!isMaster) return;
         if (fileStock) return; // upload local sempre prevalece
         if (!globalStockFile || !globalStockMeta) return;
@@ -2843,7 +2862,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         globalStockMeta,
         dbSessionId,
         isReadOnlyCompletedView,
-        consultingAuditNumber
+        consultingAuditNumber,
+        branchAuditsHistory
     ]);
 
     const handleStartAudit = async () => {
