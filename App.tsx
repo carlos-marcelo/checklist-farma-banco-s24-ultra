@@ -5065,7 +5065,11 @@ const App: React.FC = () => {
             alert('Módulo Pré-Vencidos está desativado por tempo indeterminado.');
             return;
         }
-        if ((view === 'logs' || view === 'cadastros_globais') && currentUser?.role !== 'MASTER') {
+        if (view === 'logs' && currentUser?.role !== 'MASTER' && currentUser?.role !== 'ADMINISTRATIVO') {
+            alert('Apenas usuários master ou administrativo podem acessar este módulo.');
+            return;
+        }
+        if (view === 'cadastros_globais' && currentUser?.role !== 'MASTER') {
             alert('Apenas usuários master podem acessar este módulo.');
             return;
         }
@@ -5393,10 +5397,13 @@ const App: React.FC = () => {
         setEventsDisplayLimit(50);
     }, [logsBranchFilter, logsAreaFilter, logsAppFilter, logsUserFilter, logsEventFilter, logsGroupRepeats]);
 
+    const canViewManagerMetrics =
+        currentUser?.role === 'MASTER' ||
+        currentUser?.role === 'ADMINISTRATIVO';
     const isMetricsInitialHydrating =
         currentView === 'logs' &&
-        currentUser?.role === 'MASTER' &&
-        (!hasLoadedLogsForMetrics || !hasLoadedSessionsForMetrics);
+        canViewManagerMetrics &&
+        (!hasLoadedLogsForMetrics || (currentUser?.role === 'MASTER' && !hasLoadedSessionsForMetrics));
     const remoteForceLogoutSecondsRemaining = remoteForceLogoutDeadline
         ? Math.max(0, Math.ceil((remoteForceLogoutDeadline - Date.now()) / 1000))
         : 0;
@@ -8795,7 +8802,7 @@ const App: React.FC = () => {
                     )}
 
                     {/* --- LOGS & EVENTOS VIEW --- */}
-                    {currentView === 'logs' && currentUser?.role === 'MASTER' && (
+                    {currentView === 'logs' && canViewManagerMetrics && (
                         <div className="max-w-6xl mx-auto space-y-10 animate-fade-in pb-24">
                             {isMetricsInitialHydrating ? (
                                 <div className="min-h-[320px] bg-white rounded-3xl border border-slate-200 shadow-sm flex items-center justify-center">
@@ -9146,6 +9153,7 @@ const App: React.FC = () => {
                             </div>
 
                             {/* --- MONITORAMENTO DE SESSÕES ATIVAS --- */}
+                            {currentUser?.role === 'MASTER' && (
                             <div className="bg-white rounded-3xl border border-gray-100 shadow-sm overflow-hidden mt-8">
                                 <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between bg-slate-50/50">
                                     <h3 className="text-sm font-black text-slate-800 uppercase tracking-widest flex items-center gap-2">
@@ -9334,6 +9342,7 @@ const App: React.FC = () => {
                                     </table>
                                 </div>
                             </div>
+                            )}
 
                             <div className="bg-white rounded-3xl border border-gray-100 shadow-sm overflow-hidden mt-8">
                                 <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
@@ -9729,10 +9738,10 @@ const App: React.FC = () => {
                             )}
                         </div>
                     )}
-                    {currentView === 'logs' && currentUser?.role !== 'MASTER' && (
+                    {currentView === 'logs' && !canViewManagerMetrics && (
                         <div className="max-w-4xl mx-auto p-10 text-center bg-white rounded-3xl border border-gray-100 shadow-sm">
                             <h2 className="text-xl font-black text-gray-800">Acesso restrito</h2>
-                            <p className="text-sm text-gray-500 mt-2">A aba Métricas Gerenciais está disponível apenas para usuários master.</p>
+                            <p className="text-sm text-gray-500 mt-2">A aba Métricas Gerenciais está disponível apenas para usuários master ou administrativo.</p>
                         </div>
                     )}
 

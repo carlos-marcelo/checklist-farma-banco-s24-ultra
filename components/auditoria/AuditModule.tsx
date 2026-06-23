@@ -112,9 +112,21 @@ const GROUP_CONFIG_DEFAULTS: Record<string, string> = {
     "10000": "Conveniência"
 };
 
+const PRODUCT_CLASSIFICATION_FIXES_BY_CODE: Record<string, { groupId: string; groupName: string; deptId: string; deptName: string; catId: string; catName: string }> = {
+    '86703': {
+        groupId: '10000',
+        groupName: 'Conveniência',
+        deptId: '114',
+        deptName: 'ELETRONICOS',
+        catId: '77',
+        catName: 'BAZAR'
+    }
+};
+
 // Classificação manual emergencial por código reduzido (prioridade máxima no termo).
 // Mantida aqui para evitar perda de classificação em casos de divergência entre fontes.
 const TERM_MANUAL_CLASSIFICATION_BY_CODE: Record<string, { groupId: string; deptId: string; catId: string }> = {
+    '86703': { groupId: '10000', deptId: '114', catId: '77' },
     '42609': { groupId: '3000', deptId: '120', catId: '111' },
     '50928': { groupId: '3000', deptId: '120', catId: '116' },
     '62148': { groupId: '2000', deptId: '120', catId: '129' },
@@ -423,6 +435,29 @@ const normalizeAuditDataStructure = (input?: AuditData | null): { data: AuditDat
     const deptKey = (d: Department) => digits((d as any).numericId || d.id) || raw(d.id) || label(d.name);
     const catKey = (c: Category) => raw(c.id) || digits((c as any).numericId) || label(c.name);
     const productKey = (p: Product) => normalizeProductCode((p as any).reducedCode || p.code) || raw(p.name);
+    const fixKey = (fix: { groupId: string; deptId: string; catId: string }) =>
+        `${fix.groupId}|${fix.deptId}|${fix.catId}`;
+    const isProductInFixedScope = (group: Group, dept: Department, cat: Category, fix: { groupId: string; deptId: string; deptName: string; catId: string; catName: string }) => {
+        const gMatch = (digits(group.id) || raw(group.id)) === fix.groupId;
+        const dMatch =
+            digits((dept as any).numericId || dept.id) === fix.deptId ||
+            label(dept.name) === label(fix.deptName);
+        const cMatch =
+            digits((cat as any).numericId || cat.id) === fix.catId ||
+            label(cat.name) === label(fix.catName);
+        return gMatch && dMatch && cMatch;
+    };
+    const recalcCategoryTotals = (cat: Category) => {
+        const totalQuantity = (cat.products || []).reduce((sum, p) => sum + Number(p.quantity || 0), 0);
+        const totalCost = (cat.products || []).reduce((sum, p) => sum + Number(p.quantity || 0) * Number(p.cost || 0), 0);
+        return {
+            ...cat,
+            itemsCount: (cat.products || []).length,
+            totalQuantity,
+            totalCost
+        };
+    };
+    const fixedProducts = new Map<string, { fix: typeof PRODUCT_CLASSIFICATION_FIXES_BY_CODE[string]; products: Product[] }>();
     const statusRank = (s: AuditStatus | string) => {
         const n = normalizeAuditStatus(s);
         if (n === AuditStatus.DONE) return 3;
@@ -474,6 +509,17 @@ const normalizeAuditDataStructure = (input?: AuditData | null): { data: AuditDat
                                 if (pKey) changed = true;
                                 return;
                             }
+                            const fixedScope = PRODUCT_CLASSIFICATION_FIXES_BY_CODE[pKey];
+                            if (fixedScope && !isProductInFixedScope(group, dept, cat, fixedScope)) {
+                                changed = true;
+                                const key = fixKey(fixedScope);
+                                const bucket = fixedProducts.get(key) || { fix: fixedScope, products: [] };
+                                if (!bucket.products.some(existing => productKey(existing) === pKey)) {
+                                    bucket.products.push({ ...p });
+                                }
+                                fixedProducts.set(key, bucket);
+                                return;
+                            }
                             seen.add(pKey);
                             deduped.push({ ...p });
                         });
@@ -497,6 +543,65 @@ const normalizeAuditDataStructure = (input?: AuditData | null): { data: AuditDat
                     }
                 }
             });
+        });
+    });
+
+    fixedProducts.forEach(({ fix, products }) => {
+        let targetGroup = nextGroups.find(g => (digits(g.id) || raw(g.id)) === fix.groupId);
+        if (!targetGroup) {
+            targetGroup = { id: fix.groupId, name: fix.groupName, departments: [] };
+            nextGroups.push(targetGroup);
+        }
+        let targetDept = targetGroup.departments.find(d =>
+            digits((d as any).numericId || d.id) === fix.deptId ||
+            label(d.name) === label(fix.deptName)
+        );
+        if (!targetDept) {
+            targetDept = { id: fix.deptId, numericId: fix.deptId, name: fix.deptName, categories: [] };
+            targetGroup.departments.push(targetDept);
+        } else if (!(targetDept as any).numericId) {
+            (targetDept as any).numericId = fix.deptId;
+        }
+        let targetCat = targetDept.categories.find(c =>
+            digits((c as any).numericId || c.id) === fix.catId ||
+            label(c.name) === label(fix.catName)
+        );
+        if (!targetCat) {
+            targetCat = {
+                id: `${fix.groupId}-${fix.deptId}-${fix.catId}`,
+                numericId: fix.catId,
+                name: fix.catName,
+                itemsCount: 0,
+                totalQuantity: 0,
+                totalCost: 0,
+                status: AuditStatus.TODO,
+                products: []
+            };
+            targetDept.categories.push(targetCat);
+        } else if (!targetCat.numericId) {
+            targetCat.numericId = fix.catId;
+        }
+
+        products.forEach(product => {
+            const pKey = productKey(product);
+            if (!targetCat!.products.some(existing => productKey(existing) === pKey)) {
+                targetCat!.products.push(product);
+            }
+        });
+    });
+
+    nextGroups.forEach(group => {
+        group.departments.forEach(dept => {
+            dept.categories = dept.categories
+                .map(recalcCategoryTotals)
+                .filter(cat => {
+                    if ((cat.products || []).length > 0) return true;
+                    return !isDiversosLabel(cat.name) && !isHierarchyPlaceholderName(cat.name, ['OUTROS', 'GERAL']);
+                });
+        });
+        group.departments = group.departments.filter(dept => {
+            if ((dept.categories || []).length > 0) return true;
+            return !isDiversosLabel(dept.name) && !isHierarchyPlaceholderName(dept.name, ['OUTROS', 'GERAL']);
         });
     });
 
@@ -1970,6 +2075,47 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             
             const remoteStrength = getAuditDataStrength((freshLatest?.data as AuditData) || null);
             const incomingGroupsCount = Array.isArray(incomingData?.groups) ? incomingData.groups.length : 0;
+            const getAuditShapeStats = (auditData: AuditData | null | undefined) => {
+                let groups = 0;
+                let departments = 0;
+                let categories = 0;
+                let products = 0;
+                let doneCategories = 0;
+                (auditData?.groups || []).forEach(g => {
+                    groups += 1;
+                    (g.departments || []).forEach(d => {
+                        departments += 1;
+                        (d.categories || []).forEach(c => {
+                            categories += 1;
+                            products += Array.isArray(c.products) ? c.products.length : 0;
+                            if (isDoneStatus(c.status)) doneCategories += 1;
+                        });
+                    });
+                });
+                return {
+                    groups,
+                    departments,
+                    categories,
+                    products,
+                    doneCategories,
+                    termDrafts: Object.keys(((auditData as any)?.termDrafts || {}) as Record<string, unknown>).length,
+                    partialStarts: Array.isArray((auditData as any)?.partialStarts) ? (auditData as any).partialStarts.length : 0,
+                    partialCompleted: Array.isArray((auditData as any)?.partialCompleted) ? (auditData as any).partialCompleted.length : 0
+                };
+            };
+            const incomingShape = getAuditShapeStats(incomingData);
+            const remoteShape = getAuditShapeStats((freshLatest?.data as AuditData) || null);
+            const isSameStructureShape =
+                incomingShape.groups === remoteShape.groups &&
+                incomingShape.departments === remoteShape.departments &&
+                incomingShape.categories === remoteShape.categories &&
+                incomingShape.products === remoteShape.products &&
+                incomingShape.products > 0;
+            const isPartialMarkerOnlyChange =
+                isSameStructureShape &&
+                incomingShape.doneCategories >= remoteShape.doneCategories &&
+                incomingShape.termDrafts >= remoteShape.termDrafts &&
+                incomingShape.partialCompleted >= remoteShape.partialCompleted;
             
             if (
                 !allowProgressRegression &&
@@ -1977,6 +2123,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 freshLatest.audit_number === session.audit_number &&
                 remoteStrength > 0 &&
                 incomingStrength < remoteStrength &&
+                !isPartialMarkerOnlyChange &&
                 (incomingStrength <= 0 || incomingGroupsCount === 0 || incomingProgress <= 0.1)
             ) {
                 const recovered = reconcileAuditStateFromCompletedScopes(freshLatest.data as AuditData);
@@ -2627,7 +2774,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     : /^\d+(?:-\d+)?(?:[.,]0+)?$/.test(text) || /[Ee+]/.test(text);
             if (!looksNumericCode) return;
             const code = normalizeBarcode(raw);
-            if (!code || code.length < 3) return;
+            const isReducedCodeColumn = index === 1;
+            if (!code || code.length < (isReducedCodeColumn ? 1 : 3)) return;
             if (GROUP_UPLOAD_IDS.includes(code as GroupUploadId) && index !== 1) return;
             candidates.add(code);
         };
@@ -3266,12 +3414,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const superClean = (str: unknown) => 
                 normalizeDescriptionKey(str).replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
 
-            const isStrictBarcode = (val: any) => {
+            const isStrictBarcode = (val: any, index?: number) => {
                 if (val == null || val === '') return false;
                 let s = String(val).trim().replace(/^'/, '');
                 if (/^\d+(?:-\d+)?(?:[.,]0+)?$/.test(s)) {
                     const numOnly = s.replace(/\D/g, '');
-                    return numOnly.length >= 3;
+                    return numOnly.length >= (index === 1 ? 1 : 3);
                 }
                 return false;
             };
@@ -3363,7 +3511,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     const deptData = { deptId: inlineDeptId, deptName: inlineDeptName };
 
                     for (let i = 0; i < Math.min(row.length, 20); i++) {
-                        if (isStrictBarcode(row[i])) {
+                        if (isStrictBarcode(row[i], i)) {
                             const red = normalizeBarcode(row[i]);
                             if (red) deptReportByReduced[red] = deptData;
                         }
@@ -3432,7 +3580,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     const catData = { catId: inlineCatId, catName: inlineCatName, deptName };
 
                     for (let i = 0; i < Math.min(row.length, 20); i++) {
-                        if (isStrictBarcode(row[i])) {
+                        if (isStrictBarcode(row[i], i)) {
                             const red = normalizeBarcode(row[i]);
                             if (red) catReportByReduced[red] = catData;
                         }
@@ -3456,6 +3604,75 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     list.push(scope);
                     bucket[key] = list;
                 }
+            };
+
+            const normalizeHierarchyLabel = (value: unknown) =>
+                normalizeLookupText(String(value ?? ''));
+            const isPlaceholderDeptName = (value: unknown) => {
+                const label = normalizeHierarchyLabel(value);
+                return !label || label === 'outros' || label === 'geral' || isDiversosLabel(String(value ?? ''));
+            };
+            const isPlaceholderCatName = (value: unknown) => {
+                const label = normalizeHierarchyLabel(value);
+                return !label || label === 'geral' || label === 'outros' || isDiversosLabel(String(value ?? ''));
+            };
+            const scopeFallbackBuckets = new Map<string, { scope: ProductScope; count: number }>();
+            const deptFallbackBuckets = new Map<string, { scope: ProductScope; count: number }>();
+            const groupFallbackScopeById: Record<string, ProductScope> = {};
+            const deptFallbackScopeByKey: Record<string, ProductScope> = {};
+            const upsertFallbackBucket = (
+                bucket: Map<string, { scope: ProductScope; count: number }>,
+                key: string,
+                scope: ProductScope
+            ) => {
+                if (!key) return;
+                const current = bucket.get(key);
+                if (current) {
+                    current.count += 1;
+                } else {
+                    bucket.set(key, { scope, count: 1 });
+                }
+            };
+            const registerFallbackScope = (scope: ProductScope) => {
+                if (!scope.groupId || isPlaceholderDeptName(scope.deptName) || isPlaceholderCatName(scope.catName)) return;
+                const groupKey = normalizeScopeId(scope.groupId);
+                if (!groupKey || !ALLOWED_IDS.includes(Number(groupKey))) return;
+                const scopeKey = `${groupKey}|${normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName)}|${normalizeScopeId(scope.catId) || normalizeHierarchyLabel(scope.catName)}`;
+                upsertFallbackBucket(scopeFallbackBuckets, scopeKey, scope);
+                const deptKey = `${groupKey}|${normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName)}|${scopeKey}`;
+                upsertFallbackBucket(deptFallbackBuckets, deptKey, scope);
+            };
+            const rebuildFallbackScopes = () => {
+                const bestByGroup = new Map<string, { scope: ProductScope; count: number }>();
+                scopeFallbackBuckets.forEach(entry => {
+                    const groupKey = normalizeScopeId(entry.scope.groupId);
+                    const current = bestByGroup.get(groupKey);
+                    if (!current || entry.count > current.count) bestByGroup.set(groupKey, entry);
+                });
+                bestByGroup.forEach((entry, groupKey) => {
+                    groupFallbackScopeById[groupKey] = entry.scope;
+                });
+
+                const bestByDept = new Map<string, { scope: ProductScope; count: number }>();
+                deptFallbackBuckets.forEach((entry, key) => {
+                    const [groupKey, deptKey] = key.split('|');
+                    const bestKey = `${groupKey}|${deptKey}`;
+                    const current = bestByDept.get(bestKey);
+                    if (!current || entry.count > current.count) bestByDept.set(bestKey, entry);
+                });
+                bestByDept.forEach((entry, key) => {
+                    deptFallbackScopeByKey[key] = entry.scope;
+                });
+            };
+            const getHierarchyFallbackScope = (scope: ProductScope) => {
+                const groupKey = normalizeScopeId(scope.groupId);
+                if (!groupKey) return null;
+                const deptKey = normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName);
+                if (deptKey) {
+                    const deptFallback = deptFallbackScopeByKey[`${groupKey}|${deptKey}`];
+                    if (deptFallback) return deptFallback;
+                }
+                return groupFallbackScopeById[groupKey] || null;
             };
 
             const groupFileRows = effectiveGroupFiles.map((entry, idx) => ({
@@ -3497,8 +3714,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
                     productCodeCandidates.forEach(codeCandidate => addScope(productsByReduced, codeCandidate, scope));
                     addScope(productsByName, productNameKey, scope);
+                    registerFallbackScope(scope);
                 });
             });
+
+            rebuildFallbackScopes();
 
             const stockAcc: Record<string, { q: number; costAmount: number; name: string; groupId: string }> = {};
             const groupsMap: Record<string, Group> = {};
@@ -3562,38 +3782,46 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const scopesByReduced = productsByReduced[reduced] || [];
                 const scopesByName = nameKey ? (productsByName[nameKey] || []) : [];
                 const scopes = scopesByReduced.length > 0 ? scopesByReduced : scopesByName;
+                const manualClassification = PRODUCT_CLASSIFICATION_FIXES_BY_CODE[reduced];
 
-                let chosenScope: ProductScope | null = null;
-                if (scopes.length > 0) {
-                    chosenScope = scopes.find(s => String(s.groupId) === String(acc.groupId)) || scopes[0];
-                } else {
-                    const catFallback = catReportByReduced[reduced] || (nameKey ? catReportByName[nameKey] : undefined);
-                    if (catFallback && acc.groupId && ALLOWED_IDS.includes(Number(acc.groupId))) {
-                        const deptFallback = parseHierarchyCell(catFallback.deptName, "OUTROS");
-                        chosenScope = {
-                            groupId: acc.groupId,
-                            groupName: GROUP_CONFIG_DEFAULTS[acc.groupId] || `Grupo ${acc.groupId}`,
-                            deptId: deptFallback.numericId,
-                            deptName: deptFallback.name || "OUTROS",
-                            catId: catFallback.catId || "",
-                            catName: catFallback.catName || "GERAL"
-                        };
+                let chosenScope: ProductScope | null = manualClassification
+                    ? { ...manualClassification }
+                    : null;
+                if (!chosenScope) {
+                    if (scopes.length > 0) {
+                        chosenScope = scopes.find(s => String(s.groupId) === String(acc.groupId)) || scopes[0];
+                    } else {
+                        const catFallback = catReportByReduced[reduced] || (nameKey ? catReportByName[nameKey] : undefined);
+                        if (catFallback && acc.groupId && ALLOWED_IDS.includes(Number(acc.groupId))) {
+                            const deptFallback = parseHierarchyCell(catFallback.deptName, "OUTROS");
+                            chosenScope = {
+                                groupId: acc.groupId,
+                                groupName: GROUP_CONFIG_DEFAULTS[acc.groupId] || `Grupo ${acc.groupId}`,
+                                deptId: deptFallback.numericId,
+                                deptName: deptFallback.name || "OUTROS",
+                                catId: catFallback.catId || "",
+                                catName: catFallback.catName || "GERAL"
+                            };
+                        }
                     }
                 }
                 if (!chosenScope) {
                     const hasAllowedStockGroup =
                         !!acc.groupId && ALLOWED_IDS.includes(Number(acc.groupId));
                     const fallbackGroupId = hasAllowedStockGroup ? acc.groupId : UNCLASSIFIED_GROUP_ID;
-                    chosenScope = {
-                        groupId: fallbackGroupId,
-                        groupName: hasAllowedStockGroup
-                            ? (GROUP_CONFIG_DEFAULTS[fallbackGroupId] || `Grupo ${fallbackGroupId}`)
-                            : UNCLASSIFIED_GROUP_NAME,
-                        deptId: '',
-                        deptName: UNCLASSIFIED_DEPT_NAME,
-                        catId: '',
-                        catName: UNCLASSIFIED_CAT_NAME
-                    };
+                    const groupFallback = hasAllowedStockGroup ? groupFallbackScopeById[normalizeScopeId(fallbackGroupId)] : null;
+                    chosenScope = groupFallback
+                        ? { ...groupFallback }
+                        : {
+                            groupId: fallbackGroupId,
+                            groupName: hasAllowedStockGroup
+                                ? (GROUP_CONFIG_DEFAULTS[fallbackGroupId] || `Grupo ${fallbackGroupId}`)
+                                : UNCLASSIFIED_GROUP_NAME,
+                            deptId: '',
+                            deptName: UNCLASSIFIED_DEPT_NAME,
+                            catId: '',
+                            catName: UNCLASSIFIED_CAT_NAME
+                        };
                 }
                 const resolvedScope: ProductScope = { ...chosenScope };
                 const deptByReduced = deptReportByReduced[reduced] || (nameKey ? deptReportByName[nameKey] : undefined);
@@ -3624,6 +3852,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 resolvedScope.deptId = deptParsed.numericId;
                             }
                         }
+                    }
+                }
+                const hierarchyFallback = getHierarchyFallbackScope(resolvedScope);
+                if (hierarchyFallback && (isPlaceholderDeptName(resolvedScope.deptName) || isPlaceholderCatName(resolvedScope.catName))) {
+                    if (isPlaceholderDeptName(resolvedScope.deptName)) {
+                        resolvedScope.deptId = hierarchyFallback.deptId;
+                        resolvedScope.deptName = hierarchyFallback.deptName;
+                    }
+                    if (isPlaceholderCatName(resolvedScope.catName)) {
+                        resolvedScope.catId = hierarchyFallback.catId;
+                        resolvedScope.catName = hierarchyFallback.catName;
                     }
                 }
 
@@ -6743,7 +6982,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const scopeCatsGuard = getScopeCategories(groupId, deptId, catId);
         const scopeOpenCats = scopeCatsGuard.filter(({ cat }) => !isDoneStatus(cat.status));
         if (scopeOpenCats.length === 0) {
-            alert("Este escopo já está 100% finalizado. A contagem parcial só pode incluir categorias pendentes.");
+            await toggleScopeStatus(groupId, deptId, catId);
             return;
         }
         const nowIso = new Date().toISOString();
@@ -6799,7 +7038,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 data: { ...nextData, termDrafts: composeTermDraftsForPersist((((nextData as any)?.termDrafts || {}) as Record<string, TermForm>), (((data as any)?.termDrafts || {}) as Record<string, TermForm>), termDrafts) } as any,
                 progress: progress,
                 user_email: userEmail
-            });
+            }, { allowProgressRegression: true });
             if (savedSession) {
                 await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
             }
@@ -8529,13 +8768,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             </button>
                                             <button
                                                 onClick={(e) => { e.stopPropagation(); startScopeAudit(group.id); }}
-                                                disabled={isComplete || !canUseAuditMasterTools}
-                                                className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all shadow-sm ${isComplete || !canUseAuditMasterTools
+                                                disabled={!canUseAuditMasterTools}
+                                                className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all shadow-sm ${!canUseAuditMasterTools
                                                     ? 'bg-slate-100 text-slate-300 border-slate-200 cursor-not-allowed'
+                                                    : isComplete
+                                                        ? 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-500 hover:text-white'
                                                     : groupHasInProgress
                                                         ? 'bg-blue-600 text-white border-blue-500'
                                                         : 'bg-blue-50 text-blue-600 border-blue-100 hover:bg-blue-600 hover:text-white'}`}
-                                                title={!canUseAuditMasterTools ? 'Apenas Master ou Administrativo pode iniciar grupo inteiro' : (isComplete ? 'Desmarque a conclusão para iniciar parcial' : (groupHasInProgress ? 'Desativar contagem parcial' : (groupHasStarted ? 'Retomar auditoria parcial' : 'Iniciar auditoria parcial')))}
+                                                title={!canUseAuditMasterTools ? 'Apenas Master ou Administrativo pode iniciar grupo inteiro' : (isComplete ? 'Desmarcar conclusão e reabrir parcial' : (groupHasInProgress ? 'Desativar contagem parcial' : (groupHasStarted ? 'Retomar auditoria parcial' : 'Iniciar auditoria parcial')))}
                                             >
                                                 <Activity className="w-5 h-5" />
                                             </button>
@@ -8643,15 +8884,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             </button>
                                             <button
                                                 onClick={() => startScopeAudit(selectedGroup?.id, dept.id)}
-                                                disabled={deptAllDone}
                                                 className={`px-3 py-2 rounded-xl border text-[10px] font-black uppercase transition-all shadow-sm ${deptAllDone
-                                                    ? 'bg-slate-100 text-slate-300 border-slate-200 cursor-not-allowed'
+                                                    ? 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-500 hover:text-white'
                                                     : deptHasInProgress
                                                         ? 'bg-blue-600 text-white border-blue-500'
                                                         : 'bg-blue-50 text-blue-600 border-blue-100 hover:bg-blue-600 hover:text-white'}`}
-                                                title={deptAllDone ? 'Desmarque a conclusão para iniciar parcial' : (deptHasInProgress ? 'Desativar contagem parcial' : (deptHasStarted ? 'Retomar auditoria parcial' : 'Iniciar auditoria parcial'))}
+                                                title={deptAllDone ? 'Desmarcar conclusão e reabrir parcial' : (deptHasInProgress ? 'Desativar contagem parcial' : (deptHasStarted ? 'Retomar auditoria parcial' : 'Iniciar auditoria parcial'))}
                                             >
-                                                {deptHasInProgress ? 'PAUSAR' : 'INICIAR'}
+                                                {deptAllDone ? 'REABRIR' : deptHasInProgress ? 'PAUSAR' : 'INICIAR'}
                                             </button>
                                             <button
                                                 onClick={() => toggleScopeStatus(selectedGroup?.id, dept.id)}
@@ -8714,7 +8954,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     }).map(cat => {
                         const catStatus = normalizeAuditStatus(cat.status);
                         const canFinalize = canUseAuditMasterTools && catStatus !== AuditStatus.TODO;
-                        const startLabel = catStatus === AuditStatus.IN_PROGRESS ? 'PAUSAR' : 'INICIAR';
+                        const startLabel = catStatus === AuditStatus.DONE ? 'REABRIR' : catStatus === AuditStatus.IN_PROGRESS ? 'PAUSAR' : 'INICIAR';
                         const catProgressValue = catStatus === AuditStatus.DONE ? 100 : catStatus === AuditStatus.IN_PROGRESS ? 50 : 0;
                         return (
                             <div key={cat.id} className={`p-4 sm:p-6 lg:p-8 rounded-[2rem] border-2 flex flex-col lg:flex-row items-stretch lg:items-center gap-4 sm:gap-6 lg:gap-10 transition-all hover:shadow-lg group ${catStatus === AuditStatus.DONE ? 'border-slate-200 bg-white' : catStatus === AuditStatus.IN_PROGRESS ? 'border-blue-200 bg-blue-50/40' : 'border-slate-50 bg-white'}`}>
@@ -8764,9 +9004,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     </button>
                                     <button
                                         onClick={() => startScopeAudit(selectedGroup?.id, selectedDept?.id, cat.id)}
-                                        disabled={catStatus === AuditStatus.DONE}
                                         className={`px-3 sm:px-5 py-2.5 sm:py-3 rounded-xl text-[10px] font-black uppercase transition-all border shadow-sm ${catStatus === AuditStatus.DONE
-                                            ? 'bg-slate-100 text-slate-300 border-slate-200 cursor-not-allowed'
+                                            ? 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-500 hover:text-white'
                                             : catStatus === AuditStatus.IN_PROGRESS
                                                 ? 'bg-blue-600 text-white border-blue-500'
                                                 : 'bg-blue-50 text-blue-600 border-blue-100 hover:bg-blue-600 hover:text-white'}`}
@@ -8790,7 +9029,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     {view.level === 'products' && selectedCat && (() => {
                         const catStatus = normalizeAuditStatus(selectedCat.status);
                         const canFinalize = canUseAuditMasterTools && catStatus !== AuditStatus.TODO;
-                        const startLabel = catStatus === AuditStatus.IN_PROGRESS ? 'PAUSAR' : 'INICIAR';
+                        const startLabel = catStatus === AuditStatus.DONE ? 'REABRIR' : catStatus === AuditStatus.IN_PROGRESS ? 'PAUSAR' : 'INICIAR';
                         return (
                             <div className="bg-white rounded-[2rem] sm:rounded-[3rem] shadow-2xl overflow-hidden border border-slate-200">
                                 <div className="bg-slate-900 p-4 sm:p-6 lg:p-10 text-white flex flex-col gap-4 lg:flex-row lg:justify-between lg:items-center relative">
@@ -8822,9 +9061,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         </button>
                                         <button
                                             onClick={() => startScopeAudit(selectedGroup?.id, selectedDept?.id, selectedCat.id)}
-                                            disabled={catStatus === AuditStatus.DONE}
                                             className={`px-3 sm:px-5 py-2.5 sm:py-4 rounded-xl sm:rounded-2xl font-black text-[10px] sm:text-[11px] uppercase tracking-wider sm:tracking-widest shadow-xl transition-all active:scale-95 border ${catStatus === AuditStatus.DONE
-                                                ? 'bg-slate-100 text-slate-300 border-slate-200 cursor-not-allowed'
+                                                ? 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-500 hover:text-white'
                                                 : catStatus === AuditStatus.IN_PROGRESS
                                                     ? 'bg-blue-600 text-white border-blue-500'
                                                     : 'bg-blue-50 text-blue-600 border-blue-100 hover:bg-blue-600 hover:text-white'}`}

@@ -55,6 +55,7 @@ export const Topbar: React.FC<TopbarProps> = ({
     const isMaster = currentUser.role === 'MASTER';
     const isAdmin = currentUser.role === 'ADMINISTRATIVO';
     const canViewAnalise = isMaster || isAdmin;
+    const canViewMetrics = isMaster || isAdmin;
     const navItems = [
         { label: 'Dashboard', view: 'dashboard', color: 'blue', icon: <LayoutDashboard size={18} />, shortcut: 'Shift + D' },
         ...(canViewAnalise ? [{ label: 'Análise de Resultados', view: 'analise_resultados', color: 'blue', icon: <LineChart size={18} /> }] : []),
@@ -65,9 +66,9 @@ export const Topbar: React.FC<TopbarProps> = ({
         { label: 'Histórico', view: 'history', color: 'purple', icon: <History size={18} />, shortcut: 'Shift + H' },
         { label: 'Suporte', view: 'support', color: 'rose', icon: <MessageSquareQuote size={18} /> }
     ].concat(PRE_VENCIDOS_MODULE_ENABLED ? [{ label: 'Pré-Vencidos', view: 'pre', color: 'amber', icon: <Package size={18} />, shortcut: 'Shift + V' }] : [])
-    .filter(item => (item.view !== 'logs' || isMaster));
+    .filter(item => (item.view !== 'logs' || canViewMetrics));
 
-    if (isMaster) {
+    if (canViewMetrics) {
         navItems.splice(navItems.findIndex(item => item.view === 'support'), 0, { label: 'Métricas Gerenciais', view: 'logs', color: 'slate', icon: <FileSearch size={18} />, shortcut: 'Shift + M' });
     }
 
@@ -91,12 +92,14 @@ export const Topbar: React.FC<TopbarProps> = ({
         if (PRE_VENCIDOS_MODULE_ENABLED) {
             map.v = 'pre';
         }
-        if (isMaster) {
+        if (canViewMetrics) {
             map.m = 'logs';
+        }
+        if (isMaster) {
             map.b = 'cadastros_globais';
         }
         return map;
-    }, [isMaster]);
+    }, [canViewMetrics, isMaster]);
 
     useEffect(() => {
         const isEditableTarget = (target: EventTarget | null) => {
