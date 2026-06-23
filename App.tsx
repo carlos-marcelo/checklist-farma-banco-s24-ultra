@@ -4236,6 +4236,9 @@ const App: React.FC = () => {
 
     // --- VALIDATION & SCORING LOGIC ---
 
+    const hasChecklistValue = (value: unknown) => value !== '' && value !== null && value !== undefined;
+    const isScoredChecklistValue = (value: unknown) => value === 'pass' || value === 'fail';
+
     const getSectionStatus = (section: ChecklistSection, checklistId = activeChecklistId) => {
         let totalItems = 0;
         let answeredItems = 0;
@@ -4247,12 +4250,14 @@ const App: React.FC = () => {
             if (item.type !== InputType.HEADER && item.type !== InputType.INFO) {
                 totalItems++;
                 const val = getInputValue(item.id, checklistId);
-                if (val !== '' && val !== null && val !== undefined) {
+                if (hasChecklistValue(val)) {
                     answeredItems++;
                 }
                 if (item.type === InputType.BOOLEAN_PASS_FAIL) {
-                    scoreableItems++;
-                    if (val !== '' && val !== null && val !== undefined) {
+                    if (val !== 'na') {
+                        scoreableItems++;
+                    }
+                    if (isScoredChecklistValue(val)) {
                         scoreTotal++;
                         if (val === 'pass') scorePassed++;
                     }
@@ -4301,17 +4306,20 @@ const App: React.FC = () => {
                 const val = getInputValue(item.id, checklistId);
 
                 // Check for missing required items
-                if (item.required && (val === '' || val === null || val === undefined)) {
+                if (item.required && !hasChecklistValue(val)) {
                     missingItems.push({ text: item.text, section: section.title });
                 }
 
                 if (item.type === InputType.BOOLEAN_PASS_FAIL) {
-                    totalBoolean++;
+                    if (isScoredChecklistValue(val)) {
+                        totalBoolean++;
+                    }
+
                     if (val === 'pass') {
                         passed++;
                     } else if (val === 'fail') {
                         failedItems.push({ text: item.text, section: section.title });
-                    } else if (val === '' || val === null || val === undefined) {
+                    } else if (!hasChecklistValue(val)) {
                         // Track unanswered items that are not strictly required but impact score
                         unansweredItems.push({ text: item.text, section: section.title });
                     }
