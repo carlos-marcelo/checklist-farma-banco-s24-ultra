@@ -2376,6 +2376,13 @@ const App: React.FC = () => {
                 }
                 return;
             }
+            if (currentUser.role === 'ADMINISTRATIVO' && String(currentUser.area || '').trim()) {
+                if (!cancelled) {
+                    setShowBranchSelectionModal(false);
+                    setBranchPromptCheckedForUser(currentUser.email);
+                }
+                return;
+            }
             if (currentUser.company_id && companies.length === 0) return;
             if (branchPromptCheckedForUser === currentUser.email) return;
 
@@ -5632,21 +5639,40 @@ const App: React.FC = () => {
 
     const dashboardAuditBranchCandidates = useMemo(() => {
         const set = new Set<string>();
-        if (currentUser?.filial) {
+        const isAreaScopedAdmin = currentUser?.role === 'ADMINISTRATIVO' && !!String(currentUser.area || '').trim();
+        const adminArea = String(currentUser?.area || '').trim().toLocaleLowerCase('pt-BR');
+        const isAllowedAuditArea = (areaName?: string | null) =>
+            !isAreaScopedAdmin || String(areaName || '').trim().toLocaleLowerCase('pt-BR') === adminArea;
+        const isAllowedAuditBranch = (branchName?: string | null) => {
+            if (!isAreaScopedAdmin) return true;
+            const normalizedBranch = normalizeBranchLabel(branchName).toLocaleLowerCase('pt-BR');
+            return scopedCompanies.some(c =>
+                (c.areas || []).some((area: any) =>
+                    isAllowedAuditArea(area?.name) &&
+                    (area.branches || []).some((branch: string) =>
+                        normalizeBranchLabel(branch).toLocaleLowerCase('pt-BR') === normalizedBranch
+                    )
+                )
+            );
+        };
+
+        if (currentUser?.filial && isAllowedAuditBranch(currentUser.filial)) {
             buildBranchQueryVariants(currentUser.filial).forEach(v => set.add(v));
         }
         scopedUsers.forEach(u => {
+            if (!isAllowedAuditArea(u.area)) return;
             buildBranchQueryVariants(u.filial || '').forEach(v => set.add(v));
         });
         scopedCompanies.forEach(c => {
             (c.areas || []).forEach((area: any) => {
+                if (!isAllowedAuditArea(area?.name)) return;
                 (area.branches || []).forEach((branch: string) => {
                     buildBranchQueryVariants(branch).forEach(v => set.add(v));
                 });
             });
         });
         return Array.from(set);
-    }, [currentUser?.filial, scopedUsers, scopedCompanies]);
+    }, [currentUser?.filial, currentUser?.role, currentUser?.area, scopedUsers, scopedCompanies]);
 
     const loadDashboardAuditSessions = useCallback(async () => {
         if (!currentUser) return;
@@ -7520,6 +7546,9 @@ const App: React.FC = () => {
                                 userEmail={currentUser?.email || ''}
                                 userName={currentUser?.name || ''}
                                 userRole={currentUser?.role || 'USER'}
+                                userCompanyId={currentUser?.company_id || null}
+                                userArea={currentUser?.area || null}
+                                userFilial={currentUser?.filial || null}
                                 companies={companies}
                                 initialFilial={auditJumpFilial}
                             />

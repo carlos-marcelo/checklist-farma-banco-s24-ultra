@@ -82,6 +82,26 @@ const AUDIT_CAT_IDS_GLOBAL_KEY = 'audit_ids_categoria';
 const ALLOWED_IDS = GROUP_UPLOAD_IDS.map(id => Number(id));
 const FILIAIS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18];
 
+const normalizeAreaName = (value?: string | null) =>
+    String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('pt-BR');
+
+const toAuditBranchValue = (value?: string | number | null) => {
+    const raw = String(value || '').trim();
+    const digits = raw.match(/\d+/g)?.join('') || '';
+    return digits || raw;
+};
+
+const compareAuditBranchValues = (a: string, b: string) => {
+    const numA = Number(toAuditBranchValue(a));
+    const numB = Number(toAuditBranchValue(b));
+    const hasNumA = Number.isFinite(numA) && numA > 0;
+    const hasNumB = Number.isFinite(numB) && numB > 0;
+    if (hasNumA && hasNumB && numA !== numB) return numA - numB;
+    if (hasNumA && !hasNumB) return -1;
+    if (!hasNumA && hasNumB) return 1;
+    return String(a).localeCompare(String(b), 'pt-BR');
+};
+
 const GROUP_CONFIG_DEFAULTS: Record<string, string> = {
     "2000": "Medicamentos Similar",
     "3000": "Medicamentos RX",
@@ -1025,14 +1045,18 @@ interface AuditModuleProps {
     userEmail: string;
     userName: string;
     userRole: string;
+    userCompanyId?: string | null;
+    userArea?: string | null;
+    userFilial?: string | null;
     companies: any[];
     initialFilial?: string;
 }
 
-const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, companies, initialFilial }) => {
+const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, userCompanyId, userArea, userFilial, companies, initialFilial }) => {
     const isMaster = userRole === 'MASTER';
     const isAdmin = userRole === 'ADMINISTRATIVO';
-    const canManageAuditLifecycle = isMaster || isAdmin;
+    const canUseAuditMasterTools = isMaster || isAdmin;
+    const canManageAuditLifecycle = canUseAuditMasterTools;
     const [data, setData] = useState<AuditData | null>(null);
     const [view, setView] = useState<ViewState>({ level: 'groups' });
     const [isProcessing, setIsProcessing] = useState(false);
@@ -1116,8 +1140,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const auditLookupInputRef = useRef<HTMLInputElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
     const [selectedEmpresa, setSelectedEmpresa] = useState("Drogaria Cidade");
-    const [selectedFilial, setSelectedFilial] = useState(String(initialFilial || '').trim());
-    const selectedCompany = useMemo(() => companies.find(c => c.name === selectedEmpresa), [companies, selectedEmpresa]);
+    const [selectedFilial, setSelectedFilial] = useState(toAuditBranchValue(initialFilial || userFilial || ''));
+    const allowedCompanies = useMemo(() => {
+        if (isMaster || !userCompanyId) return companies;
+        const scoped = companies.filter(c => c.id === userCompanyId);
+        return scoped.length > 0 ? scoped : companies;
+    }, [companies, isMaster, userCompanyId]);
+    const selectedCompany = useMemo(() => allowedCompanies.find(c => c.name === selectedEmpresa) || allowedCompanies[0], [allowedCompanies, selectedEmpresa]);
+    const allowedAuditBranches = useMemo(() => {
+        if (isMaster) return FILIAIS.map(f => String(f));
+
+        const allowed = new Set<string>();
+        const normalizedUserArea = normalizeAreaName(userArea);
+        (selectedCompany?.areas || []).forEach((area: any) => {
+            if (normalizedUserArea && normalizeAreaName(area?.name) !== normalizedUserArea) return;
+            (area?.branches || []).forEach((branch: string) => {
+                const value = toAuditBranchValue(branch);
+                if (value) allowed.add(value);
+            });
+        });
+
+        const userBranch = toAuditBranchValue(userFilial || '');
+        if (!normalizedUserArea && userBranch) allowed.add(userBranch);
+
+        return Array.from(allowed).sort(compareAuditBranchValues);
+    }, [isMaster, selectedCompany?.areas, userArea, userFilial]);
+    const allowedAuditBranchSet = useMemo(() => new Set(allowedAuditBranches), [allowedAuditBranches]);
     const [branchAuditsHistory, setBranchAuditsHistory] = useState<DbAuditSession[]>([]);
     const [isLoadingBranchAudits, setIsLoadingBranchAudits] = useState(false);
     const [showCompletedAuditsModal, setShowCompletedAuditsModal] = useState(false);
@@ -1146,11 +1194,30 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     useEffect(() => {
         activeFilialRef.current = selectedFilial || '';
     }, [selectedFilial]);
+
     useEffect(() => {
-        const normalized = String(initialFilial || '').trim();
+        if (allowedCompanies.length === 0) return;
+        if (allowedCompanies.some(c => c.name === selectedEmpresa)) return;
+        setSelectedEmpresa(String(allowedCompanies[0]?.name || ''));
+    }, [allowedCompanies, selectedEmpresa]);
+
+    useEffect(() => {
+        const normalized = toAuditBranchValue(initialFilial || '');
         if (!normalized) return;
+        if (!isMaster && allowedAuditBranches.length > 0 && !allowedAuditBranchSet.has(normalized)) return;
         setSelectedFilial(prev => (prev === normalized ? prev : normalized));
-    }, [initialFilial]);
+    }, [initialFilial, isMaster, allowedAuditBranches.length, allowedAuditBranchSet]);
+
+    useEffect(() => {
+        if (isMaster || !selectedFilial || allowedAuditBranches.length === 0) return;
+        if (allowedAuditBranchSet.has(toAuditBranchValue(selectedFilial))) return;
+        setSelectedFilial('');
+        setData(null);
+        setDbSessionId(undefined);
+        setAllowActiveAuditAutoOpen(false);
+        setIsReadOnlyCompletedView(false);
+        setConsultingAuditNumber(null);
+    }, [isMaster, selectedFilial, allowedAuditBranches.length, allowedAuditBranchSet]);
 
     const loadAuditNum = useCallback(async (silent: boolean = false) => {
         if (!selectedFilial) return;
@@ -1309,7 +1376,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 if (!canAutoOpenActive) {
                     if (silent) return;
                     canAutoOpenActive = true;
-                    if (isMaster) {
+                    if (canUseAuditMasterTools) {
                         try {
                             const history = await fetchAuditsHistory(requestedFilial);
                             const completedCount = history.filter(item => item.status === 'completed').length;
@@ -1410,7 +1477,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             return { latestStockTs: officialUploadRaw || bestRaw, hasNewerGlobalStock };
                         };
 
-                        if (isMaster) {
+                        if (canUseAuditMasterTools) {
                             if ((isNewSession || !data) && !alreadyConfirmed) {
                                 const { latestStockTs, hasNewerGlobalStock } = resolveLatestStockTimestampForPrompt(
                                     latest.data?.sourceFiles?.stock?.syncedAt || latest.data?.sourceFiles?.lastStockUpdateAt || latest.created_at
@@ -1495,7 +1562,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } catch (error) {
             console.error('Error loading audit info:', error);
         }
-    }, [selectedFilial, selectedCompany?.id, dbSessionId, isMaster, data, isUpdatingStock, isReadOnlyCompletedView, consultingAuditNumber, allowActiveAuditAutoOpen]);
+    }, [selectedFilial, selectedCompany?.id, dbSessionId, canUseAuditMasterTools, data, isUpdatingStock, isReadOnlyCompletedView, consultingAuditNumber, allowActiveAuditAutoOpen]);
 
     // Carga Inicial
     useEffect(() => {
@@ -2029,7 +2096,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         // Usuário não-master também pode preencher assinaturas/termos.
         // Faz persistência rápida em background antes de limpar a UI.
-        if (!isMaster) {
+        if (!canUseAuditMasterTools) {
             if (!isReadOnlyCompletedView && data) {
                 const snapshotData = ({ ...data, termDrafts: composeTermDraftsForPersist(((data as any)?.termDrafts || {}) as Record<string, TermForm>, termDrafts) } as any);
                 const snapshotSessionId = dbSessionId;
@@ -2220,8 +2287,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     };
 
     const reopenAuditByNumber = async (targetAuditNumber: number) => {
-        if (!isMaster) {
-            alert("Somente Master pode reabrir inventário.");
+        if (!canUseAuditMasterTools) {
+            alert("Somente Master ou Administrativo pode reabrir inventário.");
             return false;
         }
         if (!selectedFilial) {
@@ -2316,8 +2383,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     };
 
     const handleReopenAudit = async () => {
-        if (!isMaster) {
-            alert("Somente Master pode reabrir inventário.");
+        if (!canUseAuditMasterTools) {
+            alert("Somente Master ou Administrativo pode reabrir inventário.");
             return;
         }
         if (!selectedFilial) {
@@ -2388,7 +2455,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setView({ level: 'groups' });
             setShowCompletedAuditsModal(false);
             alert(
-                isMaster
+                canUseAuditMasterTools
                     ? `Inventário Nº ${targetAuditNumber} aberto. Você está no modo de consulta de inventário concluído.`
                     : `Inventário Nº ${targetAuditNumber} aberto em modo consulta (sem edição).`
             );
@@ -2460,8 +2527,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     };
 
     const handleDeleteCurrentAudit = async () => {
-        if (!isMaster) {
-            alert("Somente Master pode excluir inventário.");
+        if (!canUseAuditMasterTools) {
+            alert("Somente Master ou Administrativo pode excluir inventário.");
             return;
         }
         if (!selectedFilial) {
@@ -2815,7 +2882,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         ) {
             return;
         }
-        if (!isMaster) return;
+        if (!canUseAuditMasterTools) return;
         if (fileStock) return; // upload local sempre prevalece
         if (!globalStockFile || !globalStockMeta) return;
 
@@ -2856,7 +2923,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         data,
         isProcessing,
         isUpdatingStock,
-        isMaster,
+        canUseAuditMasterTools,
         fileStock,
         globalStockFile,
         globalStockMeta,
@@ -3136,7 +3203,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const safePartialStarts = Array.isArray(data?.partialStarts) ? data.partialStarts : [];
             let syncedGlobalStockAt: string | null = null;
 
-            if (isMaster && selectedCompany?.id && selectedFilial && fileStock) {
+            if (canUseAuditMasterTools && selectedCompany?.id && selectedFilial && fileStock) {
                 try {
                     const stockDataUrl = await new Promise<string>((resolve, reject) => {
                         const reader = new FileReader();
@@ -5653,8 +5720,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             alert("Modo consulta ativo: não é possível remover Excel de termo.");
             return;
         }
-        if (!isMaster) {
-            alert("Apenas usuário master pode remover planilha do termo.");
+        if (!canUseAuditMasterTools) {
+            alert("Apenas Master ou Administrativo pode remover planilha do termo.");
             return;
         }
         setTermComparisonMetrics(null);
@@ -5729,7 +5796,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
             if (nextData) setData(nextData);
 
-            if (isMaster && nextData) {
+            if (canUseAuditMasterTools && nextData) {
                 const savedSession = await persistAuditSession({
                     id: dbSessionId,
                     branch: selectedFilial,
@@ -6573,8 +6640,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             return;
         }
         if (!data?.partialStarts || data.partialStarts.length === 0) return;
-        if (!isMaster) {
-            alert("Apenas usuário master pode concluir contagens parciais.");
+        if (!canUseAuditMasterTools) {
+            alert("Apenas Master ou Administrativo pode concluir contagens parciais.");
             return;
         }
         if (!window.confirm("Deseja concluir todas as contagens parciais ativas?")) return;
@@ -6654,7 +6721,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             console.error("Error finalizing partials:", err);
             alert("Erro ao concluir contagens parciais no Supabase.");
         }
-    }, [data, dbSessionId, selectedFilial, nextAuditNumber, applyPartialScopes, calculateProgress, isMaster, isReadOnlyCompletedView]);
+    }, [data, dbSessionId, selectedFilial, nextAuditNumber, applyPartialScopes, calculateProgress, canUseAuditMasterTools, isReadOnlyCompletedView]);
 
     const clearActivePartialsShortcut = useCallback(async () => {
         if (isReadOnlyCompletedView) {
@@ -6763,8 +6830,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             return;
         }
         if (!data) return;
-        if (!isMaster) {
-            alert("Apenas usuário master pode concluir ou desativar contagens parciais.");
+        if (!canUseAuditMasterTools) {
+            alert("Apenas Master ou Administrativo pode concluir ou desativar contagens parciais.");
             return;
         }
 
@@ -7398,7 +7465,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setAuditLookupOpen(false);
     }, []);
     const termScopeInfo = useMemo(() => (termModal ? buildTermScopeInfo(termModal) : null), [termModal, data]);
-    const canEditTerm = isMaster && !isReadOnlyCompletedView;
+    const canEditTerm = canUseAuditMasterTools && !isReadOnlyCompletedView;
     const canFillTermSignatures = !isReadOnlyCompletedView;
     const partialInfoList = useMemo(() => {
         if (!data?.partialStarts || data.partialStarts.length === 0) return [];
@@ -7670,15 +7737,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             <div className="space-y-1">
                                 <label className="text-[10px] font-black uppercase text-slate-400">Empresa</label>
                                 <select className="w-full bg-slate-50 border-2 rounded-xl px-4 py-3 font-bold border-slate-100" value={selectedEmpresa} onChange={e => setSelectedEmpresa(e.target.value)}>
-                                    <option>Drogaria Cidade</option>
-                                    {companies.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+                                    {allowedCompanies.length === 0 && <option>Drogaria Cidade</option>}
+                                    {allowedCompanies.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
                                 </select>
                             </div>
                             <div className="space-y-1">
                                 <label className="text-[10px] font-black uppercase text-slate-400">Selecione a Filial</label>
                                 <select className="w-full bg-slate-50 border-2 rounded-xl px-4 py-3 font-bold border-slate-100" value={selectedFilial} onChange={e => setSelectedFilial(e.target.value)}>
                                     <option value="">Selecione...</option>
-                                    {FILIAIS.map(f => <option key={f} value={f.toString()}>Filial {f}</option>)}
+                                    {allowedAuditBranches.map(f => <option key={f} value={f}>Filial {f}</option>)}
                                 </select>
                             </div>
                             <div className="space-y-1">
@@ -7690,7 +7757,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 </div>
                             </div>
                         </div>
-                        {selectedFilial && isMaster && (
+                        {selectedFilial && canUseAuditMasterTools && (
                             <div className="rounded-2xl border border-indigo-100 bg-indigo-50/40 px-4 py-4 space-y-3">
                                 <div className="flex flex-wrap items-center justify-between gap-2">
                                     <div>
@@ -7712,13 +7779,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     <button
                                         type="button"
                                         onClick={handleStartAudit}
-                                        disabled={isProcessing || !isMaster || !!latestOpenAudit}
-                                        className={`px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${isProcessing || !isMaster || !!latestOpenAudit
+                                        disabled={isProcessing || !canUseAuditMasterTools || !!latestOpenAudit}
+                                        className={`px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${isProcessing || !canUseAuditMasterTools || !!latestOpenAudit
                                             ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
                                             : 'bg-indigo-600 text-white hover:bg-indigo-500'}`}
                                         title={
-                                            !isMaster
-                                                ? 'Somente Master cria novo inventário'
+                                            !canUseAuditMasterTools
+                                                ? 'Somente Master ou Administrativo cria novo inventário'
                                                 : latestOpenAudit
                                                     ? `Existe inventário aberto Nº ${latestOpenAudit.audit_number}`
                                                     : `Criar novo inventário automático Nº ${nextAuditNumber}`
@@ -7775,12 +7842,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 return (
                                     <label
                                         key={`group-upload-${groupId}`}
-                                        className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!isMaster || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}
+                                        className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}
                                     >
                                         <input
                                             type="file"
                                             className="hidden"
-                                            disabled={!isMaster || structureLocked}
+                                            disabled={!canUseAuditMasterTools || structureLocked}
                                             onChange={e => setGroupFile(groupId, e.target.files?.[0] || null)}
                                         />
                                         <FileSpreadsheet className={`mx-auto w-6 h-6 mb-1 ${effectiveFile ? 'text-emerald-500' : 'text-slate-300'}`} />
@@ -7801,8 +7868,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 );
                             })}
 
-                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${!isMaster ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveStockFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
-                                <input type="file" className="hidden" disabled={!isMaster} onChange={e => setFileStock(e.target.files?.[0] || null)} />
+                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${!canUseAuditMasterTools ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveStockFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
+                                <input type="file" className="hidden" disabled={!canUseAuditMasterTools} onChange={e => setFileStock(e.target.files?.[0] || null)} />
                                 <FileSpreadsheet className={`mx-auto w-6 h-6 mb-1 ${effectiveStockFile ? 'text-emerald-500' : 'text-slate-300'}`} />
                                 <p className="text-[8px] font-black uppercase truncate">{fileStock ? fileStock.name : effectiveStockFile ? effectiveStockFile.name : 'Saldos'}</p>
                                 <p className="text-[8px] font-bold text-slate-500 mt-1">
@@ -7819,8 +7886,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 )}
                             </label>
 
-                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!isMaster || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveDeptIdsFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
-                                <input type="file" className="hidden" disabled={!isMaster || structureLocked} onChange={e => setFileDeptIds(e.target.files?.[0] || null)} />
+                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveDeptIdsFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
+                                <input type="file" className="hidden" disabled={!canUseAuditMasterTools || structureLocked} onChange={e => setFileDeptIds(e.target.files?.[0] || null)} />
                                 <FileSpreadsheet className={`mx-auto w-6 h-6 mb-1 ${effectiveDeptIdsFile ? 'text-emerald-500' : 'text-slate-300'}`} />
                                 <p className="text-[8px] font-black uppercase truncate">{fileDeptIds ? fileDeptIds.name : effectiveDeptIdsFile ? effectiveDeptIdsFile.name : 'IDs Depto (opcional)'}</p>
                                 <p className="text-[8px] font-bold text-slate-500 mt-1">
@@ -7837,8 +7904,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 )}
                             </label>
 
-                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!isMaster || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveCatIdsFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
-                                <input type="file" className="hidden" disabled={!isMaster || structureLocked} onChange={e => setFileCatIds(e.target.files?.[0] || null)} />
+                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveCatIdsFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
+                                <input type="file" className="hidden" disabled={!canUseAuditMasterTools || structureLocked} onChange={e => setFileCatIds(e.target.files?.[0] || null)} />
                                 <FileSpreadsheet className={`mx-auto w-6 h-6 mb-1 ${effectiveCatIdsFile ? 'text-emerald-500' : 'text-slate-300'}`} />
                                 <p className="text-[8px] font-black uppercase truncate">{fileCatIds ? fileCatIds.name : effectiveCatIdsFile ? effectiveCatIdsFile.name : 'IDs Cat (opcional)'}</p>
                                 <p className="text-[8px] font-bold text-slate-500 mt-1">
@@ -7868,18 +7935,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             Classificação: cruza <span className="text-slate-700">Estoque B</span> com <span className="text-slate-700">Cadastro K</span> (fallback por código reduzido), e lê <span className="text-slate-700">Departamento S</span> + <span className="text-slate-700">Categoria W</span>.
                         </p>
                         <div className="space-y-3">
-                            <button onClick={handleStartAudit} disabled={isProcessing || !isMaster} className={`w-full py-4 rounded-xl text-white font-black uppercase tracking-widest transition-all shadow-xl active:scale-95 ${isProcessing || !isMaster ? 'bg-slate-300 cursor-not-allowed' : 'bg-slate-900 hover:bg-indigo-600'}`}>
+                            <button onClick={handleStartAudit} disabled={isProcessing || !canUseAuditMasterTools} className={`w-full py-4 rounded-xl text-white font-black uppercase tracking-widest transition-all shadow-xl active:scale-95 ${isProcessing || !canUseAuditMasterTools ? 'bg-slate-300 cursor-not-allowed' : 'bg-slate-900 hover:bg-indigo-600'}`}>
                                 {isProcessing
                                     ? 'Sincronizando Banco de Dados...'
-                                    : isMaster
+                                    : canUseAuditMasterTools
                                         ? (isUpdatingStock
                                             ? 'Atualizar Somente Saldos'
-                                            : 'Iniciar Inventário Master')
-                                        : 'Apenas Master pode Iniciar'}
+                                            : 'Iniciar Inventário')
+                                        : 'Apenas Master ou Administrativo pode Iniciar'}
                             </button>
-                            <button onClick={handleLoadFromTrier} disabled={isTrierLoading || !isMaster} className={`w-full py-4 rounded-xl text-white font-black uppercase tracking-widest transition-all shadow-xl active:scale-95 flex items-center justify-center gap-2 ${isTrierLoading || !isMaster ? 'bg-slate-300 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-500'}`}>
+                            <button onClick={handleLoadFromTrier} disabled={isTrierLoading || !canUseAuditMasterTools} className={`w-full py-4 rounded-xl text-white font-black uppercase tracking-widest transition-all shadow-xl active:scale-95 flex items-center justify-center gap-2 ${isTrierLoading || !canUseAuditMasterTools ? 'bg-slate-300 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-500'}`}>
                                 <Activity className="w-5 h-5" />
-                                {isTrierLoading ? 'Carregando do Trier...' : isMaster ? 'Carregar direto do Trier (tempo real)' : 'Apenas Master pode Carregar'}
+                                {isTrierLoading ? 'Carregando do Trier...' : canUseAuditMasterTools ? 'Carregar direto do Trier (tempo real)' : 'Apenas Master ou Administrativo pode Carregar'}
                             </button>
                             {trierError && (
                                 <div className="flex items-center justify-between gap-3">
@@ -7960,7 +8027,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                         >
                                                             Acessar
                                                         </button>
-                                                        {isMaster && (
+                                                        {canUseAuditMasterTools && (
                                                             <button
                                                                 type="button"
                                                                 onClick={() => void reopenAuditByNumber(item.audit_number)}
@@ -8051,21 +8118,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         </button>
                         <button
                             onClick={handleReopenAudit}
-                            disabled={isProcessing || !isMaster}
-                            className={`px-3 py-2 rounded-lg font-black text-[9px] uppercase tracking-widest transition-all ${isProcessing || !isMaster
+                            disabled={isProcessing || !canUseAuditMasterTools}
+                            className={`px-3 py-2 rounded-lg font-black text-[9px] uppercase tracking-widest transition-all ${isProcessing || !canUseAuditMasterTools
                                 ? 'bg-slate-500/50 text-slate-300 cursor-not-allowed'
                                 : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg'}`}
-                            title={!isMaster ? 'Somente Master' : 'Reabre inventário salvo (concluído)'}
+                            title={!canUseAuditMasterTools ? 'Somente Master ou Administrativo' : 'Reabre inventário salvo (concluído)'}
                         >
                             Reabrir
                         </button>
                         <button
                             onClick={handleDeleteCurrentAudit}
-                            disabled={isProcessing || !isMaster}
-                            className={`px-3 py-2 rounded-lg font-black text-[9px] uppercase tracking-widest transition-all ${isProcessing || !isMaster
+                            disabled={isProcessing || !canUseAuditMasterTools}
+                            className={`px-3 py-2 rounded-lg font-black text-[9px] uppercase tracking-widest transition-all ${isProcessing || !canUseAuditMasterTools
                                 ? 'bg-slate-500/50 text-slate-300 cursor-not-allowed'
                                 : 'bg-red-600 hover:bg-red-500 text-white shadow-lg'}`}
-                            title={!isMaster ? 'Somente Master pode excluir permanentemente' : 'Exclusão permanente'}
+                            title={!canUseAuditMasterTools ? 'Somente Master ou Administrativo pode excluir permanentemente' : 'Exclusão permanente'}
                         >
                             Excluir
                         </button>
@@ -8124,11 +8191,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     </button>
                                     <button
                                         onClick={finalizeActivePartials}
-                                        disabled={partialInfoList.length === 0 || !isMaster}
-                                        className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest border transition-all ${partialInfoList.length === 0 || !isMaster
+                                        disabled={partialInfoList.length === 0 || !canUseAuditMasterTools}
+                                        className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest border transition-all ${partialInfoList.length === 0 || !canUseAuditMasterTools
                                             ? 'bg-slate-100 text-slate-300 border-slate-200 cursor-not-allowed'
                                             : 'bg-white text-emerald-600 border-emerald-200 hover:bg-emerald-600 hover:text-white'}`}
-                                        title={!isMaster ? 'Apenas usuário master pode concluir' : undefined}
+                                        title={!canUseAuditMasterTools ? 'Apenas Master ou Administrativo pode concluir' : undefined}
                                     >
                                         Concluir Ativas
                                     </button>
@@ -8189,7 +8256,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             <FileSignature className="w-4 h-4 text-blue-600" />
                                             <span className="text-[10px] font-black uppercase tracking-widest text-blue-700/80">Termos</span>
                                         </div>
-                                        {isMaster && (
+                                        {canUseAuditMasterTools && (
                                             <button
                                                 onClick={resetPartialHistory}
                                                 className="text-[9px] font-black uppercase tracking-widest text-red-600 bg-white border border-red-200 px-3 py-1 rounded-lg hover:bg-red-600 hover:text-white transition-colors"
@@ -8462,20 +8529,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             </button>
                                             <button
                                                 onClick={(e) => { e.stopPropagation(); startScopeAudit(group.id); }}
-                                                disabled={isComplete || !isMaster}
-                                                className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all shadow-sm ${isComplete || !isMaster
+                                                disabled={isComplete || !canUseAuditMasterTools}
+                                                className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all shadow-sm ${isComplete || !canUseAuditMasterTools
                                                     ? 'bg-slate-100 text-slate-300 border-slate-200 cursor-not-allowed'
                                                     : groupHasInProgress
                                                         ? 'bg-blue-600 text-white border-blue-500'
                                                         : 'bg-blue-50 text-blue-600 border-blue-100 hover:bg-blue-600 hover:text-white'}`}
-                                                title={!isMaster ? 'Apenas Master pode iniciar grupo inteiro' : (isComplete ? 'Desmarque a conclusão para iniciar parcial' : (groupHasInProgress ? 'Desativar contagem parcial' : (groupHasStarted ? 'Retomar auditoria parcial' : 'Iniciar auditoria parcial')))}
+                                                title={!canUseAuditMasterTools ? 'Apenas Master ou Administrativo pode iniciar grupo inteiro' : (isComplete ? 'Desmarque a conclusão para iniciar parcial' : (groupHasInProgress ? 'Desativar contagem parcial' : (groupHasStarted ? 'Retomar auditoria parcial' : 'Iniciar auditoria parcial')))}
                                             >
                                                 <Activity className="w-5 h-5" />
                                             </button>
                                             <button
                                                 onClick={(e) => { e.stopPropagation(); toggleScopeStatus(group.id); }}
-                                                disabled={!isMaster || !groupHasStarted}
-                                                className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all shadow-sm ${!isMaster || !groupHasStarted ? 'bg-slate-50 text-slate-200 border-slate-100 cursor-not-allowed' : 'bg-emerald-50 text-emerald-600 border-emerald-100 hover:bg-emerald-600 hover:text-white'}`}
+                                                disabled={!canUseAuditMasterTools || !groupHasStarted}
+                                                className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all shadow-sm ${!canUseAuditMasterTools || !groupHasStarted ? 'bg-slate-50 text-slate-200 border-slate-100 cursor-not-allowed' : 'bg-emerald-50 text-emerald-600 border-emerald-100 hover:bg-emerald-600 hover:text-white'}`}
                                             >
                                                 <CheckSquare className="w-5 h-5" />
                                             </button>
@@ -8588,8 +8655,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             </button>
                                             <button
                                                 onClick={() => toggleScopeStatus(selectedGroup?.id, dept.id)}
-                                                disabled={!isMaster || !deptHasStarted}
-                                                className={`px-3 py-2 rounded-xl border text-[10px] font-black uppercase transition-all shadow-sm ${!isMaster || !deptHasStarted ? 'bg-slate-50 text-slate-200 border-slate-100 cursor-not-allowed' : 'bg-emerald-50 text-emerald-600 border-emerald-100 hover:bg-emerald-600 hover:text-white'}`}
+                                                disabled={!canUseAuditMasterTools || !deptHasStarted}
+                                                className={`px-3 py-2 rounded-xl border text-[10px] font-black uppercase transition-all shadow-sm ${!canUseAuditMasterTools || !deptHasStarted ? 'bg-slate-50 text-slate-200 border-slate-100 cursor-not-allowed' : 'bg-emerald-50 text-emerald-600 border-emerald-100 hover:bg-emerald-600 hover:text-white'}`}
                                             >
                                                 Alternar Tudo
                                             </button>
@@ -8646,7 +8713,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         return 0;
                     }).map(cat => {
                         const catStatus = normalizeAuditStatus(cat.status);
-                        const canFinalize = isMaster && catStatus !== AuditStatus.TODO;
+                        const canFinalize = canUseAuditMasterTools && catStatus !== AuditStatus.TODO;
                         const startLabel = catStatus === AuditStatus.IN_PROGRESS ? 'PAUSAR' : 'INICIAR';
                         const catProgressValue = catStatus === AuditStatus.DONE ? 100 : catStatus === AuditStatus.IN_PROGRESS ? 50 : 0;
                         return (
@@ -8722,7 +8789,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
                     {view.level === 'products' && selectedCat && (() => {
                         const catStatus = normalizeAuditStatus(selectedCat.status);
-                        const canFinalize = isMaster && catStatus !== AuditStatus.TODO;
+                        const canFinalize = canUseAuditMasterTools && catStatus !== AuditStatus.TODO;
                         const startLabel = catStatus === AuditStatus.IN_PROGRESS ? 'PAUSAR' : 'INICIAR';
                         return (
                             <div className="bg-white rounded-[2rem] sm:rounded-[3rem] shadow-2xl overflow-hidden border border-slate-200">
