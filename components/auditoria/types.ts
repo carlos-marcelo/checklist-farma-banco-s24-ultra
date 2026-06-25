@@ -13,6 +13,26 @@ export interface Product {
     cost?: number; // Preço de custo unitário
 }
 
+export interface PostAuditAdjustment {
+    id: string;
+    code: string;
+    barcode?: string;
+    reducedCode?: string;
+    description: string;
+    quantity: number;
+    unitCost: number;
+    totalCost: number;
+    groupId?: string;
+    groupName?: string;
+    deptId?: string;
+    deptName?: string;
+    catId?: string;
+    catName?: string;
+    note?: string;
+    createdAt: string;
+    createdBy?: string;
+}
+
 export interface Category {
     id: string;
     numericId?: string;
@@ -57,6 +77,7 @@ export interface AuditData {
         deptId?: string;
         catId?: string;
     }>;
+    postAuditAdjustments?: PostAuditAdjustment[];
     lastPartialBatchId?: string;
     sharedExcelMetrics?: any;
     sharedGroupExcelMetrics?: Record<string, any>;

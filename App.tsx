@@ -322,6 +322,20 @@ const parseJsonValue = <T,>(value: any): T | null => {
 const AUDIT_GLOBAL_UNIFIED_TERM_BATCH_ID = '__global_unified_term__';
 const roundAuditMoney = (value: unknown) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
+const getPostAuditAdjustmentTotals = (parsedData: any) => {
+    const adjustments = Array.isArray(parsedData?.postAuditAdjustments) ? parsedData.postAuditAdjustments : [];
+    return adjustments.reduce((acc: { quantity: number; cost: number }, item: any) => {
+        const quantity = Number(item?.quantity || 0);
+        const unitCost = roundAuditMoney(item?.unitCost || 0);
+        const totalCost = roundAuditMoney(item?.totalCost ?? (quantity * unitCost));
+        if (!Number.isFinite(quantity) || !Number.isFinite(totalCost)) return acc;
+        return {
+            quantity: acc.quantity + quantity,
+            cost: roundAuditMoney(acc.cost + totalCost)
+        };
+    }, { quantity: 0, cost: 0 });
+};
+
 const getAuditTermMetricsTimestamp = (metrics: any) => {
     const raw = metrics?.sourceUploadedAt || metrics?.financialDiffVerifiedAt || metrics?.updatedAt;
     const time = raw ? Date.parse(String(raw)) : 0;
@@ -6746,6 +6760,14 @@ const App: React.FC = () => {
                 });
                 diffCost = roundAuditMoney(diffCost);
             }
+            const postAuditAdjustmentTotals = getPostAuditAdjustmentTotals(parsedData);
+            if (
+                Math.abs(Number(postAuditAdjustmentTotals.quantity || 0)) > 0.01 ||
+                Math.abs(Number(postAuditAdjustmentTotals.cost || 0)) > 0.01
+            ) {
+                diffQty += Number(postAuditAdjustmentTotals.quantity || 0);
+                diffCost = roundAuditMoney(diffCost + Number(postAuditAdjustmentTotals.cost || 0));
+            }
 
             const pendingSkus = Math.max(0, totalSkus - countedSkus);
             const pendingUnits = Math.max(0, totalUnits - countedUnits);
@@ -7346,6 +7368,14 @@ const App: React.FC = () => {
                     diffCost += Number(groupMetric.diffCost || 0);
                 });
                 diffCost = roundAuditMoney(diffCost);
+            }
+            const postAuditAdjustmentTotals = getPostAuditAdjustmentTotals(parsedData);
+            if (
+                Math.abs(Number(postAuditAdjustmentTotals.quantity || 0)) > 0.01 ||
+                Math.abs(Number(postAuditAdjustmentTotals.cost || 0)) > 0.01
+            ) {
+                diffQty += Number(postAuditAdjustmentTotals.quantity || 0);
+                diffCost = roundAuditMoney(diffCost + Number(postAuditAdjustmentTotals.cost || 0));
             }
 
             const pendingSkus = Math.max(0, totalSkus - countedSkus);

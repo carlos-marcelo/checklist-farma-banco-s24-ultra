@@ -11,7 +11,8 @@ import {
     Group,
     Department,
     Category,
-    Product
+    Product,
+    PostAuditAdjustment
 } from './types';
 import {
     fetchLatestAudit,
@@ -52,7 +53,9 @@ import {
     Download,
     Save,
     Check,
-    Loader2
+    Loader2,
+    Plus,
+    Trash2
 } from 'lucide-react';
 
 const GROUP_UPLOAD_IDS = ['2000', '3000', '4000', '8000', '10000', '66', '67'] as const;
@@ -349,6 +352,57 @@ const normalizeLookupText = (value: unknown) =>
         .replace(/[\u0300-\u036f]/g, '')
         .toLowerCase()
         .trim();
+
+const normalizeProductLookupCode = (value: unknown) =>
+    String(value ?? '')
+        .trim()
+        .replace(/\D/g, '')
+        .replace(/^0+/, '');
+
+const roundPostAuditMoney = (value: unknown) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+const parseSignedAuditNumber = (value: unknown): number => {
+    const raw = String(value ?? '').trim();
+    if (!raw) return 0;
+    const normalized = raw
+        .replace(/\s+/g, '')
+        .replace(/\.(?=\d{3}(?:\D|$))/g, '')
+        .replace(',', '.');
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const normalizePostAuditAdjustments = (value: unknown): PostAuditAdjustment[] => {
+    if (!Array.isArray(value)) return [];
+    return value
+        .map((item: any): PostAuditAdjustment | null => {
+            const quantity = Number(item?.quantity || 0);
+            const unitCost = roundPostAuditMoney(item?.unitCost);
+            if (!Number.isFinite(quantity) || Math.abs(quantity) <= 0) return null;
+            if (!Number.isFinite(unitCost)) return null;
+            const totalCost = roundPostAuditMoney(item?.totalCost ?? (quantity * unitCost));
+            return {
+                id: String(item?.id || `${Date.now()}_${Math.random().toString(36).slice(2)}`),
+                code: String(item?.code || item?.reducedCode || item?.barcode || '').trim(),
+                barcode: String(item?.barcode || '').trim() || undefined,
+                reducedCode: String(item?.reducedCode || '').trim() || undefined,
+                description: String(item?.description || item?.name || 'Produto sem descrição').trim(),
+                quantity,
+                unitCost,
+                totalCost,
+                groupId: item?.groupId ? String(item.groupId) : undefined,
+                groupName: item?.groupName ? String(item.groupName) : undefined,
+                deptId: item?.deptId ? String(item.deptId) : undefined,
+                deptName: item?.deptName ? String(item.deptName) : undefined,
+                catId: item?.catId ? String(item.catId) : undefined,
+                catName: item?.catName ? String(item.catName) : undefined,
+                note: item?.note ? String(item.note) : undefined,
+                createdAt: String(item?.createdAt || new Date().toISOString()),
+                createdBy: item?.createdBy ? String(item.createdBy) : undefined
+            };
+        })
+        .filter((item): item is PostAuditAdjustment => !!item);
+};
 
 const isHierarchyPlaceholderName = (value: unknown, extraInvalid: string[] = []) => {
     const text = normalizeLookupText(value).replace(/\s+/g, ' ');
@@ -1121,6 +1175,21 @@ const normalizeTermMetricsToOfficial = (metrics: any) => {
     };
 };
 
+const getWholeTermMetricsTotals = (metrics: any) => {
+    const normalized = normalizeTermMetricsToOfficial(metrics);
+    if (!normalized) return null;
+    return {
+        sysQty: Number(normalized.sysQty || 0),
+        sysCost: roundAuditMoney(normalized.sysCost),
+        countedQty: Number(normalized.countedQty || 0),
+        countedCost: roundAuditMoney(normalized.countedCost),
+        diffQty: Number(normalized.diffQty || 0),
+        diffCost: roundAuditMoney(normalized.diffCost),
+        items: Array.isArray(normalized.items) ? normalized.items : [],
+        groupedDifferences: Array.isArray(normalized.groupedDifferences) ? normalized.groupedDifferences : []
+    };
+};
+
 const getAuthoritativeTermMetrics = (
     sourceData: any,
     sourceDrafts?: Record<string, TermForm>
@@ -1439,6 +1508,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [expandedCatKeys, setExpandedCatKeys] = useState<Set<string>>(new Set());
     const [auditLookup, setAuditLookup] = useState('');
     const [auditLookupOpen, setAuditLookupOpen] = useState(false);
+    const [postAdjustmentCode, setPostAdjustmentCode] = useState('');
+    const [postAdjustmentQty, setPostAdjustmentQty] = useState('');
+    const [postAdjustmentNote, setPostAdjustmentNote] = useState('');
+    const [postAdjustmentError, setPostAdjustmentError] = useState<string | null>(null);
+    const [isSavingPostAdjustment, setIsSavingPostAdjustment] = useState(false);
     const auditLookupInputRef = useRef<HTMLInputElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
     const [selectedEmpresa, setSelectedEmpresa] = useState("Drogaria Cidade");
@@ -4822,6 +4896,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         // Se houver draft direto, filtra pelo escopo para evitar contaminação entre grupos.
         // Se não houver nenhum match (dados legados), mantém total bruto para não apagar.
         if (draftMetrics) {
+            if (scope.type === 'group') {
+                return getWholeTermMetricsTotals(draftMetrics);
+            }
             const directItems = (draftMetrics.items || []).filter((it: any) => matchScopeRecord(it));
             const directGrouped = (draftMetrics.groupedDifferences || []).filter((d: any) => matchScopeRecord(d));
             const source = directItems.length > 0
@@ -4880,6 +4957,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const scopedPools = scopedEntries
             .map(({ draft }) => draft.excelMetrics)
             .filter(Boolean);
+        if (scope.type === 'group' && scopedEntries.length > 0) {
+            const targetGroup = normalizeScopeId(scope.groupId);
+            const entryGroups = (draftKey: string) => {
+                const groups = new Set<string>();
+                if (draftKey.startsWith('custom|')) {
+                    const meta = parseCustomDraftKey(draftKey);
+                    (meta?.scopesPart || '').split(',').filter(Boolean).forEach(scopeKey => {
+                        const [g] = scopeKey.split('|');
+                        const normalized = normalizeScopeId(g);
+                        if (normalized) groups.add(normalized);
+                    });
+                    return groups;
+                }
+                const [, g] = draftKey.split('|');
+                const normalized = normalizeScopeId(g);
+                if (normalized) groups.add(normalized);
+                return groups;
+            };
+            const ownedByThisGroup = scopedEntries.filter(({ draftKey }) => {
+                const groups = entryGroups(draftKey);
+                return groups.size === 1 && groups.has(targetGroup);
+            });
+            if (ownedByThisGroup.length === scopedEntries.length) {
+                return getWholeTermMetricsTotals(mergeExcelMetricsPools(scopedPools as any[]));
+            }
+        }
         // Prioridade: Rascunho do próprio termo > Soma dos termos do mesmo grupo
         const base = draftMetrics || mergeExcelMetricsPools(scopedPools as any[]);
 
@@ -4931,23 +5034,26 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const getGroupVerifiedMetrics = useCallback((group: any) => {
         const groupId = String(group?.id || '');
         const direct = getScopedMetrics({ type: 'group', groupId });
+        if (direct) return direct;
         const deptMetrics = (group?.departments || [])
             .map((dept: any) => getScopedMetrics({ type: 'department', groupId, deptId: String(dept.id) }))
             .filter(Boolean);
 
-        if (deptMetrics.length === 0) return direct;
-
-        const byDepartments = sumExcelMetrics(deptMetrics);
-        if (!direct) return byDepartments;
-
-        const hasRelevantMismatch =
-            Math.abs(Number(direct.diffQty || 0) - Number(byDepartments.diffQty || 0)) > 0.01 ||
-            Math.abs(Number(direct.diffCost || 0) - Number(byDepartments.diffCost || 0)) > 0.01;
-
-        // Se houver divergência entre "fora do grupo" e a soma interna dos departamentos,
-        // prioriza a soma interna para manter consistência visual e financeira.
-        return hasRelevantMismatch ? byDepartments : direct;
+        if (deptMetrics.length === 0) return null;
+        return sumExcelMetrics(deptMetrics);
     }, [getScopedMetrics, sumExcelMetrics]);
+
+    const postAuditAdjustments = useMemo(
+        () => normalizePostAuditAdjustments((data as any)?.postAuditAdjustments),
+        [data]
+    );
+
+    const postAuditAdjustmentTotals = useMemo(() => {
+        return postAuditAdjustments.reduce((acc, item) => ({
+            quantity: acc.quantity + Number(item.quantity || 0),
+            cost: roundAuditMoney(acc.cost + Number(item.totalCost || 0))
+        }), { quantity: 0, cost: 0 });
+    }, [postAuditAdjustments]);
 
     const authoritativeTermMetrics = useMemo(
         () => getAuthoritativeTermMetrics(data, termDrafts),
@@ -4992,6 +5098,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             });
             diffCost = roundAuditMoney(diffCost);
         }
+        if (postAuditAdjustments.length > 0) {
+            diffQty += Number(postAuditAdjustmentTotals.quantity || 0);
+            diffCost = roundAuditMoney(diffCost + Number(postAuditAdjustmentTotals.cost || 0));
+            if (
+                Math.abs(Number(postAuditAdjustmentTotals.quantity || 0)) > 0.01 ||
+                Math.abs(Number(postAuditAdjustmentTotals.cost || 0)) > 0.01
+            ) {
+                groupsWithDivergence += 1;
+            }
+        }
 
         const pendingUnits = Math.max(0, Number(branchMetrics.units || 0) - Number(branchMetrics.doneUnits || 0));
         const pendingSkus = Math.max(0, Number(branchMetrics.skus || 0) - Number(branchMetrics.doneSkus || 0));
@@ -5013,7 +5129,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             doneCost: roundAuditMoney(Number(branchMetrics.doneCost || 0) + diffCost),
             totalCost: Number(branchMetrics.cost || 0)
         };
-    }, [data, authoritativeTermMetrics, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost]);
+    }, [data, authoritativeTermMetrics, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost, postAuditAdjustments.length, postAuditAdjustmentTotals.quantity, postAuditAdjustmentTotals.cost]);
 
     const createDefaultTermForm = (): TermForm => ({
         inventoryNumber: inventoryNumber || data?.inventoryNumber || '',
@@ -8428,6 +8544,25 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const wsDetailed = XLSX.utils.json_to_sheet(detailedItems);
             XLSX.utils.book_append_sheet(wb, wsDetailed, "Itens Detalhado");
 
+            if (postAuditAdjustments.length > 0) {
+                const adjustmentRows = postAuditAdjustments.map(item => ({
+                    'Data/Hora': item.createdAt ? new Date(item.createdAt).toLocaleString('pt-BR', { hour12: false }) : '',
+                    'Usuário': item.createdBy || '',
+                    'Código Reduzido': item.reducedCode || item.code,
+                    'Código de Barras': item.barcode || '',
+                    'Descrição': item.description,
+                    'Grupo': item.groupName || item.groupId || '',
+                    'Departamento': item.deptName || item.deptId || '',
+                    'Categoria': item.catName || item.catId || '',
+                    'Qtd Ajuste': item.quantity,
+                    'Custo Unitário (R$)': item.unitCost,
+                    'Impacto Financeiro (R$)': item.totalCost,
+                    'Observação': item.note || ''
+                }));
+                const wsAdjustments = XLSX.utils.json_to_sheet(adjustmentRows);
+                XLSX.utils.book_append_sheet(wb, wsAdjustments, "Ajustes Pos Auditoria");
+            }
+
             const fileName = `Auditoria_F${data.filial}_N${accessedAuditNumber || 'DETALHADA'}_Detalhado.xlsx`;
             XLSX.writeFile(wb, fileName);
 
@@ -8466,6 +8601,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             productName: string;
             barcode: string;
             reducedCode: string;
+            quantity: number;
+            unitCost: number;
             searchText: string;
         }>;
 
@@ -8485,6 +8622,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             productName: product.name,
                             barcode,
                             reducedCode,
+                            quantity: Number(product.quantity || 0),
+                            unitCost: roundAuditMoney(product.cost || 0),
                             searchText: normalizeLookupText(
                                 `${barcode} ${reducedCode} ${product.name} ${group.id} ${group.name} ${dept.id} ${dept.name} ${cat.id} ${cat.name}`
                             )
@@ -8502,6 +8641,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             .filter(item => item.searchText.includes(normalizedAuditLookup))
             .slice(0, 25);
     }, [auditLookupIndex, normalizedAuditLookup]);
+    const normalizedPostAdjustmentCode = useMemo(() => normalizeProductLookupCode(postAdjustmentCode), [postAdjustmentCode]);
+    const postAdjustmentProduct = useMemo(() => {
+        if (!normalizedPostAdjustmentCode) return null as null | (typeof auditLookupIndex)[number];
+        const exact = auditLookupIndex.find(item =>
+            normalizeProductLookupCode(item.reducedCode) === normalizedPostAdjustmentCode ||
+            normalizeProductLookupCode(item.barcode) === normalizedPostAdjustmentCode
+        );
+        if (exact) return exact;
+        const text = normalizeLookupText(postAdjustmentCode);
+        if (!text) return null;
+        return auditLookupIndex.find(item => item.searchText.includes(text)) || null;
+    }, [auditLookupIndex, normalizedPostAdjustmentCode, postAdjustmentCode]);
     const handleOpenAuditLookupResult = useCallback((result: (typeof auditLookupIndex)[number]) => {
         setView({
             level: 'products',
@@ -8512,6 +8663,103 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setAuditLookup('');
         setAuditLookupOpen(false);
     }, []);
+    const persistPostAuditAdjustments = useCallback(async (nextAdjustmentsRaw: PostAuditAdjustment[]) => {
+        if (!data || isReadOnlyCompletedView) return false;
+        const nextAdjustments = normalizePostAuditAdjustments(nextAdjustmentsRaw);
+        const nextData = {
+            ...data,
+            postAuditAdjustments: nextAdjustments,
+            termDrafts: composeTermDraftsForPersist(((data as any).termDrafts || {}) as Record<string, TermForm>, termDrafts)
+        } as AuditData;
+        setData(nextData);
+        const progress = calculateProgress(nextData);
+        const savedSession = await persistAuditSession({
+            id: dbSessionId,
+            branch: selectedFilial,
+            audit_number: nextAuditNumber,
+            status: 'open',
+            data: nextData,
+            progress,
+            user_email: userEmail,
+            updated_at: lastAuditUpdateRef.current || undefined
+        });
+        if (!savedSession) {
+            setData(data);
+            return false;
+        }
+        setDbSessionId(savedSession.id);
+        setNextAuditNumber(savedSession.audit_number);
+        setData((savedSession.data as AuditData) || nextData);
+        return true;
+    }, [data, isReadOnlyCompletedView, composeTermDraftsForPersist, termDrafts, calculateProgress, persistAuditSession, dbSessionId, selectedFilial, nextAuditNumber, userEmail]);
+
+    const addPostAuditAdjustment = useCallback(async () => {
+        if (isReadOnlyCompletedView) return;
+        setPostAdjustmentError(null);
+        const product = postAdjustmentProduct;
+        const quantity = parseSignedAuditNumber(postAdjustmentQty);
+        if (!product) {
+            setPostAdjustmentError('Produto não encontrado pelo reduzido ou código.');
+            return;
+        }
+        if (!quantity || !Number.isFinite(quantity)) {
+            setPostAdjustmentError('Informe uma quantidade diferente de zero.');
+            return;
+        }
+        const unitCost = roundAuditMoney(product.unitCost || 0);
+        if (!unitCost || !Number.isFinite(unitCost)) {
+            setPostAdjustmentError('Produto sem custo unitário válido.');
+            return;
+        }
+        const id = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+            ? crypto.randomUUID()
+            : `adj_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const adjustment: PostAuditAdjustment = {
+            id,
+            code: product.reducedCode || product.barcode || postAdjustmentCode.trim(),
+            barcode: product.barcode || undefined,
+            reducedCode: product.reducedCode || undefined,
+            description: product.productName,
+            quantity,
+            unitCost,
+            totalCost: roundAuditMoney(quantity * unitCost),
+            groupId: product.groupId,
+            groupName: product.groupName,
+            deptId: product.deptId,
+            deptName: product.deptName,
+            catId: product.catId,
+            catName: product.catName,
+            note: postAdjustmentNote.trim() || undefined,
+            createdAt: new Date().toISOString(),
+            createdBy: userEmail
+        };
+        setIsSavingPostAdjustment(true);
+        try {
+            const saved = await persistPostAuditAdjustments([...postAuditAdjustments, adjustment]);
+            if (saved) {
+                setPostAdjustmentCode('');
+                setPostAdjustmentQty('');
+                setPostAdjustmentNote('');
+                setPostAdjustmentError(null);
+            } else {
+                setPostAdjustmentError('Não foi possível salvar o ajuste.');
+            }
+        } finally {
+            setIsSavingPostAdjustment(false);
+        }
+    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentQty, postAdjustmentCode, postAdjustmentNote, userEmail, persistPostAuditAdjustments, postAuditAdjustments]);
+
+    const removePostAuditAdjustment = useCallback(async (id: string) => {
+        if (isReadOnlyCompletedView) return;
+        setIsSavingPostAdjustment(true);
+        setPostAdjustmentError(null);
+        try {
+            const saved = await persistPostAuditAdjustments(postAuditAdjustments.filter(item => item.id !== id));
+            if (!saved) setPostAdjustmentError('Não foi possível remover o ajuste.');
+        } finally {
+            setIsSavingPostAdjustment(false);
+        }
+    }, [isReadOnlyCompletedView, persistPostAuditAdjustments, postAuditAdjustments]);
     const termScopeInfo = useMemo(() => (termModal ? buildTermScopeInfo(termModal) : null), [termModal, data]);
     const canEditTerm = canUseAuditMasterTools && !isReadOnlyCompletedView;
     const canFillTermSignatures = !isReadOnlyCompletedView;
@@ -9646,6 +9894,166 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             </div>
                         );
                     })}
+
+                    {view.level === 'groups' && (
+                        <div className="rounded-[2.5rem] p-8 border border-indigo-200 bg-white shadow-sm hover:shadow-xl transition-all flex flex-col relative overflow-hidden">
+                            <div className="absolute top-0 right-0 w-36 h-36 bg-indigo-50 rounded-full -mr-16 -mt-16 z-0"></div>
+                            <div className="relative z-10 flex flex-col h-full">
+                                <div className="flex items-start justify-between gap-3 mb-6">
+                                    <div>
+                                        <span className="inline-flex items-center text-sm font-black text-indigo-700 bg-indigo-50 px-4 py-2 rounded-2xl border border-indigo-100 shadow-sm uppercase tracking-widest">
+                                            Ajustes
+                                        </span>
+                                        <h2 className="text-xl font-black text-slate-900 uppercase italic mt-5 leading-tight tracking-tight">
+                                            Ajustes após auditoria
+                                        </h2>
+                                    </div>
+                                    <div className={`text-right text-xs font-black tabular-nums ${postAuditAdjustmentTotals.cost < 0 ? 'text-red-600' : postAuditAdjustmentTotals.cost > 0 ? 'text-emerald-600' : 'text-slate-400'}`}>
+                                        <div>{postAuditAdjustmentTotals.quantity > 0 ? '+' : ''}{postAuditAdjustmentTotals.quantity.toLocaleString('pt-BR')} un.</div>
+                                        <div>{postAuditAdjustmentTotals.cost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</div>
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-3 gap-2 mb-5">
+                                    <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 min-w-0">
+                                        <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Itens</p>
+                                        <p className="text-lg font-black text-slate-800 tabular-nums">{postAuditAdjustments.length}</p>
+                                    </div>
+                                    <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 min-w-0">
+                                        <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Qtd</p>
+                                        <p className={`text-lg font-black tabular-nums ${postAuditAdjustmentTotals.quantity < 0 ? 'text-red-600' : postAuditAdjustmentTotals.quantity > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
+                                            {postAuditAdjustmentTotals.quantity > 0 ? '+' : ''}{postAuditAdjustmentTotals.quantity.toLocaleString('pt-BR')}
+                                        </p>
+                                    </div>
+                                    <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 min-w-0">
+                                        <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Valor</p>
+                                        <p className={`text-base font-black tabular-nums leading-tight ${postAuditAdjustmentTotals.cost < 0 ? 'text-red-600' : postAuditAdjustmentTotals.cost > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
+                                            {postAuditAdjustmentTotals.cost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <div className="space-y-3 border-t border-slate-100 pt-5">
+                                    <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px] gap-2">
+                                        <input
+                                            value={postAdjustmentCode}
+                                            onChange={(event) => {
+                                                setPostAdjustmentCode(event.target.value);
+                                                setPostAdjustmentError(null);
+                                            }}
+                                            disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
+                                            placeholder="Reduzido ou código"
+                                            className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-700 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
+                                        />
+                                        <input
+                                            value={postAdjustmentQty}
+                                            onChange={(event) => {
+                                                setPostAdjustmentQty(event.target.value);
+                                                setPostAdjustmentError(null);
+                                            }}
+                                            onKeyDown={(event) => {
+                                                if (event.key === 'Enter') void addPostAuditAdjustment();
+                                            }}
+                                            disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
+                                            placeholder="+2 / -1"
+                                            className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-sm font-black text-slate-700 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
+                                        />
+                                    </div>
+                                    <input
+                                        value={postAdjustmentNote}
+                                        onChange={(event) => setPostAdjustmentNote(event.target.value)}
+                                        disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
+                                        placeholder="Observação"
+                                        className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
+                                    />
+
+                                    {postAdjustmentProduct && (
+                                        <div className="rounded-xl border border-emerald-100 bg-emerald-50/70 p-3">
+                                            <p className="text-[10px] font-black uppercase text-emerald-800 leading-tight">{postAdjustmentProduct.productName}</p>
+                                            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] font-bold text-emerald-700/80">
+                                                <span>Grupo {postAdjustmentProduct.groupId}</span>
+                                                <span>Custo {postAdjustmentProduct.unitCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                                                <span>Saldo {postAdjustmentProduct.quantity.toLocaleString('pt-BR')}</span>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {postAdjustmentError && (
+                                        <div className="rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-[11px] font-bold text-red-600">
+                                            {postAdjustmentError}
+                                        </div>
+                                    )}
+
+                                    <button
+                                        onClick={() => void addPostAuditAdjustment()}
+                                        disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
+                                        className="w-full h-12 rounded-xl bg-slate-900 text-white font-black uppercase tracking-widest text-xs flex items-center justify-center gap-2 hover:bg-indigo-600 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed transition-all"
+                                    >
+                                        {isSavingPostAdjustment ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                                        Adicionar ajuste
+                                    </button>
+
+                                    {isReadOnlyCompletedView && (
+                                        <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+                                            Modo consulta: ajustes bloqueados.
+                                        </p>
+                                    )}
+                                </div>
+
+                                <div className="mt-5 flex-1 min-h-[120px] max-h-[260px] overflow-y-auto pr-1 space-y-2">
+                                    {postAuditAdjustments.length === 0 ? (
+                                        <div className="h-full min-h-[120px] rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 flex items-center justify-center text-center px-4">
+                                            <p className="text-[11px] font-black uppercase tracking-widest text-slate-400">
+                                                Nenhum ajuste lançado
+                                            </p>
+                                        </div>
+                                    ) : (
+                                        postAuditAdjustments.map(adjustment => (
+                                            <div key={adjustment.id} className="rounded-2xl border border-slate-100 bg-slate-50/80 p-3">
+                                                <div className="flex items-start justify-between gap-3">
+                                                    <div className="min-w-0">
+                                                        <p className="text-[11px] font-black uppercase text-slate-800 leading-tight break-words">{adjustment.description}</p>
+                                                        <p className="mt-1 text-[10px] font-bold text-slate-400">
+                                                            Red. {adjustment.reducedCode || adjustment.code} • {adjustment.groupName || `Grupo ${adjustment.groupId || '-'}`}
+                                                        </p>
+                                                        {adjustment.note && (
+                                                            <p className="mt-1 text-[10px] font-semibold text-slate-500 break-words">{adjustment.note}</p>
+                                                        )}
+                                                    </div>
+                                                    <button
+                                                        onClick={() => void removePostAuditAdjustment(adjustment.id)}
+                                                        disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
+                                                        className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-400 hover:bg-red-50 hover:text-red-600 hover:border-red-200 disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center shrink-0"
+                                                        title="Remover ajuste"
+                                                    >
+                                                        <Trash2 className="w-4 h-4" />
+                                                    </button>
+                                                </div>
+                                                <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] font-black">
+                                                    <div className="rounded-lg bg-white border border-slate-100 px-2 py-1">
+                                                        <span className="block text-slate-400 uppercase">Qtd</span>
+                                                        <span className={adjustment.quantity < 0 ? 'text-red-600' : 'text-emerald-600'}>
+                                                            {adjustment.quantity > 0 ? '+' : ''}{adjustment.quantity.toLocaleString('pt-BR')}
+                                                        </span>
+                                                    </div>
+                                                    <div className="rounded-lg bg-white border border-slate-100 px-2 py-1">
+                                                        <span className="block text-slate-400 uppercase">Custo</span>
+                                                        <span className="text-slate-700">{adjustment.unitCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                                                    </div>
+                                                    <div className="rounded-lg bg-white border border-slate-100 px-2 py-1">
+                                                        <span className="block text-slate-400 uppercase">Total</span>
+                                                        <span className={adjustment.totalCost < 0 ? 'text-red-600' : 'text-emerald-600'}>
+                                                            {adjustment.totalCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
 
                     {view.level === 'departments' && [...(selectedGroup?.departments || [])].sort((a, b) => {
                         const aHasInProgress = a.categories.some(c => isInProgressStatus(c.status));
