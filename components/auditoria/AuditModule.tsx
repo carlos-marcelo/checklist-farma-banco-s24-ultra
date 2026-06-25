@@ -49,6 +49,7 @@ import {
     RefreshCw,
     X,
     Upload,
+    Download,
     Save,
     Check,
     Loader2
@@ -120,6 +121,14 @@ const PRODUCT_CLASSIFICATION_FIXES_BY_CODE: Record<string, { groupId: string; gr
         deptName: 'ELETRONICOS',
         catId: '77',
         catName: 'BAZAR'
+    },
+    '26542': {
+        groupId: '3000',
+        groupName: 'Medicamentos RX',
+        deptId: '121',
+        deptName: 'MEDICAMENTO TARJADO',
+        catId: '89',
+        catName: 'DIABETES'
     }
 };
 
@@ -143,7 +152,19 @@ const TERM_MANUAL_CLASSIFICATION_BY_CODE: Record<string, { groupId: string; dept
     '59209': { groupId: '4000', deptId: '121', catId: '109' },
     '49578': { groupId: '4000', deptId: '121', catId: '129' },
     '84591': { groupId: '4000', deptId: '121', catId: '124' },
-    '84489': { groupId: '4000', deptId: '121', catId: '106' }
+    '84489': { groupId: '4000', deptId: '121', catId: '106' },
+    '26542': { groupId: '3000', deptId: '121', catId: '89' },
+    '18621': { groupId: '3000', deptId: '121', catId: '124' },
+    '35497': { groupId: '3000', deptId: '121', catId: '103' },
+    '45637': { groupId: '3000', deptId: '121', catId: '119' },
+    '57237': { groupId: '3000', deptId: '121', catId: '110' },
+    '60528': { groupId: '3000', deptId: '121', catId: '124' },
+    '68823': { groupId: '3000', deptId: '121', catId: '123' },
+    '72550': { groupId: '3000', deptId: '121', catId: '129' },
+    '82553': { groupId: '3000', deptId: '121', catId: '165' },
+    '5189': { groupId: '4000', deptId: '121', catId: '118' },
+    '79995': { groupId: '4000', deptId: '121', catId: '180' },
+    '84092': { groupId: '4000', deptId: '121', catId: '124' }
 };
 
 const AuditTermInput = React.memo(({ 
@@ -714,6 +735,13 @@ interface TermForm {
         diffCost: number;
         items: any[];
         groupedDifferences?: any[];
+        sourceRows?: any[][];
+        sourceFileName?: string;
+        sourceFileSize?: number;
+        sourceUploadedAt?: string;
+        officialDiffCost?: number;
+        financialDiffSource?: string;
+        financialDiffColumnIndex?: number;
     };
     excelMetricsRemovedAt?: string;
 }
@@ -738,10 +766,12 @@ const mergeTermDraftMaps = (
     Object.entries(incoming || {}).forEach(([key, incomingDraft]) => {
         const currentDraft = base[key];
         if (!currentDraft) {
-            base[key] = incomingDraft;
+            base[key] = incomingDraft?.excelMetrics
+                ? { ...incomingDraft, excelMetrics: normalizeTermMetricsToOfficial(incomingDraft.excelMetrics) }
+                : incomingDraft;
             return;
         }
-        const nextMetrics = incomingDraft?.excelMetrics ?? currentDraft?.excelMetrics;
+        const nextMetrics = normalizeTermMetricsToOfficial(pickPreferredTermMetrics(incomingDraft?.excelMetrics, currentDraft?.excelMetrics));
         let nextRemovedAt = incomingDraft?.excelMetricsRemovedAt ?? currentDraft?.excelMetricsRemovedAt;
         if (incomingDraft?.excelMetrics) nextRemovedAt = undefined;
         base[key] = nextMetrics
@@ -784,6 +814,18 @@ const mergeExcelMetricsPools = (pools: any[]): any | null => {
     const validPools = (pools || []).filter(Boolean);
     if (validPools.length === 0) return null;
     if (validPools.length === 1) return validPools[0];
+
+    const officialPoolValues = validPools
+        .map((pool: any) => {
+            const raw = pool?.officialDiffCost ?? (pool?.financialDiffSource ? pool?.diffCost : undefined);
+            if (raw === undefined || raw === null || raw === '') return null;
+            const value = roundAuditMoney(raw);
+            return Number.isFinite(value) ? value : null;
+        })
+        .filter((value): value is number => value !== null);
+    const officialDiffCost = officialPoolValues.length > 0
+        ? roundAuditMoney(officialPoolValues.reduce((sum, value) => sum + value, 0))
+        : null;
 
     const normText = (value: unknown) =>
         String(value ?? '')
@@ -863,6 +905,7 @@ const mergeExcelMetricsPools = (pools: any[]): any | null => {
 
         return {
             ...totals,
+            ...(officialDiffCost !== null ? { diffCost: officialDiffCost, officialDiffCost, financialDiffSource: 'merged_official_terms' } : {}),
             items,
             groupedDifferences: Object.values(groupedMap)
         };
@@ -879,7 +922,10 @@ const mergeExcelMetricsPools = (pools: any[]): any | null => {
         groupedDifferences: [...(acc.groupedDifferences || []), ...(curr.groupedDifferences || [])]
     }), { sysQty: 0, sysCost: 0, countedQty: 0, countedCost: 0, diffQty: 0, diffCost: 0, items: [], groupedDifferences: [] });
 
-    return fallback;
+    return {
+        ...fallback,
+        ...(officialDiffCost !== null ? { diffCost: officialDiffCost, officialDiffCost, financialDiffSource: 'merged_official_terms' } : {})
+    };
 };
 
 const parseCustomDraftKeyMeta = (draftKey: string): null | { batchId?: string; scopesPart: string } => {
@@ -890,9 +936,48 @@ const parseCustomDraftKeyMeta = (draftKey: string): null | { batchId?: string; s
     return { batchId: undefined, scopesPart: match[1] || '' };
 };
 
+const normalizeCustomScopesPart = (scopesPart?: string) =>
+    String(scopesPart || '')
+        .split(',')
+        .map(part => part.trim())
+        .filter(Boolean)
+        .sort()
+        .join(',');
+
+const getCustomDraftScopesPart = (draftKey: string) =>
+    normalizeCustomScopesPart(parseCustomDraftKeyMeta(draftKey)?.scopesPart || '');
+
 const GLOBAL_UNIFIED_TERM_BATCH_ID = '__global_unified_term__';
 
 const roundAuditMoney = (value: unknown) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+const getTermMetricsTimestamp = (metrics: any) => {
+    const raw = metrics?.sourceUploadedAt || metrics?.financialDiffVerifiedAt || metrics?.updatedAt;
+    const time = raw ? Date.parse(String(raw)) : 0;
+    return Number.isFinite(time) ? time : 0;
+};
+
+const getTermMetricsQualityScore = (metrics: any) => {
+    if (!metrics) return -1;
+    let score = 0;
+    if (Array.isArray(metrics.sourceRows) && metrics.sourceRows.length > 0) score += 1000;
+    if (metrics.sourceUploadedAt) score += 250;
+    if (metrics.officialDiffCost !== undefined && metrics.officialDiffCost !== null) score += 150;
+    if (metrics.financialDiffSource === 'spreadsheet_column') score += 80;
+    if (metrics.financialDiffSource === 'calculated_cost_delta') score += 40;
+    if (Array.isArray(metrics.items) && metrics.items.length > 0) score += Math.min(metrics.items.length, 100);
+    return score;
+};
+
+const pickPreferredTermMetrics = (...metricsList: any[]) => {
+    return metricsList.filter(Boolean).reduce((best, candidate) => {
+        if (!best) return candidate;
+        const candidateScore = getTermMetricsQualityScore(candidate);
+        const bestScore = getTermMetricsQualityScore(best);
+        if (candidateScore !== bestScore) return candidateScore > bestScore ? candidate : best;
+        return getTermMetricsTimestamp(candidate) >= getTermMetricsTimestamp(best) ? candidate : best;
+    }, null as any);
+};
 
 const TERM_METADATA_KEYWORDS = [
     'filial:', 'grupo de produtos:', 'departamento:', 'categoria:',
@@ -931,6 +1016,111 @@ const summarizeTermRows = (rows: any[]) => {
     };
 };
 
+const getOfficialTermDiffCost = (metrics: any): number | null => {
+    if (!metrics) return null;
+    const raw = metrics.officialDiffCost ?? (
+        metrics.financialDiffSource ? metrics.diffCost : undefined
+    );
+    if (raw === undefined || raw === null || raw === '') return null;
+    const value = roundAuditMoney(raw);
+    return Number.isFinite(value) ? value : null;
+};
+
+const buildOfficialTermScale = (metrics: any) => {
+    const officialDiffCost = getOfficialTermDiffCost(metrics);
+    const officialDiffQty = Number(metrics?.diffQty || 0);
+    const cleanItems = (Array.isArray(metrics?.items) ? metrics.items : []).filter((item: any) => !isTermMetadataRow(item));
+    const groupedRows = Array.isArray(metrics?.groupedDifferences) ? metrics.groupedDifferences : [];
+    const sourceRows = cleanItems.length > 0 ? cleanItems : groupedRows;
+    const sourceTotals = summarizeTermRows(sourceRows);
+    const rawDiffCost = roundAuditMoney(sourceTotals.diffCost);
+    const rawDiffQty = Number(sourceTotals.diffQty || 0);
+    const shouldScaleCost =
+        officialDiffCost !== null &&
+        Math.abs(rawDiffCost) > 0.01 &&
+        Math.abs(rawDiffCost - officialDiffCost) > 0.01;
+    const shouldScaleQty =
+        Number.isFinite(officialDiffQty) &&
+        Math.abs(rawDiffQty) > 0.01 &&
+        Math.abs(rawDiffQty - officialDiffQty) > 0.01;
+
+    return {
+        cleanItems,
+        groupedRows,
+        officialDiffCost,
+        officialDiffQty,
+        shouldScaleCost,
+        shouldScaleQty,
+        costRatio: shouldScaleCost ? officialDiffCost! / rawDiffCost : 1,
+        qtyRatio: shouldScaleQty ? officialDiffQty / rawDiffQty : 1
+    };
+};
+
+const scaleTermMetricRows = (
+    rows: any[],
+    scale: ReturnType<typeof buildOfficialTermScale>,
+    adjustResidual = false
+) => {
+    const scaled = (rows || []).map((row: any) => {
+        const next = { ...row };
+        if (scale.shouldScaleCost) {
+            next.diffCost = roundAuditMoney(Number(row?.diffCost || 0) * scale.costRatio);
+            next.countedCost = roundAuditMoney(Number(next.sysCost || 0) + Number(next.diffCost || 0));
+        }
+        if (scale.shouldScaleQty) {
+            next.diffQty = Number(row?.diffQty || 0) * scale.qtyRatio;
+            next.countedQty = Number(next.sysQty || 0) + Number(next.diffQty || 0);
+        }
+        return next;
+    });
+
+    if (adjustResidual && scaled.length > 0) {
+        const last = scaled[scaled.length - 1];
+        if (scale.shouldScaleCost && scale.officialDiffCost !== null) {
+            const sumCost = roundAuditMoney(scaled.reduce((sum, row) => sum + Number(row?.diffCost || 0), 0));
+            const residualCost = roundAuditMoney(scale.officialDiffCost - sumCost);
+            if (Math.abs(residualCost) > 0.001) {
+                last.diffCost = roundAuditMoney(Number(last.diffCost || 0) + residualCost);
+                last.countedCost = roundAuditMoney(Number(last.sysCost || 0) + Number(last.diffCost || 0));
+            }
+        }
+        if (scale.shouldScaleQty && Number.isFinite(scale.officialDiffQty)) {
+            const sumQty = scaled.reduce((sum, row) => sum + Number(row?.diffQty || 0), 0);
+            const residualQty = scale.officialDiffQty - sumQty;
+            if (Math.abs(residualQty) > 0.001) {
+                last.diffQty = Number(last.diffQty || 0) + residualQty;
+                last.countedQty = Number(last.sysQty || 0) + Number(last.diffQty || 0);
+            }
+        }
+    }
+
+    return scaled;
+};
+
+const normalizeTermMetricsToOfficial = (metrics: any) => {
+    if (!metrics) return metrics;
+    const scale = buildOfficialTermScale(metrics);
+    const items = scaleTermMetricRows(scale.cleanItems, scale, false);
+    const groupedDifferences = scaleTermMetricRows(scale.groupedRows, scale, true);
+    const diffCost = scale.officialDiffCost !== null ? scale.officialDiffCost : roundAuditMoney(metrics.diffCost);
+    const sysCost = roundAuditMoney(metrics.sysCost);
+    const countedCost = scale.officialDiffCost !== null
+        ? roundAuditMoney(sysCost + diffCost)
+        : roundAuditMoney(metrics.countedCost);
+    const diffQty = Number(metrics.diffQty || 0);
+    const countedQty = Number(metrics.sysQty || 0) + diffQty;
+
+    return {
+        ...metrics,
+        sysCost,
+        countedCost,
+        diffCost,
+        countedQty,
+        items,
+        groupedDifferences
+    };
+};
+
 const getAuthoritativeTermMetrics = (
     sourceData: any,
     sourceDrafts?: Record<string, TermForm>
@@ -951,7 +1141,22 @@ const getAuthoritativeTermMetrics = (
         if (draftValue?.excelMetrics) metricsByKey.set(draftKey, draftValue.excelMetrics);
     });
 
-    const metricEntries = Array.from(metricsByKey.entries()).filter(([, metrics]) => !!metrics);
+    const dedupedMetricsByKey = new Map<string, { draftKey: string; metrics: any }>();
+    metricsByKey.forEach((metrics, draftKey) => {
+        const dedupeKey = draftKey.startsWith('custom|')
+            ? `custom|${getCustomDraftScopesPart(draftKey)}`
+            : draftKey;
+        const current = dedupedMetricsByKey.get(dedupeKey);
+        const preferred = pickPreferredTermMetrics(metrics, current?.metrics);
+        if (preferred) dedupedMetricsByKey.set(dedupeKey, {
+            draftKey: preferred === metrics ? draftKey : (current?.draftKey || draftKey),
+            metrics: preferred
+        });
+    });
+
+    const metricEntries = Array.from(dedupedMetricsByKey.values())
+        .map(({ draftKey, metrics }) => [draftKey, metrics] as [string, any])
+        .filter(([, metrics]) => !!metrics);
     if (metricEntries.length === 0) return null;
 
     const globalUnifiedEntries = metricEntries.filter(([draftKey]) =>
@@ -963,6 +1168,7 @@ const getAuthoritativeTermMetrics = (
     if (!merged) return null;
 
     const cleanItems = (Array.isArray(merged.items) ? merged.items : []).filter((item: any) => !isTermMetadataRow(item));
+    const officialDiffCost = getOfficialTermDiffCost(merged);
     const totals = cleanItems.length > 0
         ? summarizeTermRows(cleanItems)
         : {
@@ -973,6 +1179,9 @@ const getAuthoritativeTermMetrics = (
             diffQty: Number(merged.diffQty || 0),
             diffCost: roundAuditMoney(merged.diffCost)
         };
+    if (officialDiffCost !== null) {
+        totals.diffCost = officialDiffCost;
+    }
 
     return {
         ...totals,
@@ -1193,6 +1402,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         diffCost: number;
         items: any[];
         groupedDifferences?: any[];
+        sourceRows?: any[][];
+        sourceFileName?: string;
+        sourceFileSize?: number;
+        sourceUploadedAt?: string;
+        officialDiffCost?: number;
+        financialDiffSource?: string;
+        financialDiffColumnIndex?: number;
     } | null>(null);
     const termFormRef = useRef<TermForm | null>(null);
     const termDraftsRef = useRef<Record<string, TermForm>>({});
@@ -1210,33 +1426,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const termComparisonMetrics = useMemo(() => {
         if (!rawTermComparisonMetrics) return null;
 
-        const metadataKeywords = [
-            'filial:', 'grupo de produtos:', 'departamento:', 'categoria:',
-            'tipo de produto:', 'grupo de preço:', 'início contagem:',
-            'conferência de estoque', 'código', 'página 1 de', 'produto:'
-        ];
+        const newItems = (rawTermComparisonMetrics.items || []).filter((item: any) => !isTermMetadataRow(item));
 
-        const isMetadataRow = (item: any) => {
-            const codigo = String(item.code || '').trim().toLowerCase();
-            const descricao = String(item.description || '').trim().toLowerCase();
-
-            if (metadataKeywords.some(keyword => codigo.startsWith(keyword) || descricao.startsWith(keyword))) {
-                return true;
-            }
-            if ((!codigo && !descricao) || codigo === '-' || descricao === '-' || (codigo === '' && descricao === '-')) {
-                return true;
-            }
-            return false;
-        };
-
-        const newItems = (rawTermComparisonMetrics.items || []).filter((item: any) => !isMetadataRow(item));
-
-        return {
+        return normalizeTermMetricsToOfficial({
             ...rawTermComparisonMetrics,
             items: newItems,
             // Não podar grupos aqui: preservar exatamente o que foi carregado/normalizado.
             groupedDifferences: rawTermComparisonMetrics.groupedDifferences || []
-        };
+        });
     }, [rawTermComparisonMetrics]);
 
     const [expandedCatKeys, setExpandedCatKeys] = useState<Set<string>>(new Set());
@@ -1299,6 +1496,73 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     useEffect(() => {
         activeFilialRef.current = selectedFilial || '';
     }, [selectedFilial]);
+
+    const normalizeRemoteAuditSnapshot = useCallback((snapshot: AuditData): AuditData => {
+        const nextData = { ...((snapshot || {}) as any) } as AuditData;
+        if ((nextData as any).partialStart && !(nextData as any).partialStarts) {
+            (nextData as any).partialStarts = [(nextData as any).partialStart];
+        }
+        if (!(nextData as any).partialCompleted) {
+            (nextData as any).partialCompleted = [];
+        }
+        if ((nextData as any).partialCompleted) {
+            const deduped = new Map<string, any>();
+            (nextData as any).partialCompleted.forEach((p: any) => {
+                deduped.set(partialCompletedKey(p), p);
+            });
+            (nextData as any).partialCompleted = Array.from(deduped.values());
+        }
+        if (nextData.groups) {
+            nextData.groups.forEach((g: any) => {
+                g.departments.forEach((d: any) => {
+                    d.categories.forEach((c: any) => {
+                        c.status = normalizeAuditStatus(c.status);
+                        if (c.totalCost === undefined || c.totalCost === null || (c.totalCost === 0 && c.totalQuantity > 0)) {
+                            let catCost = 0;
+                            c.products.forEach((p: any) => { catCost += (p.quantity * (p.cost || 0)); });
+                            c.totalCost = catCost;
+                        }
+                    });
+                });
+            });
+        }
+        const reconciled = reconcileAuditStateFromCompletedScopes(nextData);
+        const normalized = normalizeAuditDataStructure(reconciled);
+        return (normalized.data || reconciled) as AuditData;
+    }, []);
+
+    const fetchFreshOpenAuditSnapshot = useCallback(async (): Promise<{
+        session: DbAuditSession;
+        data: AuditData;
+        drafts: Record<string, TermForm>;
+    } | null> => {
+        if (!selectedFilial) return null;
+        const latest = await fetchLatestAudit(selectedFilial);
+        if (!latest?.data || latest.status === 'completed') return null;
+        const sameAudit =
+            !dbSessionId ||
+            latest.id === dbSessionId ||
+            latest.audit_number === nextAuditNumber;
+        if (!sameAudit) return null;
+
+        const normalizedData = normalizeRemoteAuditSnapshot(latest.data as AuditData);
+        const remoteDrafts = (((normalizedData as any).termDrafts || {}) as Record<string, TermForm>);
+        const mergedDrafts = composeTermDraftsForPersist(remoteDrafts, termDraftsRef.current);
+        const nextDataWithDrafts = { ...normalizedData, termDrafts: mergedDrafts } as AuditData;
+
+        setData(nextDataWithDrafts);
+        setTermDrafts(mergedDrafts);
+        termDraftsRef.current = mergedDrafts;
+        setDbSessionId(latest.id);
+        setNextAuditNumber(latest.audit_number);
+        lastAuditUpdateRef.current = latest.updated_at || lastAuditUpdateRef.current;
+        await CacheService.set(`audit_session_${selectedFilial}`, { ...latest, data: nextDataWithDrafts } as any);
+        if (getAuditDataStrength(nextDataWithDrafts) > 0) {
+            await CacheService.set(`audit_session_lastgood_${selectedFilial}`, { ...latest, data: nextDataWithDrafts } as any);
+        }
+
+        return { session: latest, data: nextDataWithDrafts, drafts: mergedDrafts };
+    }, [composeTermDraftsForPersist, dbSessionId, nextAuditNumber, normalizeRemoteAuditSnapshot, selectedFilial]);
 
     useEffect(() => {
         if (allowedCompanies.length === 0) return;
@@ -2790,6 +3054,109 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         return Number(parseDecimalCell(val));
     };
 
+    const hasNumericCellValue = (val: any) => {
+        if (val === null || val === undefined) return false;
+        if (typeof val === 'number') return Number.isFinite(val);
+        return String(val).trim() !== '' && Number.isFinite(parseDecimalCell(val));
+    };
+
+    const normalizeHeaderText = (value: unknown) =>
+        String(value ?? '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim();
+
+    const detectTermComparisonColumns = (rows: any[][]) => {
+        const hasAny = (header: string, terms: string[]) => terms.some(term => header.includes(term));
+        const hasDiff = (header: string) => hasAny(header, ['dif', 'diverg', 'resultado']);
+        const hasMoney = (header: string) => hasAny(header, ['r$', 'financeir', 'valor', 'vlr', 'custo', 'total']);
+
+        const maxRows = Math.min(rows.length, 80);
+        let headerRowIndex = rows.slice(0, maxRows).findIndex(row => {
+            const cells = (row || []).map(normalizeHeaderText);
+            const hasCode = cells.some(cell => hasAny(cell, ['codigo reduzido', 'cod reduzido', 'codigo', 'cod.']) && !cell.includes('barras'));
+            const hasDescription = cells.some(cell => hasAny(cell, ['descricao', 'descr produto', 'produto']));
+            const hasStockColumns = cells.filter(cell => cell.includes('estoq') && !cell.includes('atual')).length >= 2;
+            const hasCostColumns = cells.filter(cell => cell.includes('custo total')).length >= 2;
+            return hasCode && hasDescription && (hasStockColumns || hasCostColumns);
+        });
+        if (headerRowIndex < 0) headerRowIndex = rows.slice(0, maxRows).findIndex(row => {
+            const cells = (row || []).map(normalizeHeaderText);
+            return cells.some(cell => cell.includes('codigo')) && cells.some(cell => cell.includes('descricao'));
+        });
+
+        const headerRow = headerRowIndex >= 0 ? rows[headerRowIndex] || [] : [];
+        const groupRow = headerRowIndex > 0 ? rows[headerRowIndex - 1] || [] : [];
+        const headers = headerRow.map(normalizeHeaderText);
+        const groupHeaders = groupRow.map(normalizeHeaderText);
+        const maxCols = Math.max(headerRow.length, groupRow.length, ...rows.slice(0, maxRows).map(row => row?.length || 0));
+        const fullHeaderAt = (col: number) => `${groupHeaders[col] || ''} ${headers[col] || ''}`.trim();
+        const findCol = (predicate: (header: string, col: number) => boolean) => {
+            for (let col = 0; col < maxCols; col++) {
+                if (predicate(fullHeaderAt(col), col)) return col;
+            }
+            return undefined;
+        };
+        const findHeaderCol = (predicate: (header: string, col: number) => boolean) => {
+            for (let col = 0; col < maxCols; col++) {
+                if (predicate(headers[col] || '', col)) return col;
+            }
+            return undefined;
+        };
+
+        const code = findHeaderCol(header => hasAny(header, ['codigo reduzido', 'cod reduzido', 'codigo', 'cod.']) && !header.includes('barras')) ?? 1;
+        const description = findHeaderCol(header => hasAny(header, ['descricao', 'descr produto', 'produto'])) ?? 2;
+        const lab = findHeaderCol(header => hasAny(header, ['laboratorio', 'lab'])) ?? 4;
+        const diffQty = findCol(header => hasDiff(header) && header.includes('estoq') && !hasMoney(header)) ?? 13;
+
+        const stockQtyCols = Array.from({ length: maxCols }, (_, col) => col)
+            .filter(col => {
+                const header = headers[col] || '';
+                return header.includes('estoq') && !header.includes('atual') && !hasDiff(header);
+            });
+        const costTotalCols = Array.from({ length: maxCols }, (_, col) => col)
+            .filter(col => (headers[col] || '').includes('custo total'));
+
+        const sysQty =
+            stockQtyCols.find(col => hasAny(groupHeaders[col] || '', ['anterior', 'sistema', 'sist'])) ??
+            stockQtyCols.filter(col => col < diffQty).pop() ??
+            10;
+        const countedQty =
+            stockQtyCols.find(col => hasAny(groupHeaders[col] || '', ['contagem', 'fisico', 'fis', 'confer'])) ??
+            stockQtyCols.find(col => col > diffQty) ??
+            14;
+        const sysCost =
+            costTotalCols.find(col => hasAny(groupHeaders[col] || '', ['anterior', 'sistema', 'sist'])) ??
+            costTotalCols.filter(col => col < diffQty).pop() ??
+            12;
+        const countedCost =
+            costTotalCols.find(col => hasAny(groupHeaders[col] || '', ['contagem', 'fisico', 'fis', 'confer'])) ??
+            costTotalCols.find(col => col > diffQty) ??
+            16;
+
+        return {
+            headerRowIndex,
+            code,
+            description,
+            lab,
+            sysQty,
+            sysCost,
+            diffQty,
+            countedQty,
+            countedCost,
+            diffCost: findCol((header, col) =>
+                col !== diffQty &&
+                col !== sysCost &&
+                col !== countedCost &&
+                hasDiff(header) &&
+                hasMoney(header) &&
+                !hasAny(header, ['%'])
+            )
+        };
+    };
+
     const normalizeText = (text?: string) => {
         if (!text) return '';
         return text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
@@ -4266,6 +4633,48 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         return customKey ? `custom|${customKey}` : '';
     };
 
+    const getCustomScopePart = (scope: TermScope) => {
+        if (scope.type !== 'custom') return '';
+        return normalizeCustomScopesPart(
+            (scope.customScopes || [])
+                .map(s => partialScopeKey(s))
+                .filter(Boolean)
+                .join(',')
+        );
+    };
+
+    const findEquivalentCustomTermPayload = (
+        scope: TermScope,
+        draftsSource: Record<string, TermForm> = {},
+        metricsStore: Record<string, any> = {}
+    ): { key: string; draft?: TermForm; metrics?: any } | null => {
+        if (scope.type !== 'custom') return null;
+        const targetScopesPart = getCustomScopePart(scope);
+        if (!targetScopesPart) return null;
+        const currentKey = buildTermKey(scope);
+        const keys = Array.from(new Set([
+            ...Object.keys(draftsSource || {}),
+            ...Object.keys(metricsStore || {})
+        ]));
+        let bestWithMetrics: { key: string; draft?: TermForm; metrics?: any } | null = null;
+        let firstDraftOnly: { key: string; draft?: TermForm; metrics?: any } | null = null;
+        for (const candidateKey of keys) {
+            if (candidateKey === currentKey || !candidateKey.startsWith('custom|')) continue;
+            if (getCustomDraftScopesPart(candidateKey) !== targetScopesPart) continue;
+            const draft = draftsSource[candidateKey];
+            const metrics = pickPreferredTermMetrics(draft?.excelMetrics, metricsStore[candidateKey]);
+            if (draft?.excelMetricsRemovedAt && !draft?.excelMetrics) continue;
+            if (metrics) {
+                if (!bestWithMetrics || pickPreferredTermMetrics(metrics, bestWithMetrics.metrics) === metrics) {
+                    bestWithMetrics = { key: candidateKey, draft, metrics };
+                }
+                continue;
+            }
+            if (draft && !firstDraftOnly) firstDraftOnly = { key: candidateKey, draft, metrics };
+        }
+        return bestWithMetrics || firstDraftOnly;
+    };
+
     const upsertScopeDraft = (
         sourceDrafts: Record<string, TermForm>,
         scope: TermScope,
@@ -4285,7 +4694,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const directDraft = termDrafts[tk];
         const backupMetrics = (((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>)[tk];
         if (directDraft?.excelMetricsRemovedAt && !directDraft?.excelMetrics) return null;
-        const draftMetrics = directDraft?.excelMetrics || backupMetrics;
+        const draftMetrics = pickPreferredTermMetrics(directDraft?.excelMetrics, backupMetrics);
         const group = data?.groups?.find(g => normalizeScopeId(g.id) === normalizeScopeId(scope.groupId));
         if (!group) return null;
         const gName = normalizeText(group.name);
@@ -4374,6 +4783,42 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 : (normalizeText(row?.catName) === cName && matchByUniqueName(catNameToIds, row?.catName, scopeCatAliases));
             return matchG && matchD && matchC;
         };
+        const summarizeScopedRows = (rows: any[]) => rows.reduce((acc: any, curr: any) => ({
+            sysQty: (acc.sysQty || 0) + Number(curr?.sysQty || 0),
+            sysCost: (acc.sysCost || 0) + Number(curr?.sysCost || 0),
+            countedQty: (acc.countedQty || 0) + Number(curr?.countedQty || 0),
+            countedCost: (acc.countedCost || 0) + Number(curr?.countedCost || 0),
+            diffQty: (acc.diffQty || 0) + Number(curr?.diffQty || 0),
+            diffCost: (acc.diffCost || 0) + Number(curr?.diffCost || 0)
+        }), { sysQty: 0, sysCost: 0, countedQty: 0, countedCost: 0, diffQty: 0, diffCost: 0 });
+        const applyOfficialTermScale = (scopedTotals: any, sourceRows: any[], metrics: any) => {
+            const officialDiffCost = getOfficialTermDiffCost(metrics);
+            const officialDiffQty = Number(metrics?.diffQty || 0);
+            const sourceTotals = summarizeScopedRows(sourceRows || []);
+            const rawSourceDiffCost = roundAuditMoney(sourceTotals.diffCost);
+            const rawScopedDiffCost = roundAuditMoney(scopedTotals.diffCost);
+            const rawSourceDiffQty = Number(sourceTotals.diffQty || 0);
+            const rawScopedDiffQty = Number(scopedTotals.diffQty || 0);
+
+            const next = { ...scopedTotals };
+            if (
+                officialDiffCost !== null &&
+                Math.abs(rawSourceDiffCost) > 0.01 &&
+                Math.abs(rawSourceDiffCost - officialDiffCost) > 0.01
+            ) {
+                next.diffCost = roundAuditMoney(rawScopedDiffCost * (officialDiffCost / rawSourceDiffCost));
+                next.countedCost = roundAuditMoney(Number(next.sysCost || 0) + Number(next.diffCost || 0));
+            }
+            if (
+                Number.isFinite(officialDiffQty) &&
+                Math.abs(rawSourceDiffQty) > 0.01 &&
+                Math.abs(rawSourceDiffQty - officialDiffQty) > 0.01
+            ) {
+                next.diffQty = rawScopedDiffQty * (officialDiffQty / rawSourceDiffQty);
+                next.countedQty = Number(next.sysQty || 0) + Number(next.diffQty || 0);
+            }
+            return next;
+        };
         // Se houver draft direto, filtra pelo escopo para evitar contaminação entre grupos.
         // Se não houver nenhum match (dados legados), mantém total bruto para não apagar.
         if (draftMetrics) {
@@ -4383,14 +4828,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 ? directItems
                 : (directGrouped.length > 0 ? directGrouped : null);
             if (source) {
-                return source.reduce((acc: any, curr: any) => ({
-                    sysQty: (acc.sysQty || 0) + Number(curr?.sysQty || 0),
-                    sysCost: (acc.sysCost || 0) + Number(curr?.sysCost || 0),
-                    countedQty: (acc.countedQty || 0) + Number(curr?.countedQty || 0),
-                    countedCost: (acc.countedCost || 0) + Number(curr?.countedCost || 0),
-                    diffQty: (acc.diffQty || 0) + Number(curr?.diffQty || 0),
-                    diffCost: (acc.diffCost || 0) + Number(curr?.diffCost || 0)
-                }), { sysQty: 0, sysCost: 0, countedQty: 0, countedCost: 0, diffQty: 0, diffCost: 0 });
+                const allSourceRows = directItems.length > 0
+                    ? (draftMetrics.items || []).filter((it: any) => !isTermMetadataRow(it))
+                    : (draftMetrics.groupedDifferences || []);
+                return applyOfficialTermScale(summarizeScopedRows(source), allSourceRows, draftMetrics);
             }
             return null;
         }
@@ -4467,14 +4908,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         if (filtered.length === 0) return null;
 
-        return filtered.reduce((acc: any, curr: any) => ({
-            sysQty: (acc.sysQty || 0) + (curr.sysQty || 0),
-            sysCost: (acc.sysCost || 0) + (curr.sysCost || 0),
-            countedQty: (acc.countedQty || 0) + (curr.countedQty || 0),
-            countedCost: (acc.countedCost || 0) + (curr.countedCost || 0),
-            diffQty: (acc.diffQty || 0) + (curr.diffQty || 0),
-            diffCost: (acc.diffCost || 0) + (curr.diffCost || 0)
-        }), { sysQty: 0, sysCost: 0, countedQty: 0, countedCost: 0, diffQty: 0, diffCost: 0 });
+        const allSourceRows = Array.isArray(base.items) && base.items.length > 0
+            ? base.items.filter((it: any) => !isTermMetadataRow(it))
+            : (base.groupedDifferences || []);
+        return applyOfficialTermScale(summarizeScopedRows(filtered), allSourceRows, base);
     }, [data, termDrafts, buildTermKey, getScopeCategories]);
 
     const sumExcelMetrics = useCallback((items: Array<any | null | undefined>) => {
@@ -4607,27 +5044,54 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         );
     };
 
-    const getLatestSignerTemplate = (): TermForm | null => {
-        const localDrafts = Object.values(termDrafts || {});
+    const getLatestSignerTemplate = (
+        draftsSource: Record<string, TermForm> = termDrafts,
+        dataSource: AuditData | null = data
+    ): TermForm | null => {
+        const localDrafts = Object.values(draftsSource || {});
         for (let i = localDrafts.length - 1; i >= 0; i--) {
             if (hasAnySignerData(localDrafts[i])) return localDrafts[i];
         }
-        const persistedDrafts = Object.values((((data as any)?.termDrafts || {}) as Record<string, TermForm>) || {});
+        const persistedDrafts = Object.values((((dataSource as any)?.termDrafts || {}) as Record<string, TermForm>) || {});
         for (let i = persistedDrafts.length - 1; i >= 0; i--) {
             if (hasAnySignerData(persistedDrafts[i])) return persistedDrafts[i];
         }
         return null;
     };
 
-    const openTermModal = (scope: TermScope) => {
+    const openTermModal = async (scope: TermScope) => {
+        let sourceData = data;
+        let sourceDrafts = termDraftsRef.current || termDrafts;
+        try {
+            const fresh = await fetchFreshOpenAuditSnapshot();
+            if (fresh) {
+                sourceData = fresh.data;
+                sourceDrafts = fresh.drafts;
+            }
+        } catch (err) {
+            console.error("Falha ao buscar atualização antes de abrir termo:", err);
+        }
+        if (!sourceData) return;
+
+        {
+        const data = sourceData;
+        const termDrafts = sourceDrafts;
         const key = buildTermKey(scope);
         const isGlobalUnifiedCustomTerm = scope.type === 'custom' && normalizeScopeId(scope.batchId) === GLOBAL_UNIFIED_TERM_BATCH_ID;
         let draft = termDrafts[key];
         const legacyKey = getLegacyCustomTermKey(scope);
         if (!draft && scope.type === 'custom' && scope.batchId && legacyKey) draft = termDrafts[legacyKey];
-        const backupMetrics = (((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>)[key];
+        const metricsStore = (((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>);
+        const equivalentCustomPayload = findEquivalentCustomTermPayload(scope, termDrafts, metricsStore);
+        if (!draft && equivalentCustomPayload?.draft) draft = equivalentCustomPayload.draft;
+        const backupMetrics = pickPreferredTermMetrics(
+            metricsStore[key],
+            legacyKey ? metricsStore[legacyKey] : undefined,
+            equivalentCustomPayload?.metrics
+        );
+        const resolvedExcelMetrics = normalizeTermMetricsToOfficial(pickPreferredTermMetrics(draft?.excelMetrics, backupMetrics));
         const hasExplicitRemovalDraft = !!(draft?.excelMetricsRemovedAt && !draft?.excelMetrics);
-        const signerTemplate = getLatestSignerTemplate();
+        const signerTemplate = getLatestSignerTemplate(termDrafts, data);
         const nextFormBase = draft
             ? (!draft.inventoryNumber && (inventoryNumber || data?.inventoryNumber)
                 ? { ...draft, inventoryNumber: inventoryNumber || data?.inventoryNumber || '' }
@@ -4635,8 +5099,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             : (signerTemplate
                 ? applyTermSigners(createDefaultTermForm(), signerTemplate)
                 : createDefaultTermForm());
-        const nextForm = (!isGlobalUnifiedCustomTerm && !hasExplicitRemovalDraft && backupMetrics && !nextFormBase?.excelMetrics)
-            ? { ...nextFormBase, excelMetrics: backupMetrics }
+        const nextForm = (!isGlobalUnifiedCustomTerm && !hasExplicitRemovalDraft && resolvedExcelMetrics)
+            ? { ...nextFormBase, excelMetrics: resolvedExcelMetrics }
             : nextFormBase;
         setTermModal(scope);
         setTermForm(nextForm);
@@ -4706,9 +5170,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             ? null
             : (isGlobalUnifiedCustomTerm
                 ? mergeExcelMetricsPools(fallbackPools as any[])
-                : (draft?.excelMetrics || mergeExcelMetricsPools(fallbackPools as any[])));
+                : (resolvedExcelMetrics || mergeExcelMetricsPools(fallbackPools as any[])));
 
-        const hasDirectExcelMetrics = !!draft?.excelMetrics && !isGlobalUnifiedCustomTerm;
+        const hasDirectExcelMetrics = !!resolvedExcelMetrics && !isGlobalUnifiedCustomTerm;
         let nextMetrics = hasDirectExcelMetrics ? rawPool : null;
         const metricsMissingScopeIds = (metrics: any) => {
             if (!metrics) return false;
@@ -5161,16 +5625,47 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
         }
 
-        setTermComparisonMetrics(nextMetrics);
+        setTermComparisonMetrics(normalizeTermMetricsToOfficial(nextMetrics));
 
         // Persist re-classified metrics & form to termDrafts always (not conditional on reference equality)
-        const formToSave = nextMetrics
-            ? { ...nextForm, excelMetrics: nextMetrics }
+        const normalizedNextMetrics = normalizeTermMetricsToOfficial(nextMetrics);
+        const formToSave = normalizedNextMetrics
+            ? { ...nextForm, excelMetrics: normalizedNextMetrics }
             : (nextForm?.excelMetrics
-                ? nextForm
-                : ((draft?.excelMetrics ? { ...nextForm, excelMetrics: draft.excelMetrics } : nextForm)));
-        setTermDrafts(current => upsertScopeDraft(current, scope as any, formToSave));
+                ? { ...nextForm, excelMetrics: normalizeTermMetricsToOfficial(nextForm.excelMetrics) }
+                : ((draft?.excelMetrics ? { ...nextForm, excelMetrics: normalizeTermMetricsToOfficial(draft.excelMetrics) } : nextForm)));
+        setTermDrafts(current => {
+            const mergedBase = composeTermDraftsForPersist(current, termDrafts);
+            const nextDrafts = upsertScopeDraft(mergedBase, scope as any, formToSave);
+            termDraftsRef.current = nextDrafts;
+            return nextDrafts;
+        });
+        }
     };
+
+    useEffect(() => {
+        if (!termModal || !termForm) return;
+        const key = buildTermKey(termModal);
+        const legacyKey = getLegacyCustomTermKey(termModal);
+        const metricsStore = (((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>);
+        const equivalentCustomPayload = findEquivalentCustomTermPayload(termModal, termDrafts, metricsStore);
+        const draft = termDrafts[key] || (legacyKey ? termDrafts[legacyKey] : undefined) || equivalentCustomPayload?.draft;
+        const backupMetrics = pickPreferredTermMetrics(
+            metricsStore[key],
+            legacyKey ? metricsStore[legacyKey] : undefined,
+            equivalentCustomPayload?.metrics
+        );
+        const remoteMetrics = normalizeTermMetricsToOfficial(pickPreferredTermMetrics(draft?.excelMetrics, backupMetrics));
+        const explicitlyRemoved = !!(draft?.excelMetricsRemovedAt && !draft?.excelMetrics);
+        if (!remoteMetrics || explicitlyRemoved) return;
+
+        if (!termForm.excelMetrics) {
+            setTermForm(prev => prev && !prev.excelMetrics ? { ...prev, excelMetrics: remoteMetrics } : prev);
+        }
+        if (!rawTermMetricsRef.current) {
+            setTermComparisonMetrics(remoteMetrics);
+        }
+    }, [data, termDrafts, termForm, termModal]);
 
     const updateTermForm = (updater: (prev: TermForm) => TermForm, options?: { skipReplication?: boolean }) => {
         setTermForm(prev => {
@@ -5180,11 +5675,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (termModal) {
                 const key = buildTermKey(termModal);
                 setTermDrafts(current => {
-                    const persistedMetrics =
-                        rawTermMetricsRef.current ||
-                        termComparisonMetrics ||
-                        next.excelMetrics ||
-                        current[key]?.excelMetrics;
+                    const persistedMetrics = normalizeTermMetricsToOfficial(pickPreferredTermMetrics(
+                        rawTermMetricsRef.current,
+                        termComparisonMetrics,
+                        next.excelMetrics,
+                        current[key]?.excelMetrics
+                    ));
                     const currentScopeDrafts = upsertScopeDraft(
                         current,
                         termModal,
@@ -5239,10 +5735,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 // Monta estrutura de salvamento baseada nos dados mais recentes
                 const key = buildTermKey(termModal);
                 const forceClearedFlag = removedExcelDraftKeysRef.current.has(key);
+                const latestBackupMetrics = (((baseData as any)?.termExcelMetricsByKey || {}) as Record<string, any>)[key];
                 const latestDraftAtKey = baseDrafts[key] || termDrafts[key];
-                const hasAnyMetricsInMemory = !!(rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || finalForm.excelMetrics || latestDraftAtKey?.excelMetrics);
+                const hasAnyMetricsInMemory = !!(rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || finalForm.excelMetrics || latestDraftAtKey?.excelMetrics || latestBackupMetrics);
                 const forceCleared = forceClearedFlag && !hasAnyMetricsInMemory;
-                const persistedMetrics = forceCleared ? undefined : (rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || finalForm.excelMetrics || latestDraftAtKey?.excelMetrics);
+                const persistedMetrics = forceCleared ? undefined : normalizeTermMetricsToOfficial(pickPreferredTermMetrics(
+                    rawTermMetricsRef.current,
+                    rawTermComparisonMetrics,
+                    termComparisonMetrics,
+                    finalForm.excelMetrics,
+                    latestDraftAtKey?.excelMetrics,
+                    latestBackupMetrics
+                ));
                 
                 const formToSave = persistedMetrics ? { ...finalForm, excelMetrics: persistedMetrics } : (latestDraftAtKey || finalForm);
                 const nextDrafts = forceCleared ? baseDrafts : upsertScopeDraft(baseDrafts, termModal, formToSave);
@@ -5252,6 +5756,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const nextDataWithTerms = { ...baseData, termDrafts: syncedDrafts } as any;
                 
                 setTermDrafts(syncedDrafts);
+                termDraftsRef.current = syncedDrafts;
                 setData(nextDataWithTerms as AuditData);
 
                 // Dispara salvamento pro DB passando allowProgressRegression para contornar qualquer rejeição de timestamp
@@ -5294,15 +5799,24 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const baseDrafts = (baseData as any).termDrafts || {};
             const key = buildTermKey(termModal);
             const forceClearedFlag = removedExcelDraftKeysRef.current.has(key);
+            const latestBackupMetrics = (((baseData as any)?.termExcelMetricsByKey || {}) as Record<string, any>)[key];
             const latestDraftAtKey = baseDrafts[key] || termDrafts[key];
-            const hasAnyMetricsInMemory = !!(rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || termForm.excelMetrics || latestDraftAtKey?.excelMetrics);
+            const hasAnyMetricsInMemory = !!(rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || termForm.excelMetrics || latestDraftAtKey?.excelMetrics || latestBackupMetrics);
             const forceCleared = forceClearedFlag && !hasAnyMetricsInMemory;
-            const persistedMetrics = forceCleared ? undefined : (rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics || termForm.excelMetrics || latestDraftAtKey?.excelMetrics);
+            const persistedMetrics = forceCleared ? undefined : normalizeTermMetricsToOfficial(pickPreferredTermMetrics(
+                rawTermMetricsRef.current,
+                rawTermComparisonMetrics,
+                termComparisonMetrics,
+                termForm.excelMetrics,
+                latestDraftAtKey?.excelMetrics,
+                latestBackupMetrics
+            ));
             const formToSave = persistedMetrics ? { ...termForm, excelMetrics: persistedMetrics } : termForm;
             const nextDrafts = forceCleared ? baseDrafts : upsertScopeDraft(baseDrafts, termModal, formToSave);
             const syncedDrafts = replicateSignersToAllTermDrafts(nextDrafts, termForm);
             const nextDataWithTerms = { ...baseData, termDrafts: syncedDrafts } as any;
             setTermDrafts(syncedDrafts);
+            termDraftsRef.current = syncedDrafts;
             setData(nextDataWithTerms as AuditData);
             const savedSession = await persistAuditSession({
                 id: freshLatest?.id || dbSessionId,
@@ -5355,9 +5869,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const persistedMetrics =
                 forceCleared
                     ? undefined
-                    : (currentMetrics ||
-                        currentForm.excelMetrics ||
-                        latestDraftAtKey?.excelMetrics);
+                    : normalizeTermMetricsToOfficial(pickPreferredTermMetrics(
+                        currentMetrics,
+                        currentForm.excelMetrics,
+                        latestDraftAtKey?.excelMetrics
+                    ));
             const formToSave = persistedMetrics
                 ? { ...currentForm, excelMetrics: persistedMetrics }
                 : (latestDraftAtKey || currentForm);
@@ -5379,12 +5895,52 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
             const nextDataWithTerms = { ...currentData, termDrafts: syncedDrafts, termExcelMetricsByKey: metricsStore } as any;
             setTermDrafts(syncedDrafts);
+            termDraftsRef.current = syncedDrafts;
             setData(nextDataWithTerms as AuditData);
             void (async () => {
                 try {
+                    let dataToPersist = nextDataWithTerms;
+                    let sessionIdToPersist = dbSessionId;
+                    let auditNumberToPersist = nextAuditNumber;
+                    let statusToPersist: DbAuditSession['status'] = 'open';
+                    let updatedAtToPersist = lastAuditUpdateRef.current || undefined;
+                    const fresh = await fetchFreshOpenAuditSnapshot();
+                    if (fresh) {
+                        const remoteMetricsStore = { ...(((fresh.data as any)?.termExcelMetricsByKey || {}) as Record<string, any>) };
+                        const remoteDrafts = fresh.drafts || {};
+                        const latestBackupMetrics = remoteMetricsStore[key];
+                        const latestDraftAtKey = remoteDrafts[key] || syncedDrafts[key];
+                        const freshPersistedMetrics = forceCleared
+                            ? undefined
+                            : normalizeTermMetricsToOfficial(pickPreferredTermMetrics(
+                                persistedMetrics,
+                                latestDraftAtKey?.excelMetrics,
+                                latestBackupMetrics
+                            ));
+                        const freshFormToSave = freshPersistedMetrics
+                            ? { ...currentForm, excelMetrics: freshPersistedMetrics }
+                            : (latestDraftAtKey || currentForm);
+                        const freshDrafts = forceCleared
+                            ? remoteDrafts
+                            : upsertScopeDraft(remoteDrafts, currentScope, freshFormToSave);
+                        const freshSyncedDrafts = replicateSignersToAllTermDrafts(freshDrafts, currentForm);
+                        if (forceCleared) {
+                            delete remoteMetricsStore[key];
+                        } else if (freshPersistedMetrics) {
+                            remoteMetricsStore[key] = freshPersistedMetrics;
+                        }
+                        dataToPersist = { ...fresh.data, termDrafts: freshSyncedDrafts, termExcelMetricsByKey: remoteMetricsStore } as any;
+                        sessionIdToPersist = fresh.session.id;
+                        auditNumberToPersist = fresh.session.audit_number;
+                        statusToPersist = fresh.session.status;
+                        updatedAtToPersist = fresh.session.updated_at || updatedAtToPersist;
+                        setTermDrafts(freshSyncedDrafts);
+                        termDraftsRef.current = freshSyncedDrafts;
+                        setData(dataToPersist as AuditData);
+                    }
                     let skus = 0;
                     let doneSkus = 0;
-                    (nextDataWithTerms.groups || []).forEach((g: any) =>
+                    (dataToPersist.groups || []).forEach((g: any) =>
                         (g.departments || []).forEach((d: any) =>
                             (d.categories || []).forEach((c: any) => {
                                 skus += Number(c.itemsCount || 0);
@@ -5394,14 +5950,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     );
                     const progress = skus > 0 ? (doneSkus / skus) * 100 : 0;
                     const savedSession = await persistAuditSession({
-                        id: dbSessionId,
+                        id: sessionIdToPersist,
                         branch: selectedFilial,
-                        audit_number: nextAuditNumber,
-                        status: 'open',
-                        data: nextDataWithTerms,
+                        audit_number: auditNumberToPersist,
+                        status: statusToPersist,
+                        data: dataToPersist,
                         progress: progress,
-                        user_email: userEmail
-                    });
+                        user_email: userEmail,
+                        updated_at: updatedAtToPersist
+                    }, { allowProgressRegression: true });
                     if (savedSession) {
                         await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
                     }
@@ -5413,7 +5970,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 removedExcelDraftKeysRef.current.delete(key);
             }
         }
-    }, [termModal, termForm, rawTermComparisonMetrics, termComparisonMetrics, data, termDrafts, dbSessionId, selectedFilial, nextAuditNumber, userEmail, isReadOnlyCompletedView, composeTermDraftsForPersist]);
+    }, [termModal, termForm, rawTermComparisonMetrics, termComparisonMetrics, data, termDrafts, dbSessionId, selectedFilial, nextAuditNumber, userEmail, isReadOnlyCompletedView, fetchFreshOpenAuditSnapshot]);
 
     const handleProcessTermComparisonExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
         if (isReadOnlyCompletedView) {
@@ -5429,6 +5986,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         try {
             const rows = await readExcel(file);
+            const termColumns = detectTermComparisonColumns(rows);
             let sysQty = 0;
             let sysCost = 0;
             let countedQty = 0;
@@ -5473,8 +6031,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 };
             };
 
+            type TermHierarchyEntry = { groupId?: string, groupName: string, deptId?: string, deptName: string, catId?: string, catName: string };
+
+            const addUniqueHierarchyEntry = (
+                registry: Map<string, TermHierarchyEntry[]>,
+                code: unknown,
+                entry: TermHierarchyEntry
+            ) => {
+                const key = normalizeBarcode(code);
+                if (!key) return;
+                const current = registry.get(key) || [];
+                const alreadyExists = current.some(existing =>
+                    normalizeScopeId(existing.groupId) === normalizeScopeId(entry.groupId) &&
+                    normalizeScopeId(existing.deptId) === normalizeScopeId(entry.deptId) &&
+                    normalizeScopeId(existing.catId) === normalizeScopeId(entry.catId) &&
+                    normalizeText(existing.groupName) === normalizeText(entry.groupName) &&
+                    normalizeText(existing.deptName) === normalizeText(entry.deptName) &&
+                    normalizeText(existing.catName) === normalizeText(entry.catName)
+                );
+                if (!alreadyExists) {
+                    current.push(entry);
+                    registry.set(key, current);
+                }
+            };
+
             // --- Universal Registry: fallback scan of ALL group cadastro files ---
-            const universalRegistry = new Map<string, Array<{ groupId?: string, groupName: string, deptId?: string, deptName: string, catId?: string, catName: string }>>();
+            const universalRegistry = new Map<string, TermHierarchyEntry[]>();
 
             const loadUniversalRegistry = async () => {
                 const allGroupFiles = { ...globalGroupFiles, ...groupFiles };
@@ -5501,8 +6083,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             const codes = collectProductCodeCandidates(row, 12);
                             codes.forEach(code => {
                                 if (!code) return;
-                                const current = universalRegistry.get(code) || [];
-                                current.push({
+                                addUniqueHierarchyEntry(universalRegistry, code, {
                                     groupId: normalizeScopeId(groupId),
                                     groupName,
                                     deptId: normalizeScopeId(deptParsed.numericId),
@@ -5510,14 +6091,106 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     catId: normalizeScopeId(catParsed.numericId),
                                     catName
                                 });
-                                universalRegistry.set(code, current);
                             });
                         });
                     } catch (err) { }
                 }
             };
 
-            await loadUniversalRegistry();
+            // --- Branch history registry: reuse previous finalized/open uploads from this branch ---
+            const branchHistoryRegistry = new Map<string, TermHierarchyEntry[]>();
+
+            const isUsableHistoryEntry = (entry: TermHierarchyEntry) => {
+                return Boolean(
+                    normalizeScopeId(entry.groupId) &&
+                    String(entry.groupName || '').trim() &&
+                    !isDiversosLabel(entry.groupName) &&
+                    normalizeScopeId(entry.deptId) &&
+                    String(entry.deptName || '').trim() &&
+                    !isDiversosLabel(entry.deptName) &&
+                    normalizeScopeId(entry.catId) &&
+                    String(entry.catName || '').trim() &&
+                    !isDiversosLabel(entry.catName)
+                );
+            };
+
+            const addHistoryClassification = (code: unknown, entry: TermHierarchyEntry) => {
+                if (!isUsableHistoryEntry(entry)) return;
+                addUniqueHierarchyEntry(branchHistoryRegistry, code, {
+                    groupId: normalizeScopeId(entry.groupId),
+                    groupName: String(entry.groupName || '').trim(),
+                    deptId: normalizeScopeId(entry.deptId),
+                    deptName: String(entry.deptName || '').trim(),
+                    catId: normalizeScopeId(entry.catId),
+                    catName: String(entry.catName || '').trim()
+                });
+            };
+
+            const addMetricsItemsToHistory = (metrics: any) => {
+                (Array.isArray(metrics?.items) ? metrics.items : []).forEach((item: any) => {
+                    addHistoryClassification(item?.code || item?.reducedCode || item?.barcode, {
+                        groupId: normalizeScopeId(item?.groupId),
+                        groupName: item?.groupName || '',
+                        deptId: normalizeScopeId(item?.deptId),
+                        deptName: item?.deptName || '',
+                        catId: normalizeScopeId(item?.catId),
+                        catName: item?.catName || ''
+                    });
+                });
+            };
+
+            const addAuditDataToHistoryRegistry = (sourceData: any) => {
+                if (!sourceData) return;
+
+                (sourceData.groups || []).forEach((group: any) => {
+                    (group.departments || []).forEach((department: any) => {
+                        (department.categories || []).forEach((category: any) => {
+                            const entry: TermHierarchyEntry = {
+                                groupId: normalizeScopeId(group.id),
+                                groupName: group.name || GROUP_CONFIG_DEFAULTS[normalizeScopeId(group.id)] || '',
+                                deptId: normalizeScopeId(department.id || department.numericId),
+                                deptName: department.name || '',
+                                catId: normalizeScopeId(category.id || category.numericId),
+                                catName: category.name || ''
+                            };
+                            (category.products || []).forEach((product: any) => {
+                                [
+                                    product?.reducedCode,
+                                    product?.code,
+                                    product?.barcode,
+                                    product?.codigo,
+                                    product?.codReduzido,
+                                    product?.id
+                                ].forEach(code => addHistoryClassification(code, entry));
+                            });
+                        });
+                    });
+                });
+
+                Object.values(sourceData.termExcelMetricsByKey || {}).forEach(addMetricsItemsToHistory);
+                Object.values(sourceData.termDrafts || {}).forEach((draft: any) => addMetricsItemsToHistory(draft?.excelMetrics));
+            };
+
+            const loadBranchHistoryRegistry = async () => {
+                addAuditDataToHistoryRegistry(data);
+                try {
+                    const history = await fetchAuditsHistory(selectedFilial);
+                    const sessions = await Promise.all(
+                        (history || [])
+                            .slice(0, 12)
+                            .map(async (audit) => {
+                                if (audit?.id && dbSessionId && audit.id === dbSessionId) return null;
+                                if (!audit?.audit_number) return null;
+                                return fetchAuditSession(selectedFilial, audit.audit_number);
+                            })
+                    );
+                    sessions.forEach(session => addAuditDataToHistoryRegistry(session?.data));
+                } catch (err) {
+                    console.warn('Falha ao carregar historico de classificacao da filial:', err);
+                }
+            };
+
+            await Promise.all([loadUniversalRegistry(), loadBranchHistoryRegistry()]);
 
             // Pre-build hierarchy lookup for fast cross-referencing Col B (código reduzido)
             // Can contain multiple hierarchies if the item spans groups
@@ -5566,7 +6239,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             // --- Secondary lookup: read cadastro file directly for this group ---
             // Pega itens com estoque zero (não em data.groups) via Col B e Col C (código reduzido)
-            const cadastroLookup = new Map<string, { groupId?: string; deptId?: string; deptName: string; catId?: string; catName: string }>();
+            const cadastroLookup = new Map<string, TermHierarchyEntry>();
             if (primaryScopeGroupId) {
                 const groupIdKey = primaryScopeGroupId as typeof GROUP_UPLOAD_IDS[number];
                 const cadastroFile = groupFiles[groupIdKey] || globalGroupFiles[groupIdKey];
@@ -5592,6 +6265,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 if (!codeCandidate) return;
                                 const candidate = {
                                     groupId: normalizeScopeId(primaryScopeGroupId),
+                                    groupName: GROUP_CONFIG_DEFAULTS[normalizeScopeId(primaryScopeGroupId)] || `Grupo ${primaryScopeGroupId}`,
                                     deptId: normalizeScopeId(deptParsed.numericId),
                                     deptName,
                                     catId: normalizeScopeId(catParsed.numericId),
@@ -5629,18 +6303,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             const groupedMap: Record<string, { groupId?: string, groupName: string, deptId?: string, deptName: string, catId?: string, catName: string, sysQty: number, sysCost: number, countedQty: number, countedCost: number, diffQty: number, diffCost: number }> = {};
 
-            // Skip header (row 0), process data rows
-            for (let i = 1; i < rows.length; i++) {
+            // Process rows after the real table header; metadata above it is ignored.
+            const firstProductRowIndex = termColumns.headerRowIndex >= 0 ? termColumns.headerRowIndex + 1 : 1;
+            for (let i = firstProductRowIndex; i < rows.length; i++) {
                 const row = rows[i];
                 if (!row) continue;
 
                 // Se houver "Total Geral", ignorar
-                const desc = String(row[1] || '').trim().toLowerCase();
-                const colG = String(row[6] || '').trim().toLowerCase();
-                const codigo = String(row[1] || '').trim(); // B: Cód Reduzido
-                const descricao = String(row[2] || '').trim(); // C: Descrição
+                const rowText = row.map(cell => String(cell || '').trim().toLowerCase()).join(' | ');
+                const codigo = String(row[termColumns.code] || '').trim();
+                const descricao = String(row[termColumns.description] || '').trim();
 
-                if (desc.includes('total geral') || colG.includes('total geral')) {
+                if (rowText.includes('total geral')) {
                     continue;
                 }
 
@@ -5668,42 +6342,37 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
                 // Real product rows in this report will have a numeric value in column K (sysQty) and O (countedQty)
                 // Metadata rows usually have empty strings or spaces there, or don't reach those indices
-                const sqStr = String(row[10] || '').trim();
-                const cqStr = String(row[14] || '').trim();
+                const sqStr = String(row[termColumns.sysQty] || '').trim();
+                const cqStr = String(row[termColumns.countedQty] || '').trim();
                 const isNotProductRow = sqStr === '' && cqStr === '';
 
                 if (isHeader || isHyphenRow || isNotProductRow) {
                     continue;
                 }
 
-                // Índices informados:
-                // C (2): Descrição
-                // K (10): Estoque Sistema
-                // M (12): Custo Sistema (Valores M)
-                // N (13): Diferença (Qtd)
-                // O (14): Estoque Físico
-                // Q (16): Custo Físico (Valores Q - Diferença financeira seria Q - M)
-
-                const sq = parseStockNumber(row[10]); // K
-                const sc = parseStockNumber(row[12]); // M
-                const cq = parseStockNumber(row[14]); // O
-                const cc = parseStockNumber(row[16]); // Q
+                const sq = parseStockNumber(row[termColumns.sysQty]);
+                const sc = parseStockNumber(row[termColumns.sysCost]);
+                const cq = parseStockNumber(row[termColumns.countedQty]);
+                const cc = parseStockNumber(row[termColumns.countedCost]);
 
                 // A diferença QTD agora é calculada matematicamente (Físico - Sistema) em vez de ler a coluna N, 
                 // pois a soma literal de N estava gerando valores incorretos (+71.488 un).
                 const dq = cq - sq;
 
                 // Captura os dados básicos da linha para imprimir no termo depois
-                const code = String(row[1] || '').trim(); // B: Cód Reduzido
-                const description = String(row[2] || '').trim(); // C: Descrição
-                const lab = String(row[3] || '').trim();
+                const code = String(row[termColumns.code] || '').trim();
+                const description = String(row[termColumns.description] || '').trim();
+                const lab = String(row[termColumns.lab] || '').trim();
 
                 sysQty += sq;
                 sysCost += sc;
                 countedQty += cq;
                 countedCost += cc;
                 diffQtySum += dq;
-                const costDiff = cc - sc;
+                const directCostDiff = termColumns.diffCost !== undefined && hasNumericCellValue(row[termColumns.diffCost])
+                    ? parseStockNumber(row[termColumns.diffCost])
+                    : null;
+                const costDiff = directCostDiff ?? (cc - sc);
                 diffCostSum += costDiff;
 
                 // Identifica a Hierarquia cruzando com memory database
@@ -5716,11 +6385,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 let registries = productLookup.get(normalizedCode) || [];
                 let localCadastroEntry = cadastroLookup.get(normalizedCode);
                 let universalEntries = universalRegistry.get(normalizedCode) || [];
+                let historyEntries = branchHistoryRegistry.get(normalizedCode) || [];
                 const manualScope = TERM_MANUAL_CLASSIFICATION_BY_CODE[normalizedCode];
                 const manualEntry = manualScope ? resolveHierarchyByIds(manualScope.groupId, manualScope.deptId, manualScope.catId) : null;
 
                 // Multi-match agressivo: Se não achou pelas vias normais na coluna B, vasculha A até F
-                if (registries.length === 0 && !localCadastroEntry && universalEntries.length === 0) {
+                if (registries.length === 0 && !localCadastroEntry && universalEntries.length === 0 && historyEntries.length === 0) {
                     for (let c = 0; c <= 5; c++) {
                         if (c === 1) continue; // já testou
                         const testCode = normalizeBarcode(row[c]);
@@ -5740,6 +6410,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 universalEntries = universalRegistry.get(testCode) || [];
                                 break;
                             }
+                            if (branchHistoryRegistry.has(testCode)) {
+                                normalizedCode = testCode;
+                                historyEntries = branchHistoryRegistry.get(testCode) || [];
+                                break;
+                            }
                         }
                     }
                 }
@@ -5752,7 +6427,23 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         : undefined);
                 const globalRegistryEntry = registries[0];
                 // Para classificar termo, CADASTRO/MANUAL prevalece sobre estrutura derivada do estoque.
-                const cadastroPreferredEntry = manualEntry || localCadastroEntry || pickBestHierarchyEntry(universalEntries, primaryScopeGroupId);
+                const getUsableEntry = (entry: TermHierarchyEntry | null | undefined) =>
+                    entry && isUsableHistoryEntry(entry) ? entry : null;
+                const pickUsableEntry = (entries: TermHierarchyEntry[]) =>
+                    getUsableEntry(pickBestHierarchyEntry(entries, primaryScopeGroupId) as TermHierarchyEntry | null);
+                const manualPreferredEntry = getUsableEntry(manualEntry as TermHierarchyEntry | null);
+                const localPreferredEntry = getUsableEntry(localCadastroEntry as TermHierarchyEntry | null);
+                const universalPreferredEntry = pickUsableEntry(universalEntries);
+                const historyPreferredEntry = pickUsableEntry(historyEntries);
+                const cadastroPreferredEntry =
+                    manualPreferredEntry ||
+                    localPreferredEntry ||
+                    universalPreferredEntry ||
+                    historyPreferredEntry ||
+                    manualEntry ||
+                    localCadastroEntry ||
+                    pickBestHierarchyEntry(universalEntries, primaryScopeGroupId) ||
+                    pickBestHierarchyEntry(historyEntries, primaryScopeGroupId);
                 const fallbackEntry = cadastroPreferredEntry || contextRegistryEntry || globalRegistryEntry;
                 const resolvedGroupName =
                     (cadastroPreferredEntry as any)?.groupName ||
@@ -5765,10 +6456,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 let hierarchy = {
                     groupId: normalizeScopeId((cadastroPreferredEntry as any)?.groupId) || normalizeScopeId(contextRegistryEntry?.groupId) || normalizeScopeId(fallbackEntry?.groupId) || normalizeScopeId(primaryScopeGroupId) || '',
                     groupName: resolvedGroupName,
-                    deptId: normalizeScopeId(localCadastroEntry?.deptId) || normalizeScopeId((cadastroPreferredEntry as any)?.deptId) || normalizeScopeId(contextRegistryEntry?.deptId) || normalizeScopeId(fallbackEntry?.deptId) || '',
-                    deptName: localCadastroEntry?.deptName || (cadastroPreferredEntry as any)?.deptName || contextRegistryEntry?.deptName || fallbackEntry?.deptName || 'DIVERSOS (SEM DEPARTAMENTO)',
-                    catId: normalizeScopeId(localCadastroEntry?.catId) || normalizeScopeId((cadastroPreferredEntry as any)?.catId) || normalizeScopeId(contextRegistryEntry?.catId) || normalizeScopeId(fallbackEntry?.catId) || '',
-                    catName: localCadastroEntry?.catName || (cadastroPreferredEntry as any)?.catName || contextRegistryEntry?.catName || fallbackEntry?.catName || 'DIVERSOS (SEM CATEGORIA)'
+                    deptId: normalizeScopeId((cadastroPreferredEntry as any)?.deptId) || normalizeScopeId(localCadastroEntry?.deptId) || normalizeScopeId(contextRegistryEntry?.deptId) || normalizeScopeId(fallbackEntry?.deptId) || '',
+                    deptName: (cadastroPreferredEntry as any)?.deptName || localCadastroEntry?.deptName || contextRegistryEntry?.deptName || fallbackEntry?.deptName || 'DIVERSOS (SEM DEPARTAMENTO)',
+                    catId: normalizeScopeId((cadastroPreferredEntry as any)?.catId) || normalizeScopeId(localCadastroEntry?.catId) || normalizeScopeId(contextRegistryEntry?.catId) || normalizeScopeId(fallbackEntry?.catId) || '',
+                    catName: (cadastroPreferredEntry as any)?.catName || localCadastroEntry?.catName || contextRegistryEntry?.catName || fallbackEntry?.catName || 'DIVERSOS (SEM CATEGORIA)'
                 };
 
                 // Forçar hierarquia do sistema se for órfão mas tiver nome de categoria válido no mix da filial
@@ -5825,6 +6516,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             // Convert map to sorted array (Sort by highest cost difference missing)
             const groupedDifferences = Object.values(groupedMap).sort((a, b) => a.diffCost - b.diffCost);
+            const officialDiffCost = roundAuditMoney(diffCostSum);
 
             const payload = {
                 sysQty,
@@ -5832,9 +6524,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 countedQty,
                 countedCost,
                 diffQty: diffQtySum,
-                diffCost: diffCostSum,
+                diffCost: officialDiffCost,
+                officialDiffCost,
+                financialDiffSource: termColumns.diffCost !== undefined ? 'spreadsheet_column' : 'calculated_cost_delta',
+                financialDiffColumnIndex: termColumns.diffCost,
                 items,
-                groupedDifferences
+                groupedDifferences,
+                sourceRows: rows,
+                sourceFileName: file.name,
+                sourceFileSize: file.size,
+                sourceUploadedAt: new Date().toISOString()
             };
 
             setTermComparisonMetrics(payload);
@@ -5952,6 +6651,108 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         // Reset input value to allow uploading the same file again if needed
         e.target.value = '';
+    };
+
+    const downloadTermComparisonExcel = () => {
+        const metrics = normalizeTermMetricsToOfficial(
+            pickPreferredTermMetrics(rawTermMetricsRef.current, termComparisonMetrics, termForm?.excelMetrics)
+        );
+        if (!metrics) {
+            alert("Nenhuma planilha de divergências carregada para baixar.");
+            return;
+        }
+
+        const sanitizeFileToken = (value: unknown) =>
+            String(value || '')
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/[^a-zA-Z0-9_-]+/g, '_')
+                .replace(/^_+|_+$/g, '')
+                .slice(0, 80);
+
+        const wb = XLSX.utils.book_new();
+        const sourceRows = Array.isArray((metrics as any).sourceRows)
+            ? ((metrics as any).sourceRows as any[][])
+            : [];
+
+        if (sourceRows.length > 0) {
+            const wsOriginal = XLSX.utils.aoa_to_sheet(sourceRows);
+            XLSX.utils.book_append_sheet(wb, wsOriginal, "Excel Carregado");
+        }
+
+        const scopeInfo = termModal ? buildTermScopeInfo(termModal) : null;
+        const summaryRows = [
+            ['Resumo Identificado', ''],
+            ['Filial', data?.filial ? `Filial ${data.filial}` : selectedFilial || ''],
+            ['Nº Inventário', termForm?.inventoryNumber || inventoryNumber || data?.inventoryNumber || ''],
+            ['Nº Auditoria', nextAuditNumber || ''],
+            ['Escopo', termModal?.type || ''],
+            ['Grupo', scopeInfo?.group?.name || ''],
+            ['Departamentos', (scopeInfo?.departments || []).map(d => d.name).join(', ')],
+            ['Categorias', (scopeInfo?.categories || []).map(c => c.name).join(', ')],
+            ['Arquivo de origem', (metrics as any).sourceFileName || 'Reconstruído a partir dos dados salvos'],
+            ['Carregado em', (metrics as any).sourceUploadedAt || ''],
+            [],
+            ['Estoque Sistema (Qtde)', Number(metrics.sysQty || 0)],
+            ['Custo Total Sistema (R$)', roundAuditMoney(metrics.sysCost)],
+            ['Estoque Físico (Qtde)', Number(metrics.countedQty || 0)],
+            ['Custo Total Físico (R$)', roundAuditMoney(metrics.countedCost)],
+            ['Diferença de Estoque (Qtde)', Number(metrics.diffQty || 0)],
+            ['Resultado Financeiro (R$)', roundAuditMoney(metrics.diffCost)]
+        ];
+        const wsSummary = XLSX.utils.aoa_to_sheet(summaryRows);
+        wsSummary['!cols'] = [{ wch: 34 }, { wch: 48 }];
+        XLSX.utils.book_append_sheet(wb, wsSummary, "Resumo");
+
+        const itemRows = (Array.isArray(metrics.items) ? metrics.items : []).map((item: any) => ({
+            'Código': item.code || '',
+            'Descrição': item.description || item.name || '',
+            'Laboratório': item.lab || '',
+            'Grupo': item.groupName || '',
+            'Departamento': item.deptName || '',
+            'Categoria': item.catName || '',
+            'Estoque Sistema': Number(item.sysQty || 0),
+            'Custo Sistema (R$)': roundAuditMoney(item.sysCost),
+            'Estoque Físico': Number(item.countedQty || 0),
+            'Custo Físico (R$)': roundAuditMoney(item.countedCost),
+            'Diferença Qtd': Number(item.diffQty || 0),
+            'Diferença R$': roundAuditMoney(item.diffCost)
+        }));
+        if (itemRows.length > 0) {
+            const wsItems = XLSX.utils.json_to_sheet(itemRows);
+            wsItems['!cols'] = [
+                { wch: 14 }, { wch: 42 }, { wch: 18 }, { wch: 22 }, { wch: 24 }, { wch: 24 },
+                { wch: 16 }, { wch: 18 }, { wch: 16 }, { wch: 18 }, { wch: 14 }, { wch: 16 }
+            ];
+            XLSX.utils.book_append_sheet(wb, wsItems, "Itens Salvos");
+        }
+
+        const groupedRows = (Array.isArray(metrics.groupedDifferences) ? metrics.groupedDifferences : []).map((row: any) => ({
+            'Grupo': row.groupName || '',
+            'Departamento': row.deptName || '',
+            'Categoria': row.catName || '',
+            'Estoque Sistema': Number(row.sysQty || 0),
+            'Custo Sistema (R$)': roundAuditMoney(row.sysCost),
+            'Estoque Físico': Number(row.countedQty || 0),
+            'Custo Físico (R$)': roundAuditMoney(row.countedCost),
+            'Diferença Qtd': Number(row.diffQty || 0),
+            'Diferença R$': roundAuditMoney(row.diffCost)
+        }));
+        if (groupedRows.length > 0) {
+            const wsGrouped = XLSX.utils.json_to_sheet(groupedRows);
+            wsGrouped['!cols'] = [
+                { wch: 22 }, { wch: 24 }, { wch: 24 }, { wch: 16 }, { wch: 18 },
+                { wch: 16 }, { wch: 18 }, { wch: 14 }, { wch: 16 }
+            ];
+            XLSX.utils.book_append_sheet(wb, wsGrouped, "Resumo Categoria");
+        }
+
+        const baseName = sanitizeFileToken(
+            (metrics as any).sourceFileName
+                ? String((metrics as any).sourceFileName).replace(/\.(xlsx|xls)$/i, '')
+                : `excel_termo_f${selectedFilial || data?.filial || 'loja'}_auditoria_${nextAuditNumber || 'atual'}`
+        ) || 'excel_termo';
+        XLSX.writeFile(wb, `${baseName}_baixado.xlsx`);
     };
 
     const removeTermComparisonExcel = async () => {
@@ -6341,28 +7142,36 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (Object.keys(termFieldErrors).length > 0) setTermFieldErrors({});
 
         const key = buildTermKey(termModal);
-        const persistedMetrics =
-            termComparisonMetrics ||
-            termForm.excelMetrics ||
-            termDrafts[key]?.excelMetrics;
+        const backupMetrics = (((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>)[key];
+        const persistedMetrics = normalizeTermMetricsToOfficial(pickPreferredTermMetrics(
+            rawTermMetricsRef.current,
+            rawTermComparisonMetrics,
+            termComparisonMetrics,
+            termForm.excelMetrics,
+            termDrafts[key]?.excelMetrics,
+            backupMetrics
+        ));
         const formToPersist = persistedMetrics
             ? { ...termForm, excelMetrics: persistedMetrics }
             : termForm;
         const nextDrafts = upsertScopeDraft(termDrafts, termModal, formToPersist);
         const syncedDrafts = replicateSignersToAllTermDrafts(nextDrafts, termForm);
         setTermDrafts(syncedDrafts);
+        termDraftsRef.current = syncedDrafts;
         try {
             // Persistence consolidated in audit_sessions (data field)
             const progress = calculateProgress(data || {} as any);
+            const metricsStore = { ...(((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>) };
+            if (persistedMetrics) metricsStore[key] = persistedMetrics;
             const savedSession = await persistAuditSession({
                 id: dbSessionId,
                 branch: selectedFilial,
                 audit_number: nextAuditNumber,
                 status: 'open',
-                data: { ...data, termDrafts: syncedDrafts } as any,
+                data: { ...data, termDrafts: syncedDrafts, termExcelMetricsByKey: metricsStore } as any,
                 progress: progress,
                 user_email: userEmail
-            });
+            }, { allowProgressRegression: true });
             if (savedSession) {
                 await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
             }
@@ -9500,7 +10309,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                     >
                                                         <X className="w-4 h-4" />
                                                     </button>
-                                                    <h5 className="text-[10px] font-black text-indigo-800 uppercase tracking-wide sm:tracking-widest mb-3">Resumo Identificado</h5>
+                                                    <div className="mb-3 flex flex-col gap-2 pr-7 sm:flex-row sm:items-center sm:justify-between">
+                                                        <h5 className="text-[10px] font-black text-indigo-800 uppercase tracking-wide sm:tracking-widest">Resumo Identificado</h5>
+                                                        <button
+                                                            type="button"
+                                                            onClick={downloadTermComparisonExcel}
+                                                            className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-indigo-200 bg-white px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-indigo-700 shadow-sm transition-all hover:bg-indigo-600 hover:text-white"
+                                                            title="Baixar o Excel carregado ou reconstruído a partir dos dados salvos"
+                                                        >
+                                                            <Download className="w-3.5 h-3.5" />
+                                                            Baixar Excel
+                                                        </button>
+                                                    </div>
                                                     <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                                                         <div className="bg-white p-3 rounded border border-slate-100">
                                                             <div className="grid grid-cols-3 gap-1.5 sm:gap-2">

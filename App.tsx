@@ -322,6 +322,45 @@ const parseJsonValue = <T,>(value: any): T | null => {
 const AUDIT_GLOBAL_UNIFIED_TERM_BATCH_ID = '__global_unified_term__';
 const roundAuditMoney = (value: unknown) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
+const getAuditTermMetricsTimestamp = (metrics: any) => {
+    const raw = metrics?.sourceUploadedAt || metrics?.financialDiffVerifiedAt || metrics?.updatedAt;
+    const time = raw ? Date.parse(String(raw)) : 0;
+    return Number.isFinite(time) ? time : 0;
+};
+
+const getAuditTermMetricsQualityScore = (metrics: any) => {
+    if (!metrics) return -1;
+    let score = 0;
+    if (Array.isArray(metrics.sourceRows) && metrics.sourceRows.length > 0) score += 1000;
+    if (metrics.sourceUploadedAt) score += 250;
+    if (metrics.officialDiffCost !== undefined && metrics.officialDiffCost !== null) score += 150;
+    if (metrics.financialDiffSource === 'spreadsheet_column') score += 80;
+    if (metrics.financialDiffSource === 'calculated_cost_delta') score += 40;
+    if (Array.isArray(metrics.items) && metrics.items.length > 0) score += Math.min(metrics.items.length, 100);
+    return score;
+};
+
+const pickPreferredAuditTermMetrics = (...metricsList: any[]) => {
+    return metricsList.filter(Boolean).reduce((best, candidate) => {
+        if (!best) return candidate;
+        const candidateScore = getAuditTermMetricsQualityScore(candidate);
+        const bestScore = getAuditTermMetricsQualityScore(best);
+        if (candidateScore !== bestScore) return candidateScore > bestScore ? candidate : best;
+        return getAuditTermMetricsTimestamp(candidate) >= getAuditTermMetricsTimestamp(best) ? candidate : best;
+    }, null as any);
+};
+
+const normalizeAuditCustomTermScopesPart = (draftKey: string) => {
+    const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
+    const scopesPart = typeof match?.[2] === 'string' ? match[2] : (match?.[1] || '');
+    return String(scopesPart || '')
+        .split(',')
+        .map(part => part.trim())
+        .filter(Boolean)
+        .sort()
+        .join(',');
+};
+
 const AUDIT_TERM_METADATA_KEYWORDS = [
     'filial:', 'grupo de produtos:', 'departamento:', 'categoria:',
     'tipo de produto:', 'grupo de preço:', 'início contagem:',
@@ -359,10 +398,32 @@ const summarizeAuditTermRows = (rows: any[]) => {
     };
 };
 
+const getOfficialAuditTermDiffCost = (metrics: any): number | null => {
+    if (!metrics) return null;
+    const raw = metrics.officialDiffCost ?? (
+        metrics.financialDiffSource ? metrics.diffCost : undefined
+    );
+    if (raw === undefined || raw === null || raw === '') return null;
+    const value = roundAuditMoney(raw);
+    return Number.isFinite(value) ? value : null;
+};
+
 const mergeAuditExcelMetricsPools = (pools: any[]) => {
     const validPools = (pools || []).filter(Boolean);
     if (validPools.length === 0) return null;
     if (validPools.length === 1) return validPools[0];
+
+    const officialPoolValues = validPools
+        .map((pool: any) => {
+            const raw = pool?.officialDiffCost ?? (pool?.financialDiffSource ? pool?.diffCost : undefined);
+            if (raw === undefined || raw === null || raw === '') return null;
+            const value = roundAuditMoney(raw);
+            return Number.isFinite(value) ? value : null;
+        })
+        .filter((value): value is number => value !== null);
+    const officialDiffCost = officialPoolValues.length > 0
+        ? roundAuditMoney(officialPoolValues.reduce((sum, value) => sum + value, 0))
+        : null;
 
     const normalizeDigits = (value: unknown) => String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
     const normalizeScope = (value: unknown) => String(value ?? '').trim().toLowerCase();
@@ -401,6 +462,7 @@ const mergeAuditExcelMetricsPools = (pools: any[]) => {
         const items = Array.from(uniqueItems.values());
         return {
             ...summarizeAuditTermRows(items),
+            ...(officialDiffCost !== null ? { diffCost: officialDiffCost, officialDiffCost, financialDiffSource: 'merged_official_terms' } : {}),
             items,
             groupedDifferences: validPools.flatMap((pool: any) => Array.isArray(pool?.groupedDifferences) ? pool.groupedDifferences : [])
         };
@@ -421,6 +483,7 @@ const mergeAuditExcelMetricsPools = (pools: any[]) => {
         sysCost: roundAuditMoney(totals.sysCost),
         countedCost: roundAuditMoney(totals.countedCost),
         diffCost: roundAuditMoney(totals.diffCost),
+        ...(officialDiffCost !== null ? { diffCost: officialDiffCost, officialDiffCost, financialDiffSource: 'merged_official_terms' } : {}),
         items: [],
         groupedDifferences
     };
@@ -439,7 +502,22 @@ const getAuditTermMetricsFromData = (parsedData: any) => {
         if (draftValue?.excelMetrics) metricsByKey.set(draftKey, draftValue.excelMetrics);
     });
 
-    const metricEntries = Array.from(metricsByKey.entries()).filter(([, metrics]) => !!metrics);
+    const dedupedMetricsByKey = new Map<string, { draftKey: string; metrics: any }>();
+    metricsByKey.forEach((metrics, draftKey) => {
+        const dedupeKey = draftKey.startsWith('custom|')
+            ? `custom|${normalizeAuditCustomTermScopesPart(draftKey)}`
+            : draftKey;
+        const current = dedupedMetricsByKey.get(dedupeKey);
+        const preferred = pickPreferredAuditTermMetrics(metrics, current?.metrics);
+        if (preferred) dedupedMetricsByKey.set(dedupeKey, {
+            draftKey: preferred === metrics ? draftKey : (current?.draftKey || draftKey),
+            metrics: preferred
+        });
+    });
+
+    const metricEntries = Array.from(dedupedMetricsByKey.values())
+        .map(({ draftKey, metrics }) => [draftKey, metrics] as [string, any])
+        .filter(([, metrics]) => !!metrics);
     if (metricEntries.length === 0) return null;
     const globalUnifiedEntries = metricEntries.filter(([draftKey]) =>
         draftKey.startsWith('custom|') && draftKey.includes(AUDIT_GLOBAL_UNIFIED_TERM_BATCH_ID)
@@ -450,6 +528,7 @@ const getAuditTermMetricsFromData = (parsedData: any) => {
     if (!merged) return null;
 
     const cleanItems = (Array.isArray(merged.items) ? merged.items : []).filter((item: any) => !isAuditTermMetadataRow(item));
+    const officialDiffCost = getOfficialAuditTermDiffCost(merged);
     const totals = cleanItems.length > 0
         ? summarizeAuditTermRows(cleanItems)
         : {
@@ -460,6 +539,9 @@ const getAuditTermMetricsFromData = (parsedData: any) => {
             diffQty: Number(merged.diffQty || 0),
             diffCost: roundAuditMoney(merged.diffCost)
         };
+    if (officialDiffCost !== null) {
+        totals.diffCost = officialDiffCost;
+    }
 
     return {
         ...totals,
