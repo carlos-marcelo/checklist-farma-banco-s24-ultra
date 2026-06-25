@@ -8773,6 +8773,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     if (!data || isUpdatingStock) {
         const structureLocked = !!(data && data.groups && data.groups.length > 0);
+        const updateOnlyMode = isUpdatingStock || structureLocked;
         return (
             <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 font-sans">
                 <div className="max-w-2xl w-full bg-white rounded-[2rem] shadow-2xl overflow-hidden">
@@ -8827,13 +8828,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     <button
                                         type="button"
                                         onClick={handleStartAudit}
-                                        disabled={isProcessing || !canUseAuditMasterTools || !!latestOpenAudit}
-                                        className={`px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${isProcessing || !canUseAuditMasterTools || !!latestOpenAudit
+                                        disabled={isProcessing || !canUseAuditMasterTools || !!latestOpenAudit || updateOnlyMode}
+                                        className={`px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${isProcessing || !canUseAuditMasterTools || !!latestOpenAudit || updateOnlyMode
                                             ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
                                             : 'bg-indigo-600 text-white hover:bg-indigo-500'}`}
                                         title={
                                             !canUseAuditMasterTools
                                                 ? 'Somente Master ou Administrativo cria novo inventário'
+                                                : updateOnlyMode
+                                                    ? 'Modo atualização de saldos ativo: use somente Atualizar Somente Saldos'
                                                 : latestOpenAudit
                                                     ? `Existe inventário aberto Nº ${latestOpenAudit.audit_number}`
                                                     : `Criar novo inventário automático Nº ${nextAuditNumber}`
@@ -8844,12 +8847,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
                                     <button
                                         type="button"
-                                        onClick={() => setShowCompletedAuditsModal(true)}
-                                        disabled={completedAudits.length === 0}
-                                        className={`px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${completedAudits.length === 0
+                                        onClick={() => {
+                                            if (updateOnlyMode) return;
+                                            setShowCompletedAuditsModal(true);
+                                        }}
+                                        disabled={completedAudits.length === 0 || updateOnlyMode}
+                                        className={`px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${completedAudits.length === 0 || updateOnlyMode
                                             ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
                                             : 'bg-white border border-indigo-200 text-indigo-700 hover:bg-indigo-50'}`}
-                                        title={completedAudits.length === 0 ? 'Sem inventários concluídos' : 'Acessar inventários concluídos desta filial'}
+                                        title={updateOnlyMode ? 'Modo atualização de saldos ativo: acesso concluído bloqueado' : (completedAudits.length === 0 ? 'Sem inventários concluídos' : 'Acessar inventários concluídos desta filial')}
                                     >
                                         Acessar concluído
                                     </button>
@@ -8857,12 +8863,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     {latestOpenAudit && (
                                         <button
                                             type="button"
-                                            onClick={resumeLatestOpenAudit}
-                                            disabled={isProcessing}
-                                            className={`px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${isProcessing
+                                            onClick={updateOnlyMode ? undefined : resumeLatestOpenAudit}
+                                            disabled={isProcessing || updateOnlyMode}
+                                            className={`px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${isProcessing || updateOnlyMode
                                                 ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
                                                 : 'bg-amber-500 text-white hover:bg-amber-400'}`}
-                                            title={`Retomar inventário aberto Nº ${latestOpenAudit.audit_number}`}
+                                            title={updateOnlyMode ? 'Modo atualização de saldos ativo: retomar aberto bloqueado' : `Retomar inventário aberto Nº ${latestOpenAudit.audit_number}`}
                                         >
                                             Retomar aberto
                                         </button>
@@ -8890,14 +8896,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 return (
                                     <label
                                         key={`group-upload-${groupId}`}
-                                        className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}
-                                    >
-                                        <input
-                                            type="file"
-                                            className="hidden"
-                                            disabled={!canUseAuditMasterTools || structureLocked}
-                                            onChange={e => setGroupFile(groupId, e.target.files?.[0] || null)}
-                                        />
+                                    className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || updateOnlyMode) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}
+                                >
+                                    <input
+                                        type="file"
+                                        className="hidden"
+                                        disabled={!canUseAuditMasterTools || updateOnlyMode}
+                                        onChange={e => setGroupFile(groupId, e.target.files?.[0] || null)}
+                                    />
                                         <FileSpreadsheet className={`mx-auto w-6 h-6 mb-1 ${effectiveFile ? 'text-emerald-500' : 'text-slate-300'}`} />
                                         <p className="text-[8px] font-black uppercase truncate">{selectedFile ? selectedFile.name : effectiveFile ? effectiveFile.name : `Cadastro ${groupId}`}</p>
                                         <p className="text-[8px] font-bold text-slate-500 mt-1">
@@ -8934,8 +8940,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 )}
                             </label>
 
-                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveDeptIdsFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
-                                <input type="file" className="hidden" disabled={!canUseAuditMasterTools || structureLocked} onChange={e => setFileDeptIds(e.target.files?.[0] || null)} />
+                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || updateOnlyMode) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveDeptIdsFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
+                                <input type="file" className="hidden" disabled={!canUseAuditMasterTools || updateOnlyMode} onChange={e => setFileDeptIds(e.target.files?.[0] || null)} />
                                 <FileSpreadsheet className={`mx-auto w-6 h-6 mb-1 ${effectiveDeptIdsFile ? 'text-emerald-500' : 'text-slate-300'}`} />
                                 <p className="text-[8px] font-black uppercase truncate">{fileDeptIds ? fileDeptIds.name : effectiveDeptIdsFile ? effectiveDeptIdsFile.name : 'IDs Depto (opcional)'}</p>
                                 <p className="text-[8px] font-bold text-slate-500 mt-1">
@@ -8952,8 +8958,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 )}
                             </label>
 
-                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || structureLocked) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveCatIdsFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
-                                <input type="file" className="hidden" disabled={!canUseAuditMasterTools || structureLocked} onChange={e => setFileCatIds(e.target.files?.[0] || null)} />
+                            <label className={`block border-2 border-dashed rounded-xl p-4 cursor-pointer transition-all text-center ${(!canUseAuditMasterTools || updateOnlyMode) ? 'opacity-30 cursor-not-allowed' : ''} ${effectiveCatIdsFile ? 'border-emerald-500 bg-emerald-50' : 'border-slate-50 hover:border-indigo-400'}`}>
+                                <input type="file" className="hidden" disabled={!canUseAuditMasterTools || updateOnlyMode} onChange={e => setFileCatIds(e.target.files?.[0] || null)} />
                                 <FileSpreadsheet className={`mx-auto w-6 h-6 mb-1 ${effectiveCatIdsFile ? 'text-emerald-500' : 'text-slate-300'}`} />
                                 <p className="text-[8px] font-black uppercase truncate">{fileCatIds ? fileCatIds.name : effectiveCatIdsFile ? effectiveCatIdsFile.name : 'IDs Cat (opcional)'}</p>
                                 <p className="text-[8px] font-bold text-slate-500 mt-1">
@@ -8992,14 +8998,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             : 'Iniciar Inventário')
                                         : 'Apenas Master ou Administrativo pode Iniciar'}
                             </button>
-                            <button onClick={handleLoadFromTrier} disabled={isTrierLoading || !canUseAuditMasterTools} className={`w-full py-4 rounded-xl text-white font-black uppercase tracking-widest transition-all shadow-xl active:scale-95 flex items-center justify-center gap-2 ${isTrierLoading || !canUseAuditMasterTools ? 'bg-slate-300 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-500'}`}>
+                            <button onClick={handleLoadFromTrier} disabled={isTrierLoading || !canUseAuditMasterTools || updateOnlyMode} className={`w-full py-4 rounded-xl text-white font-black uppercase tracking-widest transition-all shadow-xl active:scale-95 flex items-center justify-center gap-2 ${isTrierLoading || !canUseAuditMasterTools || updateOnlyMode ? 'bg-slate-300 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-500'}`}>
                                 <Activity className="w-5 h-5" />
-                                {isTrierLoading ? 'Carregando do Trier...' : canUseAuditMasterTools ? 'Carregar direto do Trier (tempo real)' : 'Apenas Master ou Administrativo pode Carregar'}
+                                {isTrierLoading ? 'Carregando do Trier...' : updateOnlyMode ? 'Trier bloqueado no modo saldos' : canUseAuditMasterTools ? 'Carregar direto do Trier (tempo real)' : 'Apenas Master ou Administrativo pode Carregar'}
                             </button>
                             {trierError && (
                                 <div className="flex items-center justify-between gap-3">
                                     <p className="text-[10px] font-bold text-red-500 uppercase tracking-widest">{trierError}</p>
-                                    <button onClick={handleLoadFromTrier} className="text-[9px] font-black uppercase tracking-widest text-slate-600 hover:text-emerald-600">
+                                    <button onClick={handleLoadFromTrier} disabled={updateOnlyMode} className={`text-[9px] font-black uppercase tracking-widest ${updateOnlyMode ? 'text-slate-300 cursor-not-allowed' : 'text-slate-600 hover:text-emerald-600'}`}>
                                         Tentar novamente
                                     </button>
                                 </div>

@@ -1752,6 +1752,7 @@ const App: React.FC = () => {
     const [completedDashboardAuditsError, setCompletedDashboardAuditsError] = useState<string | null>(null);
     const [completedDashboardAuditsFetchedAt, setCompletedDashboardAuditsFetchedAt] = useState<string | null>(null);
     const [completedAuditNumberFilter, setCompletedAuditNumberFilter] = useState<string>('all');
+    const [dashboardClockMinute, setDashboardClockMinute] = useState(() => Date.now());
     const [auditJumpFilial, setAuditJumpFilial] = useState<string>('');
 
     // Logs & Eventos
@@ -5962,6 +5963,14 @@ const App: React.FC = () => {
         void loadCompletedDashboardAuditSessions();
     }, [currentView, currentUser, isLoadingData, loadDashboardAuditSessions, loadCompletedDashboardAuditSessions, dashboardAuditsFetchedAt, completedDashboardAuditsFetchedAt]);
 
+    useEffect(() => {
+        if (currentView !== 'dashboard') return;
+        const tick = () => setDashboardClockMinute(Date.now());
+        tick();
+        const intervalId = window.setInterval(tick, 60_000);
+        return () => window.clearInterval(intervalId);
+    }, [currentView]);
+
     const logBranchOptions = useMemo(() => {
         // Usa Map normalizado para deduplicar variações: '8' e 'Filial 8' → 'Filial 8'
         const normalized = new Map<string, string>(); // key=UPPERCASE, value=label canônico
@@ -6209,8 +6218,12 @@ const App: React.FC = () => {
             countedCost: number;
             divergencePct: number;
             termsWithExcel: number;
+            openPartialScopes: number;
+            hasOpenPartial: boolean;
+            isPartialOverdue: boolean;
         };
 
+        const isAfterPartialCutoff = new Date(dashboardClockMinute).getHours() >= 18;
         const branchToArea = new Map<string, string>();
         scopedCompanies.forEach(c => {
             (c.areas || []).forEach((area: any) => {
@@ -6268,6 +6281,12 @@ const App: React.FC = () => {
         latestByBranch.forEach((session, branchLabel) => {
             const parsedData = parseJsonValue<any>(session.data) || session.data || {};
             const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
+            const partialStarts = Array.isArray(parsedData?.partialStarts)
+                ? parsedData.partialStarts
+                : (parsedData?.partialStart ? [parsedData.partialStart] : []);
+            const openPartialScopes = partialStarts.filter(Boolean).length;
+            const hasOpenPartial = openPartialScopes > 0;
+            const isPartialOverdue = hasOpenPartial && isAfterPartialCutoff;
 
             const skuCodes = new Set<string>();
             const countedSkuCodes = new Set<string>();
@@ -6674,7 +6693,10 @@ const App: React.FC = () => {
                 diffCost,
                 countedCost: roundAuditMoney(countedCost + diffCost),
                 divergencePct,
-                termsWithExcel
+                termsWithExcel,
+                openPartialScopes,
+                hasOpenPartial,
+                isPartialOverdue
             });
         });
 
@@ -6697,6 +6719,9 @@ const App: React.FC = () => {
             countedCost: number;
             diffQty: number;
             diffCost: number;
+            partialOpenAudits: number;
+            partialOpenScopes: number;
+            partialOverdueAudits: number;
         }>();
 
         branches.forEach(item => {
@@ -6712,7 +6737,10 @@ const App: React.FC = () => {
                 auditedBaseCost: 0,
                 countedCost: 0,
                 diffQty: 0,
-                diffCost: 0
+                diffCost: 0,
+                partialOpenAudits: 0,
+                partialOpenScopes: 0,
+                partialOverdueAudits: 0
             };
             current.branches += 1;
             current.totalSkus += item.totalSkus;
@@ -6725,6 +6753,9 @@ const App: React.FC = () => {
             current.countedCost += item.countedCost;
             current.diffQty += item.diffQty;
             current.diffCost += item.diffCost;
+            if (item.hasOpenPartial) current.partialOpenAudits += 1;
+            current.partialOpenScopes += item.openPartialScopes;
+            if (item.isPartialOverdue) current.partialOverdueAudits += 1;
             areaMap.set(item.area, current);
         });
 
@@ -6743,6 +6774,9 @@ const App: React.FC = () => {
             acc.countedCost += item.countedCost;
             acc.diffQty += item.diffQty;
             acc.diffCost += item.diffCost;
+            if (item.hasOpenPartial) acc.partialOpenAudits += 1;
+            acc.partialOpenScopes += item.openPartialScopes;
+            if (item.isPartialOverdue) acc.partialOverdueAudits += 1;
             return acc;
         }, {
             openAudits: 0,
@@ -6757,7 +6791,10 @@ const App: React.FC = () => {
             auditedBaseCost: 0,
             countedCost: 0,
             diffQty: 0,
-            diffCost: 0
+            diffCost: 0,
+            partialOpenAudits: 0,
+            partialOpenScopes: 0,
+            partialOverdueAudits: 0
         });
 
         // Usa SKUs para consistência com o restante do sistema
@@ -6772,7 +6809,7 @@ const App: React.FC = () => {
             : 0;
 
         return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
-    }, [dashboardAuditSessions, scopedCompanies, scopedUsers, openAuditNumberFilter]);
+    }, [dashboardAuditSessions, scopedCompanies, scopedUsers, openAuditNumberFilter, dashboardClockMinute]);
 
     const dashboardCompletedAuditOverview = useMemo(() => {
         type BranchMetric = {
@@ -11212,11 +11249,9 @@ const App: React.FC = () => {
                                             <p className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-500">Auditoria de Estoque</p>
                                             <div className="flex items-center gap-3">
                                                 <h3 className="text-xl font-black text-gray-900">Resumo de Auditorias Abertas</h3>
-                                                {dashboardCompletedAuditOverview.summary.openAudits > 0 && (
-                                                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-green-100 text-green-800 border border-green-200 uppercase tracking-widest">
-                                                        {dashboardCompletedAuditOverview.summary.openAudits} concluída{dashboardCompletedAuditOverview.summary.openAudits !== 1 ? 's' : ''}
-                                                    </span>
-                                                )}
+                                                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold border uppercase tracking-widest ${dashboardAuditOverview.summary.partialOverdueAudits > 0 ? 'bg-red-100 text-red-700 border-red-200' : dashboardAuditOverview.summary.partialOpenAudits > 0 ? 'bg-blue-100 text-blue-700 border-blue-200' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>
+                                                    {dashboardAuditOverview.summary.partialOpenAudits === 1 ? '1 parcial por finalizar' : `${dashboardAuditOverview.summary.partialOpenAudits} parciais por finalizar`}
+                                                </span>
                                             </div>
                                         </div>
                                         <div className="flex items-center gap-3">
@@ -11315,6 +11350,21 @@ const App: React.FC = () => {
                                         </div>
                                     </div>
 
+                                    <div className="flex flex-wrap items-center gap-2 text-[10px] font-black uppercase tracking-widest text-slate-500">
+                                        <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1">
+                                            <span className="h-2.5 w-2.5 rounded-full bg-slate-300" />
+                                            Sem parcial aberta
+                                        </span>
+                                        <span className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2.5 py-1 text-blue-700">
+                                            <span className="h-2.5 w-2.5 rounded-full bg-blue-500" />
+                                            Parcial aberta
+                                        </span>
+                                        <span className="inline-flex items-center gap-1 rounded-full border border-red-200 bg-red-50 px-2.5 py-1 text-red-700">
+                                            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                                            Parcial aberta após 18:00
+                                        </span>
+                                    </div>
+
                                     <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                                         <div className="rounded-2xl border border-gray-100 bg-white p-4">
                                             <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-3">Por Área</p>
@@ -11325,11 +11375,26 @@ const App: React.FC = () => {
                                                     dashboardAuditOverview.areas.map(area => {
                                                         const pct = area.totalSkus > 0 ? (area.countedSkus / area.totalSkus) * 100 : 0;
                                                         const areaDivergencePct = area.auditedBaseCost > 0 ? (area.diffCost / area.auditedBaseCost) * 100 : 0;
+                                                        const areaStatusClass = area.partialOverdueAudits > 0
+                                                            ? 'border-red-300 bg-red-50/80'
+                                                            : area.partialOpenAudits > 0
+                                                                ? 'border-blue-300 bg-blue-50/80'
+                                                                : 'border-gray-100 bg-white';
+                                                        const areaStatusLabel = area.partialOverdueAudits > 0
+                                                            ? (area.partialOverdueAudits === 1 ? '1 parcial após 18:00' : `${area.partialOverdueAudits} parciais após 18:00`)
+                                                            : area.partialOpenAudits > 0
+                                                                ? (area.partialOpenAudits === 1 ? '1 parcial aberta' : `${area.partialOpenAudits} parciais abertas`)
+                                                                : 'Sem parcial aberta';
                                                         return (
-                                                            <div key={area.area} className="rounded-xl border border-gray-100 px-3 py-2">
+                                                            <div key={area.area} className={`rounded-xl border px-3 py-2 transition-colors ${areaStatusClass}`}>
                                                                 <div className="flex items-center justify-between">
                                                                     <p className="text-sm font-black text-gray-800">{area.area}</p>
-                                                                    <p className="text-[11px] font-bold text-gray-500">{area.branches} filial(is)</p>
+                                                                    <div className="text-right">
+                                                                        <p className="text-[11px] font-bold text-gray-500">{area.branches} filial(is)</p>
+                                                                        <p className={`text-[9px] font-black uppercase tracking-widest ${area.partialOverdueAudits > 0 ? 'text-red-700' : area.partialOpenAudits > 0 ? 'text-blue-700' : 'text-slate-400'}`}>
+                                                                            {areaStatusLabel}
+                                                                        </p>
+                                                                    </div>
                                                                 </div>
                                                                 <div className="mt-1 grid grid-cols-2 gap-2 text-[11px] font-bold">
                                                                     <span className="text-emerald-600 whitespace-nowrap tabular-nums">{area.countedUnits.toLocaleString('pt-BR')} un. conferidas</span>
@@ -11364,40 +11429,58 @@ const App: React.FC = () => {
                                                 {dashboardAuditOverview.branches.length === 0 ? (
                                                     <p className="text-sm font-semibold text-gray-400">Nenhuma filial com auditoria aberta.</p>
                                                 ) : (
-                                                    dashboardAuditOverview.branches.map(branch => (
-                                                        <button
-                                                            key={`${branch.branch}_${branch.auditNumber}`}
-                                                            type="button"
-                                                            onClick={() => handleOpenAuditFromDashboardBranch(branch.branch)}
-                                                            className="w-full text-left rounded-xl border border-gray-100 px-3 py-2 hover:border-indigo-200 hover:bg-indigo-50/30 transition-colors"
-                                                            title={`Abrir Auditoria da ${branch.branch}`}
-                                                        >
-                                                            <div className="flex items-center justify-between gap-3">
-                                                                <p className="text-sm font-black text-gray-800">{branch.branch}</p>
-                                                                <span className="text-[10px] font-black uppercase tracking-widest text-indigo-500">Inv. {branch.auditNumber}</span>
-                                                            </div>
-                                                            <div className="mt-1 grid grid-cols-2 gap-2 text-[11px] font-bold">
-                                                                <span className="text-gray-600 whitespace-nowrap tabular-nums">{branch.countedUnits.toLocaleString('pt-BR')} un. conferidas</span>
-                                                                <span className={`text-right ${branch.diffQty < 0 ? 'text-red-600' : branch.diffQty > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
-                                                                    {branch.diffQty > 0 ? '+' : ''}{branch.diffQty.toLocaleString('pt-BR', { maximumFractionDigits: 0 })} un.
-                                                                </span>
-                                                                <span className="text-gray-500">{branch.area}</span>
-                                                                <span className={`text-right whitespace-nowrap tabular-nums ${branch.diffCost < 0 ? 'text-red-600' : branch.diffCost > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
-                                                                    {branch.diffCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
-                                                                </span>
-                                                                <span className="text-slate-600 whitespace-nowrap tabular-nums">{branch.countedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
-                                                                <span className={`text-right whitespace-nowrap tabular-nums ${branch.divergencePct < 0 ? 'text-red-600' : branch.divergencePct > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
-                                                                    {branch.divergencePct > 0 ? '+' : ''}{branch.divergencePct.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
-                                                                </span>
-                                                            </div>
-                                                            <div className="mt-2 h-2 rounded-full bg-gray-100 overflow-hidden">
-                                                                <div className="h-full rounded-full bg-emerald-500" style={{ width: `${Math.max(0, Math.min(100, branch.progressPct))}%` }} />
-                                                            </div>
-                                                            <p className="mt-1 text-[10px] font-black text-emerald-600 uppercase tracking-widest text-right">
-                                                                {(branch.progressPct === 100 ? "100" : branch.progressPct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%
-                                                            </p>
-                                                        </button>
-                                                    ))
+                                                    dashboardAuditOverview.branches.map(branch => {
+                                                        const branchStatusClass = branch.isPartialOverdue
+                                                            ? 'border-red-300 bg-red-50/80 hover:border-red-400 hover:bg-red-100/70'
+                                                            : branch.hasOpenPartial
+                                                                ? 'border-blue-300 bg-blue-50/80 hover:border-blue-400 hover:bg-blue-100/70'
+                                                                : 'border-gray-100 bg-white hover:border-indigo-200 hover:bg-indigo-50/30';
+                                                        const branchStatusLabel = branch.isPartialOverdue
+                                                            ? `Parcial após 18:00 (${branch.openPartialScopes})`
+                                                            : branch.hasOpenPartial
+                                                                ? `Parcial aberta (${branch.openPartialScopes})`
+                                                                : 'Sem parcial aberta';
+                                                        const progressColor = branch.isPartialOverdue ? 'bg-red-500' : branch.hasOpenPartial ? 'bg-blue-500' : 'bg-emerald-500';
+                                                        return (
+                                                            <button
+                                                                key={`${branch.branch}_${branch.auditNumber}`}
+                                                                type="button"
+                                                                onClick={() => handleOpenAuditFromDashboardBranch(branch.branch)}
+                                                                className={`w-full text-left rounded-xl border px-3 py-2 transition-colors ${branchStatusClass}`}
+                                                                title={`Abrir Auditoria da ${branch.branch}`}
+                                                            >
+                                                                <div className="flex items-center justify-between gap-3">
+                                                                    <div>
+                                                                        <p className="text-sm font-black text-gray-800">{branch.branch}</p>
+                                                                        <p className={`text-[9px] font-black uppercase tracking-widest ${branch.isPartialOverdue ? 'text-red-700' : branch.hasOpenPartial ? 'text-blue-700' : 'text-slate-400'}`}>
+                                                                            {branchStatusLabel}
+                                                                        </p>
+                                                                    </div>
+                                                                    <span className="text-[10px] font-black uppercase tracking-widest text-indigo-500">Inv. {branch.auditNumber}</span>
+                                                                </div>
+                                                                <div className="mt-1 grid grid-cols-2 gap-2 text-[11px] font-bold">
+                                                                    <span className="text-gray-600 whitespace-nowrap tabular-nums">{branch.countedUnits.toLocaleString('pt-BR')} un. conferidas</span>
+                                                                    <span className={`text-right ${branch.diffQty < 0 ? 'text-red-600' : branch.diffQty > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                        {branch.diffQty > 0 ? '+' : ''}{branch.diffQty.toLocaleString('pt-BR', { maximumFractionDigits: 0 })} un.
+                                                                    </span>
+                                                                    <span className="text-gray-500">{branch.area}</span>
+                                                                    <span className={`text-right whitespace-nowrap tabular-nums ${branch.diffCost < 0 ? 'text-red-600' : branch.diffCost > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                        {branch.diffCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                                    </span>
+                                                                    <span className="text-slate-600 whitespace-nowrap tabular-nums">{branch.countedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                                                                    <span className={`text-right whitespace-nowrap tabular-nums ${branch.divergencePct < 0 ? 'text-red-600' : branch.divergencePct > 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
+                                                                        {branch.divergencePct > 0 ? '+' : ''}{branch.divergencePct.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
+                                                                    </span>
+                                                                </div>
+                                                                <div className="mt-2 h-2 rounded-full bg-gray-100 overflow-hidden">
+                                                                    <div className={`h-full rounded-full ${progressColor}`} style={{ width: `${Math.max(0, Math.min(100, branch.progressPct))}%` }} />
+                                                                </div>
+                                                                <p className={`mt-1 text-[10px] font-black uppercase tracking-widest text-right ${branch.isPartialOverdue ? 'text-red-700' : branch.hasOpenPartial ? 'text-blue-700' : 'text-emerald-600'}`}>
+                                                                    {(branch.progressPct === 100 ? "100" : branch.progressPct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%
+                                                                </p>
+                                                            </button>
+                                                        );
+                                                    })
                                                 )}
                                             </div>
                                         </div>
