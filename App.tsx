@@ -2879,16 +2879,69 @@ const App: React.FC = () => {
     const activeChecklist = checklists.find(c => c.id === activeChecklistId) || checklists[0];
     const currentTheme = THEMES[currentUser?.preferredTheme || 'blue'];
 
-    // Pending users are those NOT approved AND NOT rejected (fresh requests)
-    const pendingUsers = users.filter(u => !u.approved && !u.rejected);
-    const pendingUsersCount = pendingUsers.length;
     const getUserRoleRank = (role?: UserRole) => {
         if (role === 'MASTER') return 3;
         if (role === 'ADMINISTRATIVO') return 2;
         return 1;
     };
 
+    const normalizeTeamScopeText = (value?: string | null) =>
+        String(value || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim();
+
+    const isSameTeamArea = (user?: Pick<User, 'company_id' | 'area'> | null) => {
+        if (!currentUser || !user) return false;
+        const currentArea = normalizeTeamScopeText(currentUser.area);
+        const targetArea = normalizeTeamScopeText(user.area);
+        if (!currentArea || !targetArea || currentArea !== targetArea) return false;
+        if (currentUser.company_id && user.company_id && currentUser.company_id !== user.company_id) return false;
+        return true;
+    };
+
+    const canManageTeamUser = (targetUser?: User | null) => {
+        if (!currentUser || !targetUser) return false;
+        if (currentUser.role === 'MASTER') return true;
+        if (currentUser.role !== 'ADMINISTRATIVO') return false;
+        if (targetUser.role === 'MASTER') return false;
+        return isSameTeamArea(targetUser);
+    };
+
+    const getEffectiveNewUserCompanyId = () =>
+        currentUser?.role === 'ADMINISTRATIVO'
+            ? (currentUser.company_id || '')
+            : newUserCompanyId;
+
+    const getEffectiveNewUserArea = () =>
+        currentUser?.role === 'ADMINISTRATIVO'
+            ? (currentUser.area || '')
+            : newUserArea;
+
+    const canCreateTeamUserInScope = () => {
+        if (!currentUser) return false;
+        if (currentUser.role === 'MASTER') return true;
+        if (currentUser.role !== 'ADMINISTRATIVO') return false;
+        if (newUserRole === 'MASTER') return false;
+        const selectedCompany = getEffectiveNewUserCompanyId() || null;
+        if (currentUser.company_id && selectedCompany && selectedCompany !== currentUser.company_id) return false;
+        return normalizeTeamScopeText(getEffectiveNewUserArea()) === normalizeTeamScopeText(currentUser.area);
+    };
+
+    // Pending users are those NOT approved AND NOT rejected (fresh requests)
+    const pendingUsers = users.filter(u => {
+        if (u.approved || u.rejected) return false;
+        if (currentUser?.role === 'MASTER') return true;
+        if (currentUser?.role === 'ADMINISTRATIVO') return canManageTeamUser(u);
+        return false;
+    });
+    const pendingUsersCount = pendingUsers.length;
+
     const filteredUsers = users.filter(u => {
+        if (currentUser?.role === 'ADMINISTRATIVO' && !canManageTeamUser(u) && u.email !== currentUser.email) return false;
+        if (currentUser?.role !== 'MASTER' && currentUser?.role !== 'ADMINISTRATIVO' && u.email !== currentUser?.email) return false;
         if (userFilterRole !== 'ALL' && u.role !== userFilterRole) return false;
         if (userFilterStatus === 'ACTIVE' && (!u.approved || u.rejected)) return false;
         if (userFilterStatus === 'PENDING' && (u.approved || u.rejected)) return false;
@@ -3251,6 +3304,15 @@ const App: React.FC = () => {
     };
 
     const updateUserStatus = async (email: string, approved: boolean) => {
+        const targetUser = users.find(u => u.email === email);
+        if (targetUser?.email === currentUser?.email) {
+            alert("Você não pode alterar o status do próprio usuário por aqui.");
+            return;
+        }
+        if (!canManageTeamUser(targetUser)) {
+            alert("Você só pode alterar usuários da sua própria área.");
+            return;
+        }
         // Update in Supabase
         await SupabaseService.updateUser(email, { approved, rejected: false });
         // Update local state
@@ -3275,6 +3337,15 @@ const App: React.FC = () => {
     };
 
     const handleRejectUser = async (email: string, skipConfirm = true) => {
+        const targetUser = users.find(u => u.email === email);
+        if (targetUser?.email === currentUser?.email) {
+            alert("Você não pode bloquear o próprio usuário por aqui.");
+            return;
+        }
+        if (!canManageTeamUser(targetUser)) {
+            alert("Você só pode bloquear usuários da sua própria área.");
+            return;
+        }
         // Update in Supabase
         await SupabaseService.updateUser(email, { approved: false, rejected: true });
         // Update local state
@@ -3299,6 +3370,10 @@ const App: React.FC = () => {
     };
 
      const handleDeleteUser = async (email: string) => {
+         if (currentUser?.role !== 'MASTER') {
+             alert("Somente Master pode excluir usuários permanentemente.");
+             return;
+         }
          const confirmed = window.confirm("Tem certeza que deseja excluir permanentemente este usuário? Esta ação não pode ser desfeita.");
          if (!confirmed) return;
  
@@ -3544,6 +3619,12 @@ const App: React.FC = () => {
 
 
     const handleCreateUserInternal = async () => {
+        if (!canCreateTeamUserInScope()) {
+            alert(currentUser?.role === 'ADMINISTRATIVO'
+                ? "Administrativo só pode criar usuários não-Master dentro da própria área."
+                : "Você não tem permissão para criar usuário neste escopo.");
+            return;
+        }
         if (!newUserName || !newUserEmail || !newUserPass || !newUserPhone || !newUserConfirmPass) {
             alert("Preencha todos os campos.");
             return;
@@ -3583,6 +3664,8 @@ const App: React.FC = () => {
             return;
         }
 
+        const effectiveNewUserCompanyId = getEffectiveNewUserCompanyId();
+        const effectiveNewUserArea = getEffectiveNewUserArea();
         const newUser: User = {
             name: newUserName,
             email: newUserEmail,
@@ -3591,8 +3674,8 @@ const App: React.FC = () => {
             role: newUserRole,
             approved: true, // Internal creation is auto-approved
             rejected: false,
-            company_id: newUserCompanyId || null,
-            area: newUserArea || null,
+            company_id: effectiveNewUserCompanyId || null,
+            area: effectiveNewUserArea || null,
             filial: newUserFilial || null
         };
 
@@ -7483,7 +7566,7 @@ const App: React.FC = () => {
     // Determine if we are in "Read Only" mode (History View)
     const canControlChecklists = hasModuleAccess('checklistControl');
     const canEditCompanies = hasModuleAccess('companyEditing');
-    const canManageUsers = hasModuleAccess('userManagement');
+    const canManageUsers = hasModuleAccess('userManagement') || currentUser.role === 'ADMINISTRATIVO';
     const canRespondTickets = hasModuleAccess('supportTickets');
     const canApproveUsers = hasModuleAccess('userApproval');
     const isReadOnly = currentView === 'view_history' || !canControlChecklists;
@@ -8551,16 +8634,19 @@ const App: React.FC = () => {
                                             {/* Company Selection */}
                                             <div className="relative">
                                                 <select
-                                                    value={newUserCompanyId}
+                                                    value={currentUser.role === 'ADMINISTRATIVO' ? (currentUser.company_id || '') : newUserCompanyId}
                                                     onChange={(e) => {
                                                         setNewUserCompanyId(e.target.value);
                                                         setNewUserArea('');
                                                         setNewUserFilial('');
                                                     }}
-                                                    className={`w-full bg-white/70 border border-gray-200 rounded-xl p-3 text-sm text-gray-900 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none appearance-none font-medium transition-all ${!newUserCompanyId ? 'text-gray-400' : ''}`}
+                                                    disabled={currentUser.role === 'ADMINISTRATIVO'}
+                                                    className={`w-full bg-white/70 border border-gray-200 rounded-xl p-3 text-sm text-gray-900 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none appearance-none font-medium transition-all ${!getEffectiveNewUserCompanyId() ? 'text-gray-400' : ''} ${currentUser.role === 'ADMINISTRATIVO' ? 'bg-gray-50 cursor-not-allowed opacity-80' : ''}`}
                                                 >
                                                     <option value="" className="text-gray-400">Selecione a Empresa</option>
-                                                    {companies.map((company: any) => (
+                                                    {companies
+                                                        .filter((company: any) => currentUser.role !== 'ADMINISTRATIVO' || !currentUser.company_id || company.id === currentUser.company_id)
+                                                        .map((company: any) => (
                                                         <option key={company.id} value={company.id} className="text-gray-900">{company.name}</option>
                                                     ))}
                                                 </select>
@@ -8576,7 +8662,7 @@ const App: React.FC = () => {
                                                     onChange={(e) => {
                                                         const selectedFilial = e.target.value;
                                                         setNewUserFilial(selectedFilial);
-                                                        const selectedCompany = companies.find((c: any) => c.id === newUserCompanyId);
+                                                        const selectedCompany = companies.find((c: any) => c.id === getEffectiveNewUserCompanyId());
                                                         if (selectedCompany && selectedCompany.areas) {
                                                             const areaForFilial = selectedCompany.areas.find((area: any) =>
                                                                 area.branches && area.branches.includes(selectedFilial)
@@ -8586,14 +8672,17 @@ const App: React.FC = () => {
                                                             }
                                                         }
                                                     }}
-                                                    disabled={!newUserCompanyId}
-                                                    className={`w-full bg-white/70 border border-gray-200 rounded-xl p-3 text-sm text-gray-900 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none appearance-none font-medium transition-all ${!newUserCompanyId ? 'bg-gray-50 cursor-not-allowed opacity-60' : ''}`}
+                                                    disabled={!getEffectiveNewUserCompanyId()}
+                                                    className={`w-full bg-white/70 border border-gray-200 rounded-xl p-3 text-sm text-gray-900 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none appearance-none font-medium transition-all ${!getEffectiveNewUserCompanyId() ? 'bg-gray-50 cursor-not-allowed opacity-60' : ''}`}
                                                 >
                                                     <option value="">Selecione a Filial</option>
                                                     {(() => {
-                                                        const selectedCompany = companies.find((c: any) => c.id === newUserCompanyId);
+                                                        const selectedCompany = companies.find((c: any) => c.id === getEffectiveNewUserCompanyId());
                                                         if (selectedCompany && selectedCompany.areas) {
-                                                            const allBranches = selectedCompany.areas.flatMap((area: any) => area.branches || []);
+                                                            const allowedAreas = currentUser.role === 'ADMINISTRATIVO'
+                                                                ? selectedCompany.areas.filter((area: any) => normalizeTeamScopeText(area?.name) === normalizeTeamScopeText(currentUser.area))
+                                                                : selectedCompany.areas;
+                                                            const allBranches = allowedAreas.flatMap((area: any) => area.branches || []);
                                                             return allBranches.map((branch: string, idx: number) => (
                                                                 <option key={idx} value={branch}>{branch}</option>
                                                             ));
@@ -8610,7 +8699,7 @@ const App: React.FC = () => {
                                             <input
                                                 type="text"
                                                 placeholder="Área Automática"
-                                                value={newUserArea}
+                                                value={getEffectiveNewUserArea()}
                                                 readOnly
                                                 disabled
                                                 className="w-full bg-gray-50/50 border border-gray-200 rounded-xl p-3 text-sm text-gray-500 cursor-not-allowed font-medium italic"
@@ -8660,7 +8749,9 @@ const App: React.FC = () => {
                                                 >
                                                     <option value="USER">Usuário Comum (Acesso Padrão)</option>
                                                     <option value="ADMINISTRATIVO">Administrativo</option>
-                                                    <option value="MASTER">Administrador Master (Acesso Total)</option>
+                                                    {currentUser.role === 'MASTER' && (
+                                                        <option value="MASTER">Administrador Master (Acesso Total)</option>
+                                                    )}
                                                 </select>
                                                 <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">
                                                     <ChevronDown size={14} strokeWidth={3} />
@@ -8736,7 +8827,9 @@ const App: React.FC = () => {
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-gray-50">
-                                                {filteredUsers.map((u, idx) => (
+                                                {filteredUsers.map((u, idx) => {
+                                                    const canActOnTeamUser = canManageTeamUser(u) && u.email !== currentUser.email;
+                                                    return (
                                                     <tr key={idx} className="group hover:bg-blue-50/30 transition-colors duration-200">
                                                         <td className="px-4 py-4">
                                                             <div className="font-bold text-gray-900 break-words">{u.name}</div>
@@ -8845,7 +8938,7 @@ const App: React.FC = () => {
                                                             )}
                                                         </td>
                                                         <td className="px-4 py-4 text-right">
-                                                            {u.role !== 'MASTER' && (
+                                                            {u.role !== 'MASTER' && canActOnTeamUser && (
                                                                 <div className="flex items-center justify-end gap-2 opacity-60 group-hover:opacity-100 transition-opacity">
                                                                     {u.rejected ? (
                                                                         <button
@@ -8898,7 +8991,8 @@ const App: React.FC = () => {
                                                             </td>
                                                         )}
                                                     </tr>
-                                                ))}
+                                                    );
+                                                })}
                                                 {filteredUsers.length === 0 && (
                                                     <tr>
                                                         <td colSpan={currentUser?.role === 'MASTER' ? 8 : 7} className="px-6 py-12 text-center">
