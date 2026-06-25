@@ -815,16 +815,16 @@ const mergeExcelMetricsPools = (pools: any[]): any | null => {
     if (validPools.length === 0) return null;
     if (validPools.length === 1) return validPools[0];
 
-    const officialPoolValues = validPools
+    const mergedPoolDiffCostValues = validPools
         .map((pool: any) => {
-            const raw = pool?.officialDiffCost ?? (pool?.financialDiffSource ? pool?.diffCost : undefined);
+            const raw = pool?.officialDiffCost ?? pool?.diffCost;
             if (raw === undefined || raw === null || raw === '') return null;
             const value = roundAuditMoney(raw);
             return Number.isFinite(value) ? value : null;
         })
         .filter((value): value is number => value !== null);
-    const officialDiffCost = officialPoolValues.length > 0
-        ? roundAuditMoney(officialPoolValues.reduce((sum, value) => sum + value, 0))
+    const mergedPoolDiffCost = mergedPoolDiffCostValues.length === validPools.length
+        ? roundAuditMoney(mergedPoolDiffCostValues.reduce((sum, value) => sum + value, 0))
         : null;
 
     const normText = (value: unknown) =>
@@ -905,7 +905,7 @@ const mergeExcelMetricsPools = (pools: any[]): any | null => {
 
         return {
             ...totals,
-            ...(officialDiffCost !== null ? { diffCost: officialDiffCost, officialDiffCost, financialDiffSource: 'merged_official_terms' } : {}),
+            ...(mergedPoolDiffCost !== null ? { diffCost: mergedPoolDiffCost, officialDiffCost: mergedPoolDiffCost, financialDiffSource: 'merged_term_pools' } : {}),
             items,
             groupedDifferences: Object.values(groupedMap)
         };
@@ -924,7 +924,7 @@ const mergeExcelMetricsPools = (pools: any[]): any | null => {
 
     return {
         ...fallback,
-        ...(officialDiffCost !== null ? { diffCost: officialDiffCost, officialDiffCost, financialDiffSource: 'merged_official_terms' } : {})
+        ...(mergedPoolDiffCost !== null ? { diffCost: mergedPoolDiffCost, officialDiffCost: mergedPoolDiffCost, financialDiffSource: 'merged_term_pools' } : {})
     };
 };
 

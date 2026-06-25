@@ -413,16 +413,16 @@ const mergeAuditExcelMetricsPools = (pools: any[]) => {
     if (validPools.length === 0) return null;
     if (validPools.length === 1) return validPools[0];
 
-    const officialPoolValues = validPools
+    const mergedPoolDiffCostValues = validPools
         .map((pool: any) => {
-            const raw = pool?.officialDiffCost ?? (pool?.financialDiffSource ? pool?.diffCost : undefined);
+            const raw = pool?.officialDiffCost ?? pool?.diffCost;
             if (raw === undefined || raw === null || raw === '') return null;
             const value = roundAuditMoney(raw);
             return Number.isFinite(value) ? value : null;
         })
         .filter((value): value is number => value !== null);
-    const officialDiffCost = officialPoolValues.length > 0
-        ? roundAuditMoney(officialPoolValues.reduce((sum, value) => sum + value, 0))
+    const mergedPoolDiffCost = mergedPoolDiffCostValues.length === validPools.length
+        ? roundAuditMoney(mergedPoolDiffCostValues.reduce((sum, value) => sum + value, 0))
         : null;
 
     const normalizeDigits = (value: unknown) => String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
@@ -462,7 +462,7 @@ const mergeAuditExcelMetricsPools = (pools: any[]) => {
         const items = Array.from(uniqueItems.values());
         return {
             ...summarizeAuditTermRows(items),
-            ...(officialDiffCost !== null ? { diffCost: officialDiffCost, officialDiffCost, financialDiffSource: 'merged_official_terms' } : {}),
+            ...(mergedPoolDiffCost !== null ? { diffCost: mergedPoolDiffCost, officialDiffCost: mergedPoolDiffCost, financialDiffSource: 'merged_term_pools' } : {}),
             items,
             groupedDifferences: validPools.flatMap((pool: any) => Array.isArray(pool?.groupedDifferences) ? pool.groupedDifferences : [])
         };
@@ -483,7 +483,7 @@ const mergeAuditExcelMetricsPools = (pools: any[]) => {
         sysCost: roundAuditMoney(totals.sysCost),
         countedCost: roundAuditMoney(totals.countedCost),
         diffCost: roundAuditMoney(totals.diffCost),
-        ...(officialDiffCost !== null ? { diffCost: officialDiffCost, officialDiffCost, financialDiffSource: 'merged_official_terms' } : {}),
+        ...(mergedPoolDiffCost !== null ? { diffCost: mergedPoolDiffCost, officialDiffCost: mergedPoolDiffCost, financialDiffSource: 'merged_term_pools' } : {}),
         items: [],
         groupedDifferences
     };
