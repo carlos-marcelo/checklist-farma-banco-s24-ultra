@@ -8,6 +8,8 @@ export enum AuditStatus {
 export interface Product {
     code: string;
     reducedCode?: string;
+    barcode?: string;
+    barcodeAliases?: string[];
     name: string;
     quantity: number;
     cost?: number; // Preço de custo unitário
@@ -19,6 +21,9 @@ export interface PostAuditAdjustment {
     barcode?: string;
     reducedCode?: string;
     description: string;
+    mode?: 'delta' | 'replace';
+    previousAuditedQty?: number;
+    replacementQuantity?: number;
     quantity: number;
     unitCost: number;
     totalCost: number;

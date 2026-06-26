@@ -387,6 +387,9 @@ const normalizePostAuditAdjustments = (value: unknown): PostAuditAdjustment[] =>
                 barcode: String(item?.barcode || '').trim() || undefined,
                 reducedCode: String(item?.reducedCode || '').trim() || undefined,
                 description: String(item?.description || item?.name || 'Produto sem descrição').trim(),
+                mode: item?.mode === 'replace' ? 'replace' : 'delta',
+                previousAuditedQty: Number.isFinite(Number(item?.previousAuditedQty)) ? Number(item.previousAuditedQty) : undefined,
+                replacementQuantity: Number.isFinite(Number(item?.replacementQuantity)) ? Number(item.replacementQuantity) : undefined,
                 quantity,
                 unitCost,
                 totalCost,
@@ -1511,8 +1514,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [postAdjustmentCode, setPostAdjustmentCode] = useState('');
     const [postAdjustmentQty, setPostAdjustmentQty] = useState('');
     const [postAdjustmentNote, setPostAdjustmentNote] = useState('');
+    const [postAdjustmentMode, setPostAdjustmentMode] = useState<'delta' | 'replace'>('replace');
     const [postAdjustmentError, setPostAdjustmentError] = useState<string | null>(null);
     const [isSavingPostAdjustment, setIsSavingPostAdjustment] = useState(false);
+    const lastAutoPostAdjustmentNoteRef = useRef('');
     const auditLookupInputRef = useRef<HTMLInputElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
     const [selectedEmpresa, setSelectedEmpresa] = useState("Drogaria Cidade");
@@ -2232,6 +2237,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [globalCatIdsMeta, setGlobalCatIdsMeta] = useState<DbGlobalBaseFile | null>(null);
     const [globalStockFile, setGlobalStockFile] = useState<File | null>(null);
     const [globalStockMeta, setGlobalStockMeta] = useState<DbGlobalBaseFile | null>(null);
+    const [stockCodeAliasesByReduced, setStockCodeAliasesByReduced] = useState<Record<string, string[]>>({});
+    const [cadastroBarcodeAliasesByReduced, setCadastroBarcodeAliasesByReduced] = useState<Record<string, string[]>>({});
     const [isLoadingGlobalBases, setIsLoadingGlobalBases] = useState(false);
     const lastAutoStockSyncKeyRef = useRef('');
 
@@ -3322,6 +3329,95 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         });
     };
 
+    useEffect(() => {
+        if (!globalStockFile) {
+            setStockCodeAliasesByReduced({});
+            return;
+        }
+        let cancelled = false;
+        const loadStockAliases = async () => {
+            try {
+                const rows = await readExcel(globalStockFile);
+                if (cancelled) return;
+                const next: Record<string, string[]> = {};
+                rows.forEach(row => {
+                    if (!row) return;
+                    const reduced = normalizeBarcode(row[1]);
+                    if (!reduced) return;
+                    const aliases = collectProductCodeCandidates(row, 12)
+                        .filter(code => code && code !== reduced);
+                    if (aliases.length === 0) return;
+                    next[reduced] = Array.from(new Set([...(next[reduced] || []), ...aliases]));
+                });
+                setStockCodeAliasesByReduced(next);
+            } catch (error) {
+                console.warn('Falha ao indexar códigos de barras do estoque para ajustes:', error);
+                if (!cancelled) setStockCodeAliasesByReduced({});
+            }
+        };
+        void loadStockAliases();
+        return () => { cancelled = true; };
+    }, [globalStockFile]);
+
+    useEffect(() => {
+        const files = GROUP_UPLOAD_IDS
+            .map(groupId => globalGroupFiles[groupId])
+            .filter((file): file is File => !!file);
+        if (files.length === 0) {
+            setCadastroBarcodeAliasesByReduced({});
+            return;
+        }
+
+        let cancelled = false;
+        const addAlias = (target: Record<string, string[]>, reducedRaw: unknown, barcodeRaw: unknown) => {
+            const reduced = normalizeBarcode(reducedRaw);
+            const barcode = normalizeBarcode(barcodeRaw);
+            if (!reduced || !barcode || reduced === barcode) return;
+            if (barcode.length < 6) return;
+            target[reduced] = Array.from(new Set([...(target[reduced] || []), barcode]));
+        };
+
+        const loadCadastroAliases = async () => {
+            try {
+                const allRows = await Promise.all(files.map(file => readExcel(file)));
+                if (cancelled) return;
+                const next: Record<string, string[]> = {};
+                allRows.forEach(rows => {
+                    rows.forEach(row => {
+                        if (!row) return;
+                        // Cadastro Global: coluna C = reduzido, coluna L = código de barras.
+                        addAlias(next, row[2], row[11]);
+                    });
+                });
+                setCadastroBarcodeAliasesByReduced(next);
+            } catch (error) {
+                console.warn('Falha ao indexar códigos de barras do Cadastro Global para ajustes:', error);
+                if (!cancelled) setCadastroBarcodeAliasesByReduced({});
+            }
+        };
+
+        void loadCadastroAliases();
+        return () => { cancelled = true; };
+    }, [globalGroupFiles]);
+
+    const barcodeAliasToReduced = useMemo(() => {
+        const next: Record<string, string> = {};
+        const addAliases = (aliasesByReduced: Record<string, string[]>) => {
+            Object.entries(aliasesByReduced || {}).forEach(([reducedRaw, aliases]) => {
+                const reduced = normalizeProductLookupCode(reducedRaw);
+                if (!reduced) return;
+                (aliases || []).forEach(aliasRaw => {
+                    const alias = normalizeProductLookupCode(aliasRaw);
+                    if (!alias || alias === reduced) return;
+                    next[alias] = reduced;
+                });
+            });
+        };
+        addAliases(stockCodeAliasesByReduced);
+        addAliases(cadastroBarcodeAliasesByReduced);
+        return next;
+    }, [stockCodeAliasesByReduced, cadastroBarcodeAliasesByReduced]);
+
     const cleanDescription = (str: string) => {
         if (!str) return "";
         return str.toString().replace(/^[0-9\s\-\.]+/, "").trim().toUpperCase();
@@ -4169,12 +4265,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             rebuildFallbackScopes();
 
-            const stockAcc: Record<string, { q: number; costAmount: number; name: string; groupId: string }> = {};
+            const stockAcc: Record<string, { q: number; costAmount: number; name: string; groupId: string; barcodeAliases: string[] }> = {};
             const groupsMap: Record<string, Group> = {};
             rowsStock.forEach((row) => {
                 if (!row) return;
                 const reduced = normalizeBarcode(row[1]); // B
                 if (!reduced) return;
+                const barcodeAliases = collectProductCodeCandidates(row, 12).filter(code => code && code !== reduced);
                 const productName = row[2]?.toString() || row[4]?.toString() || "Sem Descrição";
                 const stockQty = parseStockNumber(row[14]); // O
                 const stockCost = parseStockNumber(row[15]); // P
@@ -4182,12 +4279,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const stockGroupId = stockGroupNum !== null ? String(stockGroupNum) : '';
                 if (stockQty <= 0) return;
 
-                const prev = stockAcc[reduced] || { q: 0, costAmount: 0, name: productName, groupId: stockGroupId };
+                const prev = stockAcc[reduced] || { q: 0, costAmount: 0, name: productName, groupId: stockGroupId, barcodeAliases: [] };
                 stockAcc[reduced] = {
                     q: prev.q + stockQty,
                     costAmount: prev.costAmount + (stockQty * stockCost),
                     name: prev.name || productName,
-                    groupId: prev.groupId || stockGroupId
+                    groupId: prev.groupId || stockGroupId,
+                    barcodeAliases: Array.from(new Set([...prev.barcodeAliases, ...barcodeAliases]))
                 };
             });
 
@@ -4360,9 +4458,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 cat.itemsCount++;
                 cat.totalQuantity += acc.q;
                 cat.totalCost += (acc.q * avgCost);
+                const cadastroAliases = cadastroBarcodeAliasesByReduced[normalizeProductLookupCode(reduced)] || [];
+                const allBarcodeAliases = Array.from(new Set([...acc.barcodeAliases, ...cadastroAliases]));
+                const primaryBarcode = allBarcodeAliases.find(code => code.length >= 8) || allBarcodeAliases[0] || '';
                 cat.products.push({
-                    code: reduced,
+                    code: primaryBarcode || reduced,
                     reducedCode: reduced,
+                    barcode: primaryBarcode || undefined,
+                    barcodeAliases: allBarcodeAliases,
                     name: acc.name,
                     quantity: acc.q,
                     cost: avgCost
@@ -8597,6 +8700,37 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const selectedDept = useMemo(() => selectedGroup?.departments.find(d => d.id === view.selectedDeptId), [selectedGroup, view.selectedDeptId]);
     const selectedCat = useMemo(() => selectedDept?.categories.find(c => c.id === view.selectedCatId), [selectedDept, view.selectedCatId]);
 
+    const formatPostAdjustmentHierarchyText = useCallback((label: string, code?: string | number | null, name?: string | null) => {
+        const codeText = String(code || '').trim();
+        const nameText = String(name || '').trim();
+        if (codeText && nameText) return `${label}: ${codeText} - ${nameText}`;
+        if (nameText) return `${label}: ${nameText}`;
+        if (codeText) return `${label}: ${codeText}`;
+        return `${label}: N/D`;
+    }, []);
+
+    const isAutoPostAdjustmentNote = useCallback((value: string) => {
+        const text = normalizeLookupText(value);
+        return text.startsWith('ja auditado em') &&
+            text.includes('grupo:') &&
+            text.includes('departamento:') &&
+            text.includes('categoria:');
+    }, []);
+
+    const resolveCompletedAtForScope = useCallback((groupId: string, deptId: string, catId: string) => {
+        const completed = Array.isArray((data as any)?.partialCompleted) ? (data as any).partialCompleted : [];
+        let latestAt = '';
+        completed.forEach((entry: any) => {
+            if (!isPartialScopeMatch(entry, groupId, deptId, catId)) return;
+            const candidate = String(entry?.completedAt || entry?.startedAt || '').trim();
+            if (!candidate) return;
+            if (!latestAt || new Date(candidate).getTime() > new Date(latestAt).getTime()) {
+                latestAt = candidate;
+            }
+        });
+        return latestAt || null;
+    }, [data]);
+
     const auditLookupIndex = useMemo(() => {
         if (!data) return [] as Array<{
             groupId: string;
@@ -8605,11 +8739,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             deptName: string;
             catId: string;
             catName: string;
+            deptCode: string;
+            catCode: string;
             productName: string;
             barcode: string;
             reducedCode: string;
+            codeKeys: string[];
             quantity: number;
             unitCost: number;
+            audited: boolean;
+            completedAt?: string | null;
             searchText: string;
         }>;
 
@@ -8617,8 +8756,35 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             group.departments.flatMap(dept =>
                 dept.categories.flatMap(cat =>
                     cat.products.map(product => {
-                        const barcode = String(product.code || '').trim();
-                        const reducedCode = String(product.reducedCode || '').trim();
+                        const productAny = product as any;
+                        const productCodeKey = normalizeProductLookupCode(product.code);
+                        const reducedCode = String(product.reducedCode || barcodeAliasToReduced[productCodeKey] || '').trim();
+                        const reducedKey = normalizeProductLookupCode(reducedCode);
+                        const savedAliases = Array.isArray(productAny.barcodeAliases) ? productAny.barcodeAliases : [];
+                        const stockAliases = stockCodeAliasesByReduced[reducedKey] || [];
+                        const cadastroAliases = cadastroBarcodeAliasesByReduced[reducedKey] || [];
+                        const rawCodeCandidates = [
+                            productAny.barcode,
+                            product.code,
+                            reducedCode,
+                            ...savedAliases,
+                            ...stockAliases,
+                            ...cadastroAliases
+                        ].map(value => String(value || '').trim()).filter(Boolean);
+                        const codeKeys = Array.from(new Set(rawCodeCandidates.map(normalizeProductLookupCode).filter(Boolean)));
+                        const distinctBarcodeCandidates = rawCodeCandidates.filter(code => {
+                            const key = normalizeProductLookupCode(code);
+                            return key && key !== reducedKey;
+                        });
+                        const barcode = String(
+                            distinctBarcodeCandidates.find(code => normalizeProductLookupCode(code).length >= 8) ||
+                            distinctBarcodeCandidates[0] ||
+                            ''
+                        ).trim();
+                        const completedAt = resolveCompletedAtForScope(group.id, dept.id, cat.id);
+                        const audited = isDoneStatus(cat.status);
+                        const deptCode = String((dept as any).numericId || dept.id || '').trim();
+                        const catCode = String((cat as any).numericId || cat.id || '').trim();
                         return {
                             groupId: group.id,
                             groupName: group.name,
@@ -8626,40 +8792,256 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             deptName: dept.name,
                             catId: cat.id,
                             catName: cat.name,
+                            deptCode,
+                            catCode,
                             productName: product.name,
                             barcode,
                             reducedCode,
+                            codeKeys,
                             quantity: Number(product.quantity || 0),
                             unitCost: roundAuditMoney(product.cost || 0),
+                            audited,
+                            completedAt,
                             searchText: normalizeLookupText(
-                                `${barcode} ${reducedCode} ${product.name} ${group.id} ${group.name} ${dept.id} ${dept.name} ${cat.id} ${cat.name}`
+                                `${barcode} ${reducedCode} ${codeKeys.join(' ')} ${product.name} ${group.id} ${group.name} ${dept.id} ${dept.name} ${cat.id} ${cat.name}`
                             )
                         };
                     })
                 )
             )
         );
-    }, [data]);
+    }, [data, resolveCompletedAtForScope, stockCodeAliasesByReduced, cadastroBarcodeAliasesByReduced, barcodeAliasToReduced]);
 
     const normalizedAuditLookup = useMemo(() => normalizeLookupText(auditLookup), [auditLookup]);
+    const normalizedAuditLookupCode = useMemo(() => normalizeProductLookupCode(auditLookup), [auditLookup]);
     const auditLookupResults = useMemo(() => {
         if (!normalizedAuditLookup) return [] as typeof auditLookupIndex;
+        const resolvedLookupCodes = Array.from(new Set([
+            normalizedAuditLookupCode,
+            barcodeAliasToReduced[normalizedAuditLookupCode]
+        ].filter(Boolean)));
         return auditLookupIndex
-            .filter(item => item.searchText.includes(normalizedAuditLookup))
+            .filter(item => {
+                if (resolvedLookupCodes.length > 0) {
+                    const itemReduced = normalizeProductLookupCode(item.reducedCode);
+                    const codeMatch = item.codeKeys.some(key =>
+                        resolvedLookupCodes.some(lookupCode =>
+                            key === lookupCode ||
+                            (lookupCode.length >= 3 && key.includes(lookupCode)) ||
+                            (lookupCode.length >= 8 && key.length >= 8 && lookupCode.includes(key))
+                        )
+                    ) || resolvedLookupCodes.includes(itemReduced);
+                    if (codeMatch) return true;
+                }
+                return item.searchText.includes(normalizedAuditLookup);
+            })
             .slice(0, 25);
-    }, [auditLookupIndex, normalizedAuditLookup]);
+    }, [auditLookupIndex, normalizedAuditLookup, normalizedAuditLookupCode, barcodeAliasToReduced]);
     const normalizedPostAdjustmentCode = useMemo(() => normalizeProductLookupCode(postAdjustmentCode), [postAdjustmentCode]);
     const postAdjustmentProduct = useMemo(() => {
-        if (!normalizedPostAdjustmentCode) return null as null | (typeof auditLookupIndex)[number];
-        const exact = auditLookupIndex.find(item =>
-            normalizeProductLookupCode(item.reducedCode) === normalizedPostAdjustmentCode ||
-            normalizeProductLookupCode(item.barcode) === normalizedPostAdjustmentCode
-        );
-        if (exact) return exact;
+        if (normalizedPostAdjustmentCode) {
+            const resolvedLookupCodes = Array.from(new Set([
+                normalizedPostAdjustmentCode,
+                barcodeAliasToReduced[normalizedPostAdjustmentCode]
+            ].filter(Boolean)));
+            const exactMatches = auditLookupIndex.filter(item =>
+                item.codeKeys.some(key => resolvedLookupCodes.includes(key)) ||
+                resolvedLookupCodes.includes(normalizeProductLookupCode(item.reducedCode))
+            );
+            if (exactMatches.length > 0) {
+                return [...exactMatches].sort((a, b) => {
+                    const score = (item: (typeof auditLookupIndex)[number]) => {
+                        const barcodeKey = normalizeProductLookupCode(item.barcode);
+                        const reducedKey = normalizeProductLookupCode(item.reducedCode);
+                        return (
+                            (barcodeKey && resolvedLookupCodes.includes(barcodeKey) ? 40 : 0) +
+                            (item.codeKeys.some(key => key !== reducedKey && resolvedLookupCodes.includes(key)) ? 35 : 0) +
+                            (reducedKey && resolvedLookupCodes.includes(reducedKey) ? 30 : 0) +
+                            (item.audited ? 20 : 0) +
+                            (item.completedAt ? 10 : 0)
+                        );
+                    };
+                    return score(b) - score(a);
+                })[0];
+            }
+        }
         const text = normalizeLookupText(postAdjustmentCode);
         if (!text) return null;
         return auditLookupIndex.find(item => item.searchText.includes(text)) || null;
-    }, [auditLookupIndex, normalizedPostAdjustmentCode, postAdjustmentCode]);
+    }, [auditLookupIndex, normalizedPostAdjustmentCode, postAdjustmentCode, barcodeAliasToReduced]);
+
+    const termAuditedProductItems = useMemo(() => {
+        const metricsByKey = new Map<string, any>();
+        Object.entries((((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>)).forEach(([draftKey, metrics]) => {
+            if (metrics) metricsByKey.set(draftKey, metrics);
+        });
+        Object.entries(termDrafts || {}).forEach(([draftKey, draftValue]) => {
+            if (draftValue?.excelMetricsRemovedAt && !draftValue?.excelMetrics) {
+                metricsByKey.delete(draftKey);
+                return;
+            }
+            if (draftValue?.excelMetrics) metricsByKey.set(draftKey, draftValue.excelMetrics);
+        });
+
+        const rows: Array<{
+            codeKeys: string[];
+            groupId?: string;
+            groupName?: string;
+            deptId?: string;
+            deptName?: string;
+            catId?: string;
+            catName?: string;
+            sysQty: number;
+            countedQty: number;
+            diffQty: number;
+        }> = [];
+
+        metricsByKey.forEach(metrics => {
+            const normalized = normalizeTermMetricsToOfficial(metrics);
+            (Array.isArray(normalized?.items) ? normalized.items : []).forEach((item: any) => {
+                if (isTermMetadataRow(item)) return;
+                const codeKeys = Array.from(new Set([
+                    item?.code,
+                    item?.reducedCode,
+                    item?.barcode
+                ].map(normalizeProductLookupCode).filter(Boolean)));
+                if (codeKeys.length === 0) return;
+                rows.push({
+                    codeKeys,
+                    groupId: normalizeScopeId(item?.groupId),
+                    groupName: item?.groupName,
+                    deptId: normalizeScopeId(item?.deptId),
+                    deptName: item?.deptName,
+                    catId: normalizeScopeId(item?.catId),
+                    catName: item?.catName,
+                    sysQty: Number(item?.sysQty || 0),
+                    countedQty: Number(item?.countedQty || 0),
+                    diffQty: Number(item?.diffQty || 0)
+                });
+            });
+        });
+
+        return rows;
+    }, [data, termDrafts]);
+
+    const postAdjustmentAuditedSnapshot = useMemo(() => {
+        const product = postAdjustmentProduct;
+        if (!product) return null;
+
+        const productKeys = new Set(product.codeKeys);
+        const normalizedGroupId = normalizeScopeId(product.groupId);
+        const normalizedDeptIds = new Set([product.deptId, product.deptCode].map(normalizeScopeId).filter(Boolean));
+        const normalizedCatIds = new Set([product.catId, product.catCode].map(normalizeScopeId).filter(Boolean));
+        const normalizedDeptName = normalizeLookupText(product.deptName);
+        const normalizedCatName = normalizeLookupText(product.catName);
+
+        const codeMatches = termAuditedProductItems.filter(item => item.codeKeys.some(key => productKeys.has(key)));
+        const scoreTermItem = (item: typeof termAuditedProductItems[number]) => {
+            let score = 0;
+            if (item.groupId && item.groupId === normalizedGroupId) score += 4;
+            if (item.deptId && normalizedDeptIds.has(item.deptId)) score += 3;
+            else if (item.deptName && normalizeLookupText(item.deptName) === normalizedDeptName) score += 2;
+            if (item.catId && normalizedCatIds.has(item.catId)) score += 3;
+            else if (item.catName && normalizeLookupText(item.catName) === normalizedCatName) score += 2;
+            return score;
+        };
+        const bestScore = codeMatches.reduce((max, item) => Math.max(max, scoreTermItem(item)), -1);
+        const selectedTermItems = bestScore > 0
+            ? codeMatches.filter(item => scoreTermItem(item) === bestScore)
+            : codeMatches;
+
+        const baseAuditedQty = selectedTermItems.length > 0
+            ? selectedTermItems.reduce((sum, item) => sum + Number(item.countedQty || 0), 0)
+            : Number(product.quantity || 0);
+        const baseSystemQty = selectedTermItems.length > 0
+            ? selectedTermItems.reduce((sum, item) => sum + Number(item.sysQty || 0), 0)
+            : Number(product.quantity || 0);
+
+        const adjustmentQty = postAuditAdjustments.reduce((sum, adjustment) => {
+            const adjustmentKeys = [
+                adjustment.code,
+                adjustment.reducedCode,
+                adjustment.barcode
+            ].map(normalizeProductLookupCode).filter(Boolean);
+            const matchesCode = adjustmentKeys.some(key => productKeys.has(key));
+            if (!matchesCode) return sum;
+            return sum + Number(adjustment.quantity || 0);
+        }, 0);
+
+        return {
+            baseAuditedQty,
+            baseSystemQty,
+            adjustmentQty,
+            currentAuditedQty: baseAuditedQty + adjustmentQty,
+            source: selectedTermItems.length > 0 ? 'term' : 'system'
+        };
+    }, [postAdjustmentProduct, termAuditedProductItems, postAuditAdjustments]);
+
+    const postAdjustmentComputedDelta = useMemo(() => {
+        if (!String(postAdjustmentQty || '').trim()) return null;
+        const inputQuantity = parseSignedAuditNumber(postAdjustmentQty);
+        if (!Number.isFinite(inputQuantity)) return null;
+        if (postAdjustmentMode === 'replace') {
+            if (!postAdjustmentAuditedSnapshot) return null;
+            return inputQuantity - Number(postAdjustmentAuditedSnapshot.currentAuditedQty || 0);
+        }
+        return inputQuantity;
+    }, [postAdjustmentMode, postAdjustmentQty, postAdjustmentAuditedSnapshot]);
+
+    const postAdjustmentScopeInfo = useMemo(() => {
+        const product = postAdjustmentProduct;
+        if (!product) return null;
+        return {
+            group: formatPostAdjustmentHierarchyText('Grupo', product.groupId, product.groupName),
+            dept: formatPostAdjustmentHierarchyText('Departamento', product.deptCode || product.deptId, product.deptName),
+            cat: formatPostAdjustmentHierarchyText('Categoria', product.catCode || product.catId, product.catName)
+        };
+    }, [postAdjustmentProduct, formatPostAdjustmentHierarchyText]);
+
+    const postAdjustmentAutoNote = useMemo(() => {
+        const product = postAdjustmentProduct;
+        if (!product || !product.audited) return '';
+        const completedAtLabel = product.completedAt
+            ? new Date(product.completedAt).toLocaleString('pt-BR', { hour12: false })
+            : 'data nao registrada';
+        return [
+            `Já auditado em ${completedAtLabel}.`,
+            `${postAdjustmentScopeInfo?.group || formatPostAdjustmentHierarchyText('Grupo', product.groupId, product.groupName)}.`,
+            `${postAdjustmentScopeInfo?.dept || formatPostAdjustmentHierarchyText('Departamento', product.deptCode || product.deptId, product.deptName)}.`,
+            `${postAdjustmentScopeInfo?.cat || formatPostAdjustmentHierarchyText('Categoria', product.catCode || product.catId, product.catName)}.`
+        ].join(' ');
+    }, [postAdjustmentProduct, postAdjustmentScopeInfo, formatPostAdjustmentHierarchyText]);
+
+    useEffect(() => {
+        if (!postAdjustmentAutoNote) {
+            if (!lastAutoPostAdjustmentNoteRef.current) return;
+            setPostAdjustmentNote(current => {
+                const trimmed = current.trim();
+                if (trimmed === lastAutoPostAdjustmentNoteRef.current || isAutoPostAdjustmentNote(trimmed)) return '';
+                return current;
+            });
+            lastAutoPostAdjustmentNoteRef.current = '';
+            return;
+        }
+        setPostAdjustmentNote(current => {
+            const trimmed = current.trim();
+            if (!trimmed) {
+                lastAutoPostAdjustmentNoteRef.current = postAdjustmentAutoNote;
+                return postAdjustmentAutoNote;
+            }
+            if (lastAutoPostAdjustmentNoteRef.current && current.startsWith(lastAutoPostAdjustmentNoteRef.current)) {
+                const manualComplement = current.slice(lastAutoPostAdjustmentNoteRef.current.length).trimStart();
+                lastAutoPostAdjustmentNoteRef.current = postAdjustmentAutoNote;
+                return manualComplement ? `${postAdjustmentAutoNote} ${manualComplement}` : postAdjustmentAutoNote;
+            }
+            if (isAutoPostAdjustmentNote(trimmed)) {
+                lastAutoPostAdjustmentNoteRef.current = postAdjustmentAutoNote;
+                return postAdjustmentAutoNote;
+            }
+            return current;
+        });
+    }, [postAdjustmentAutoNote, isAutoPostAdjustmentNote]);
+
     const handleOpenAuditLookupResult = useCallback((result: (typeof auditLookupIndex)[number]) => {
         setView({
             level: 'products',
@@ -8704,12 +9086,38 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (isReadOnlyCompletedView) return;
         setPostAdjustmentError(null);
         const product = postAdjustmentProduct;
-        const quantity = parseSignedAuditNumber(postAdjustmentQty);
+        const inputQuantity = parseSignedAuditNumber(postAdjustmentQty);
         if (!product) {
-            setPostAdjustmentError('Produto não encontrado pelo reduzido ou código.');
+            setPostAdjustmentError('Produto não encontrado pelo reduzido, código de barras ou descrição.');
             return;
         }
-        if (!quantity || !Number.isFinite(quantity)) {
+        if (!String(postAdjustmentQty || '').trim()) {
+            setPostAdjustmentError(postAdjustmentMode === 'replace'
+                ? 'Informe a quantidade correta auditada.'
+                : 'Informe uma quantidade diferente de zero.');
+            return;
+        }
+        if (!Number.isFinite(inputQuantity)) {
+            setPostAdjustmentError('Informe uma quantidade válida.');
+            return;
+        }
+
+        let quantity = inputQuantity;
+        let previousAuditedQty: number | undefined;
+        let replacementQuantity: number | undefined;
+        if (postAdjustmentMode === 'replace') {
+            if (!postAdjustmentAuditedSnapshot) {
+                setPostAdjustmentError('Não foi possível identificar a quantidade auditada atual deste produto.');
+                return;
+            }
+            previousAuditedQty = Number(postAdjustmentAuditedSnapshot.currentAuditedQty || 0);
+            replacementQuantity = inputQuantity;
+            quantity = replacementQuantity - previousAuditedQty;
+            if (Math.abs(quantity) <= 0.0001) {
+                setPostAdjustmentError('A quantidade correta informada já é igual à quantidade auditada atual.');
+                return;
+            }
+        } else if (!quantity || !Number.isFinite(quantity)) {
             setPostAdjustmentError('Informe uma quantidade diferente de zero.');
             return;
         }
@@ -8727,14 +9135,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             barcode: product.barcode || undefined,
             reducedCode: product.reducedCode || undefined,
             description: product.productName,
+            mode: postAdjustmentMode,
+            previousAuditedQty,
+            replacementQuantity,
             quantity,
             unitCost,
             totalCost: roundAuditMoney(quantity * unitCost),
             groupId: product.groupId,
             groupName: product.groupName,
-            deptId: product.deptId,
+            deptId: product.deptCode || product.deptId,
             deptName: product.deptName,
-            catId: product.catId,
+            catId: product.catCode || product.catId,
             catName: product.catName,
             note: postAdjustmentNote.trim() || undefined,
             createdAt: new Date().toISOString(),
@@ -8747,6 +9158,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 setPostAdjustmentCode('');
                 setPostAdjustmentQty('');
                 setPostAdjustmentNote('');
+                setPostAdjustmentMode('replace');
+                lastAutoPostAdjustmentNoteRef.current = '';
                 setPostAdjustmentError(null);
             } else {
                 setPostAdjustmentError('Não foi possível salvar o ajuste.');
@@ -8754,7 +9167,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } finally {
             setIsSavingPostAdjustment(false);
         }
-    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentQty, postAdjustmentCode, postAdjustmentNote, userEmail, persistPostAuditAdjustments, postAuditAdjustments]);
+    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentQty, postAdjustmentCode, postAdjustmentNote, postAdjustmentMode, postAdjustmentAuditedSnapshot, userEmail, persistPostAuditAdjustments, postAuditAdjustments]);
 
     const removePostAuditAdjustment = useCallback(async (id: string) => {
         if (isReadOnlyCompletedView) return;
@@ -9960,6 +10373,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 </div>
 
                                 <div className="space-y-3 border-t border-slate-100 pt-5">
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setPostAdjustmentMode('delta');
+                                                setPostAdjustmentError(null);
+                                            }}
+                                            disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
+                                            className={`h-9 rounded-xl border text-[9px] font-black uppercase tracking-widest transition-all ${postAdjustmentMode === 'delta'
+                                                ? 'bg-slate-900 text-white border-slate-900'
+                                                : 'bg-white text-slate-500 border-slate-200 hover:border-indigo-200 hover:text-indigo-600'} disabled:bg-slate-100 disabled:text-slate-300 disabled:border-slate-100`}
+                                        >
+                                            Somar/Subtrair
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setPostAdjustmentMode('replace');
+                                                setPostAdjustmentError(null);
+                                            }}
+                                            disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
+                                            className={`h-9 rounded-xl border text-[9px] font-black uppercase tracking-widest transition-all ${postAdjustmentMode === 'replace'
+                                                ? 'bg-indigo-600 text-white border-indigo-600'
+                                                : 'bg-white text-slate-500 border-slate-200 hover:border-indigo-200 hover:text-indigo-600'} disabled:bg-slate-100 disabled:text-slate-300 disabled:border-slate-100`}
+                                        >
+                                            Substituir Auditado
+                                        </button>
+                                    </div>
                                     <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px] gap-2">
                                         <input
                                             value={postAdjustmentCode}
@@ -9968,7 +10409,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 setPostAdjustmentError(null);
                                             }}
                                             disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
-                                            placeholder="Reduzido ou código"
+                                            placeholder="Reduzido, barras ou descrição"
                                             className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-700 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
                                         />
                                         <input
@@ -9981,26 +10422,56 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 if (event.key === 'Enter') void addPostAuditAdjustment();
                                             }}
                                             disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
-                                            placeholder="+2 / -1"
+                                            placeholder={postAdjustmentMode === 'replace' ? 'Qtd correta' : '+2 / -1'}
                                             className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-sm font-black text-slate-700 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
                                         />
                                     </div>
-                                    <input
+                                    <textarea
                                         value={postAdjustmentNote}
                                         onChange={(event) => setPostAdjustmentNote(event.target.value)}
                                         disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
                                         placeholder="Observação"
-                                        className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
+                                        rows={3}
+                                        className="min-h-[72px] w-full resize-y rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
                                     />
 
                                     {postAdjustmentProduct && (
                                         <div className="rounded-xl border border-emerald-100 bg-emerald-50/70 p-3">
                                             <p className="text-[10px] font-black uppercase text-emerald-800 leading-tight">{postAdjustmentProduct.productName}</p>
                                             <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] font-bold text-emerald-700/80">
-                                                <span>Grupo {postAdjustmentProduct.groupId}</span>
+                                                <span>Red. {postAdjustmentProduct.reducedCode || 'N/D'}</span>
+                                                <span>Barras {postAdjustmentProduct.barcode || 'N/D'}</span>
                                                 <span>Custo {postAdjustmentProduct.unitCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
                                                 <span>Saldo {postAdjustmentProduct.quantity.toLocaleString('pt-BR')}</span>
                                             </div>
+                                            {postAdjustmentScopeInfo && (
+                                                <div className="mt-2 space-y-0.5 text-[10px] font-black uppercase text-emerald-800/90 leading-tight">
+                                                    <p>{postAdjustmentScopeInfo.group}</p>
+                                                    <p>{postAdjustmentScopeInfo.dept}</p>
+                                                    <p>{postAdjustmentScopeInfo.cat}</p>
+                                                </div>
+                                            )}
+                                            {postAdjustmentProduct.audited && (
+                                                <p className="mt-2 text-[10px] font-black uppercase text-emerald-700">
+                                                    Já auditado{postAdjustmentProduct.completedAt ? ` em ${new Date(postAdjustmentProduct.completedAt).toLocaleString('pt-BR', { hour12: false })}` : ''}
+                                                </p>
+                                            )}
+                                            {postAdjustmentAuditedSnapshot && (
+                                                <div className="mt-2 rounded-lg bg-white/70 border border-emerald-100 px-2 py-1.5 text-[10px] font-black text-emerald-900">
+                                                    <div className="flex flex-wrap gap-x-3 gap-y-1">
+                                                        <span>Sist. {postAdjustmentAuditedSnapshot.baseSystemQty.toLocaleString('pt-BR')}</span>
+                                                        <span>Auditado atual {postAdjustmentAuditedSnapshot.currentAuditedQty.toLocaleString('pt-BR')}</span>
+                                                        {postAdjustmentAuditedSnapshot.adjustmentQty !== 0 && (
+                                                            <span>Ajustes já lançados {postAdjustmentAuditedSnapshot.adjustmentQty > 0 ? '+' : ''}{postAdjustmentAuditedSnapshot.adjustmentQty.toLocaleString('pt-BR')}</span>
+                                                        )}
+                                                    </div>
+                                                    {postAdjustmentMode === 'replace' && postAdjustmentComputedDelta !== null && (
+                                                        <p className={`mt-1 ${postAdjustmentComputedDelta < 0 ? 'text-red-600' : postAdjustmentComputedDelta > 0 ? 'text-emerald-700' : 'text-slate-500'}`}>
+                                                            Ajuste calculado: {postAdjustmentComputedDelta > 0 ? '+' : ''}{postAdjustmentComputedDelta.toLocaleString('pt-BR')} un.
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
                                     )}
 
@@ -10042,6 +10513,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                         <p className="mt-1 text-[10px] font-bold text-slate-400">
                                                             Red. {adjustment.reducedCode || adjustment.code} • {adjustment.groupName || `Grupo ${adjustment.groupId || '-'}`}
                                                         </p>
+                                                        {adjustment.mode === 'replace' && (
+                                                            <p className="mt-1 text-[10px] font-black uppercase text-indigo-600">
+                                                                Substituiu auditado: {Number(adjustment.previousAuditedQty || 0).toLocaleString('pt-BR')} -&gt; {Number(adjustment.replacementQuantity || 0).toLocaleString('pt-BR')}
+                                                            </p>
+                                                        )}
                                                         {adjustment.note && (
                                                             <p className="mt-1 text-[10px] font-semibold text-slate-500 break-words">{adjustment.note}</p>
                                                         )}
