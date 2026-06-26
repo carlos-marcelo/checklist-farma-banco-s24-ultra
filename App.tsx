@@ -1693,30 +1693,7 @@ const App: React.FC = () => {
     const [isSidebarOpen, setIsSidebarOpen] = useState(() => isMobileLayout());
     const [showErrors, setShowErrors] = useState(false);
 
-    const [currentView, setCurrentView] = useState<'checklist' | 'summary' | 'dashboard' | 'report' | 'settings' | 'history' | 'view_history' | 'support' | 'stock' | 'access' | 'pre' | 'audit' | 'logs' | 'cadastros_globais'>(() => {
-        if (typeof window === 'undefined') return 'dashboard';
-        const savedView = localStorage.getItem('APP_CURRENT_VIEW');
-        const allowedViews = new Set([
-            'checklist',
-            'summary',
-            'dashboard',
-            'report',
-            'settings',
-            'history',
-            'view_history',
-            'support',
-            'stock',
-            'access',
-            'audit',
-            'logs',
-            'cadastros_globais',
-            ...(PRE_VENCIDOS_MODULE_ENABLED ? ['pre'] : [])
-        ]);
-        if (savedView && allowedViews.has(savedView)) {
-            return savedView as 'checklist' | 'summary' | 'dashboard' | 'report' | 'settings' | 'history' | 'view_history' | 'support' | 'stock' | 'access' | 'pre' | 'audit' | 'logs' | 'cadastros_globais';
-        }
-        return 'dashboard';
-    });
+    const [currentView, setCurrentView] = useState<'checklist' | 'summary' | 'dashboard' | 'report' | 'settings' | 'history' | 'view_history' | 'support' | 'stock' | 'access' | 'pre' | 'audit' | 'logs' | 'cadastros_globais'>('dashboard');
 
     useEffect(() => {
         if (currentView) {
@@ -2283,21 +2260,10 @@ const App: React.FC = () => {
 
                 if (dbTickets) setTickets(dbTickets);
 
-                // 8. Restore Persisted View (Reports)
-                const pendingReportId = localStorage.getItem('APP_VIEWING_REPORT_ID');
-                if (pendingReportId && dbReportsSummary && dbReportsSummary.length > 0) {
-                    const found = dbReportsSummary.find(r => r.id === pendingReportId);
-                    if (found) {
-                        handleViewHistoryItem(mapDbReportToHistoryItem(found as SupabaseService.DbReport));
-                    }
-                }
-
-                const pendingStockReportId = localStorage.getItem('APP_VIEWING_STOCK_REPORT_ID');
-                if (pendingStockReportId && dbStockReportsSummary) {
-                    handleViewStockConferenceReport(pendingStockReportId);
-                }
-
-                // Cleanup old keys if any
+                // F5/refresh sempre volta para o dashboard inicial.
+                localStorage.setItem('APP_CURRENT_VIEW', 'dashboard');
+                localStorage.removeItem('APP_VIEWING_REPORT_ID');
+                localStorage.removeItem('APP_VIEWING_STOCK_REPORT_ID');
                 localStorage.removeItem('APP_VIEW_HISTORY_ITEM');
                 localStorage.removeItem('APP_VIEW_STOCK_REPORT');
 
@@ -2416,27 +2382,12 @@ const App: React.FC = () => {
         if (savedEmail && !currentUser) {
             const u = users.find(u => u.email === savedEmail);
             if (u) {
-                const savedView = localStorage.getItem('APP_CURRENT_VIEW');
-                const allowedViews = new Set([
-                    'checklist',
-                    'summary',
-                    'dashboard',
-                    'report',
-                    'settings',
-                    'history',
-                    'view_history',
-                    'support',
-                    'stock',
-                    'access',
-                    'audit',
-                    'logs',
-                    'cadastros_globais',
-                    ...(PRE_VENCIDOS_MODULE_ENABLED ? ['pre'] : [])
-                ]);
-                const restoredView = (savedView && allowedViews.has(savedView))
-                    ? savedView as 'checklist' | 'summary' | 'dashboard' | 'report' | 'settings' | 'history' | 'view_history' | 'support' | 'stock' | 'access' | 'pre' | 'audit' | 'logs' | 'cadastros_globais'
-                    : 'dashboard';
-                setCurrentView(restoredView);
+                localStorage.setItem('APP_CURRENT_VIEW', 'dashboard');
+                localStorage.removeItem('APP_VIEWING_REPORT_ID');
+                localStorage.removeItem('APP_VIEWING_STOCK_REPORT_ID');
+                localStorage.removeItem('APP_VIEW_HISTORY_ITEM');
+                localStorage.removeItem('APP_VIEW_STOCK_REPORT');
+                setCurrentView('dashboard');
                 setCurrentUser(u);
                 if (!autoLoginLoggedRef.current) {
                     autoLoginLoggedRef.current = true;
@@ -2453,7 +2404,7 @@ const App: React.FC = () => {
                         source: window.location.pathname || 'web',
                         event_meta: {
                             url: window.location.href,
-                            view: restoredView
+                            view: 'dashboard'
                         }
                     }).catch(() => { });
                 }
