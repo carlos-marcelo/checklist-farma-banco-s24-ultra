@@ -503,6 +503,122 @@ const mergeAuditExcelMetricsPools = (pools: any[]) => {
     };
 };
 
+const parseAuditCustomDraftKeyMeta = (draftKey: string): null | { batchId?: string; scopesPart: string } => {
+    const match = draftKey.match(/^custom\|([^|]*)(?:\|(.*))?$/);
+    if (!match) return null;
+    const hasNewFormat = typeof match[2] === 'string';
+    if (hasNewFormat) return { batchId: (match[1] || '').trim() || undefined, scopesPart: match[2] || '' };
+    return { batchId: undefined, scopesPart: match[1] || '' };
+};
+
+const selectNonOverlappingAuditTermMetricEntries = (
+    parsedData: any,
+    entries: Array<[string, any]>
+): Array<[string, any]> => {
+    if (!Array.isArray(entries) || entries.length <= 1) return entries || [];
+
+    const globalUnifiedEntries = entries.filter(([draftKey]) =>
+        draftKey.startsWith('custom|') && draftKey.includes(AUDIT_GLOBAL_UNIFIED_TERM_BATCH_ID)
+    );
+    if (globalUnifiedEntries.length > 0) return globalUnifiedEntries;
+
+    const norm = (value: unknown) => String(value ?? '').trim().toLowerCase();
+    const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
+    const categoryKey = (group: any, dept: any, cat: any) => [norm(group?.id), norm(dept?.id), norm(cat?.id)].join('|');
+
+    const expandScope = (scope: { groupId?: string; deptId?: string; catId?: string }) => {
+        const keys = new Set<string>();
+        const targetG = norm(scope.groupId);
+        const targetD = norm(scope.deptId);
+        const targetC = norm(scope.catId);
+        groups.forEach((group: any) => {
+            if (targetG && norm(group?.id) !== targetG) return;
+            (group?.departments || []).forEach((dept: any) => {
+                if (targetD && norm(dept?.id) !== targetD && norm(dept?.numericId) !== targetD) return;
+                (dept?.categories || []).forEach((cat: any) => {
+                    if (targetC && norm(cat?.id) !== targetC && norm(cat?.numericId) !== targetC) return;
+                    keys.add(categoryKey(group, dept, cat));
+                });
+            });
+        });
+        return keys;
+    };
+
+    const parseEntryScopes = (draftKey: string) => {
+        if (draftKey.startsWith('custom|')) {
+            const meta = parseAuditCustomDraftKeyMeta(draftKey);
+            return (meta?.scopesPart || '')
+                .split(',')
+                .map(part => part.trim())
+                .filter(Boolean)
+                .map(scopeKey => {
+                    const [groupId, deptId, catId] = scopeKey.split('|');
+                    return { groupId, deptId, catId };
+                });
+        }
+        const [type, groupId, deptId, catId] = draftKey.split('|');
+        if (!type || !groupId) return [];
+        if (type === 'group') return [{ groupId }];
+        if (type === 'department') return [{ groupId, deptId }];
+        if (type === 'category') return [{ groupId, deptId, catId }];
+        return [];
+    };
+
+    const getSpecificity = (draftKey: string) => {
+        if (draftKey.startsWith('custom|')) {
+            const scopes = parseEntryScopes(draftKey);
+            if (scopes.length === 0) return 0;
+            if (scopes.every(scope => norm(scope.catId))) return 3;
+            if (scopes.every(scope => norm(scope.deptId))) return 2;
+            return 1;
+        }
+        const [type] = draftKey.split('|');
+        if (type === 'category') return 3;
+        if (type === 'department') return 2;
+        if (type === 'group') return 1;
+        return 0;
+    };
+
+    const decorated = entries.map(([draftKey, metrics], index) => {
+        const coverage = new Set<string>();
+        parseEntryScopes(draftKey).forEach(scope => {
+            expandScope(scope).forEach(key => coverage.add(key));
+        });
+        return {
+            draftKey,
+            metrics,
+            index,
+            coverage,
+            specificity: getSpecificity(draftKey),
+            quality: getAuditTermMetricsQualityScore(metrics),
+            timestamp: getAuditTermMetricsTimestamp(metrics)
+        };
+    });
+
+    decorated.sort((a, b) =>
+        b.specificity - a.specificity ||
+        b.quality - a.quality ||
+        b.timestamp - a.timestamp ||
+        a.index - b.index
+    );
+
+    const covered = new Set<string>();
+    const selected: typeof decorated = [];
+    decorated.forEach(entry => {
+        if (entry.coverage.size === 0) {
+            if (selected.length === 0) selected.push(entry);
+            return;
+        }
+        if (Array.from(entry.coverage).some(key => covered.has(key))) return;
+        selected.push(entry);
+        entry.coverage.forEach(key => covered.add(key));
+    });
+
+    return selected
+        .sort((a, b) => a.index - b.index)
+        .map(entry => [entry.draftKey, entry.metrics] as [string, any]);
+};
+
 const getAuditTermMetricsFromData = (parsedData: any) => {
     const metricsByKey = new Map<string, any>();
     Object.entries(((parsedData?.termExcelMetricsByKey || {}) as Record<string, any>)).forEach(([draftKey, metrics]) => {
@@ -533,11 +649,11 @@ const getAuditTermMetricsFromData = (parsedData: any) => {
         .map(({ draftKey, metrics }) => [draftKey, metrics] as [string, any])
         .filter(([, metrics]) => !!metrics);
     if (metricEntries.length === 0) return null;
-    const globalUnifiedEntries = metricEntries.filter(([draftKey]) =>
+    const selectedMetricEntries = selectNonOverlappingAuditTermMetricEntries(parsedData, metricEntries);
+    const globalUnifiedEntries = selectedMetricEntries.filter(([draftKey]) =>
         draftKey.startsWith('custom|') && draftKey.includes(AUDIT_GLOBAL_UNIFIED_TERM_BATCH_ID)
     );
-    const pools = (globalUnifiedEntries.length > 0 ? globalUnifiedEntries : metricEntries)
-        .map(([, metrics]) => metrics);
+    const pools = selectedMetricEntries.map(([, metrics]) => metrics);
     const merged = mergeAuditExcelMetricsPools(pools);
     if (!merged) return null;
 
@@ -4790,11 +4906,11 @@ const App: React.FC = () => {
                 });
 
                 const metricEntries = Array.from(metricsByKey.entries()).filter(([, metrics]) => !!metrics);
-                const globalUnifiedEntries = metricEntries.filter(([draftKey]) =>
+                const selectedMetricEntries = selectNonOverlappingAuditTermMetricEntries(parsedData, metricEntries);
+                const globalUnifiedEntries = selectedMetricEntries.filter(([draftKey]) =>
                     draftKey.startsWith('custom|') && draftKey.includes('__global_unified_term__')
                 );
-                const pools = (globalUnifiedEntries.length > 0 ? globalUnifiedEntries : metricEntries)
-                    .map(([, metrics]) => metrics);
+                const pools = selectedMetricEntries.map(([, metrics]) => metrics);
                 const termSourceLabel = globalUnifiedEntries.length > 0 ? 'Termo Unico Geral' : 'Termos ativos agregados';
 
                 const merged = mergeExcelMetricsPoolsLocal(pools);
@@ -6498,14 +6614,15 @@ const App: React.FC = () => {
             // - pool geral considera apenas termDrafts ativos (excelMetrics presentes e não removidos)
             // - backup por key só é usado no acesso direto do escopo (getScopedMetricsLocal)
             const pools = termDraftEntries
-                .map(([, draft]) => {
+                .map(([draftKey, draft]) => {
                     if (!draft?.excelMetrics) return null;
                     if (draft?.excelMetricsRemovedAt && !draft?.excelMetrics) return null;
-                    return draft.excelMetrics;
+                    return [String(draftKey || ''), draft.excelMetrics] as [string, any];
                 })
-                .filter(Boolean);
-            termsWithExcel = pools.length;
-            const mergedMetrics = mergeExcelMetricsPools(pools as any[]);
+                .filter(Boolean) as Array<[string, any]>;
+            const selectedPools = selectNonOverlappingAuditTermMetricEntries(parsedData, pools);
+            termsWithExcel = selectedPools.length;
+            const mergedMetrics = mergeExcelMetricsPools(selectedPools.map(([, metrics]) => metrics) as any[]);
             const scopedRows = Array.isArray(mergedMetrics?.items) && mergedMetrics.items.length > 0
                 ? mergedMetrics.items
                 : (Array.isArray(mergedMetrics?.groupedDifferences) ? mergedMetrics.groupedDifferences : []);
@@ -7107,14 +7224,15 @@ const App: React.FC = () => {
             // - pool geral considera apenas termDrafts ativos (excelMetrics presentes e não removidos)
             // - backup por key só é usado no acesso direto do escopo (getScopedMetricsLocal)
             const pools = termDraftEntries
-                .map(([, draft]) => {
+                .map(([draftKey, draft]) => {
                     if (!draft?.excelMetrics) return null;
                     if (draft?.excelMetricsRemovedAt && !draft?.excelMetrics) return null;
-                    return draft.excelMetrics;
+                    return [String(draftKey || ''), draft.excelMetrics] as [string, any];
                 })
-                .filter(Boolean);
-            termsWithExcel = pools.length;
-            const mergedMetrics = mergeExcelMetricsPools(pools as any[]);
+                .filter(Boolean) as Array<[string, any]>;
+            const selectedPools = selectNonOverlappingAuditTermMetricEntries(parsedData, pools);
+            termsWithExcel = selectedPools.length;
+            const mergedMetrics = mergeExcelMetricsPools(selectedPools.map(([, metrics]) => metrics) as any[]);
             const scopedRows = Array.isArray(mergedMetrics?.items) && mergedMetrics.items.length > 0
                 ? mergedMetrics.items
                 : (Array.isArray(mergedMetrics?.groupedDifferences) ? mergedMetrics.groupedDifferences : []);

@@ -1008,6 +1008,66 @@ const GLOBAL_UNIFIED_TERM_BATCH_ID = '__global_unified_term__';
 
 const roundAuditMoney = (value: unknown) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
+const getStockFileSignature = (meta: any): string => {
+    if (!meta) return '';
+    const moduleKey = String(meta.module_key || meta.moduleKey || 'stock').trim().toLowerCase() || 'stock';
+    const fileName = String(meta.file_name || meta.fileName || meta.name || '').trim().toLowerCase();
+    const fileSizeRaw = meta.file_size ?? meta.fileSize ?? meta.size;
+    const fileSize = Number.isFinite(Number(fileSizeRaw)) ? String(Number(fileSizeRaw)) : '';
+    if (fileName || fileSize) return `${moduleKey}|${fileName}|${fileSize}`;
+
+    const id = String(meta.id || '').trim();
+    const uploadedAt = String(meta.uploaded_at || meta.uploadedAt || '').trim();
+    const updatedAt = String(meta.updated_at || meta.updatedAt || '').trim();
+    return (id || uploadedAt || updatedAt) ? `${moduleKey}|${id}|${uploadedAt || updatedAt}` : '';
+};
+
+const getAppliedStockSignature = (sourceFiles: any): string => {
+    const explicit = String(
+        sourceFiles?.globalStockSignature ||
+        sourceFiles?.stockSignature ||
+        sourceFiles?.stock?.signature ||
+        ''
+    ).trim();
+    if (explicit) return explicit;
+
+    return getStockFileSignature({
+        module_key: sourceFiles?.stock?.module_key || sourceFiles?.stock?.moduleKey || 'stock',
+        file_name: sourceFiles?.stock?.file_name || sourceFiles?.stock?.fileName || sourceFiles?.stock?.name,
+        file_size: sourceFiles?.stock?.file_size ?? sourceFiles?.stock?.fileSize ?? sourceFiles?.stock?.size,
+        id: sourceFiles?.stock?.id,
+        uploaded_at: sourceFiles?.stock?.syncedAt || sourceFiles?.stock?.uploaded_at || sourceFiles?.stock?.uploadedAt,
+        updated_at: sourceFiles?.stock?.updated_at || sourceFiles?.stock?.updatedAt
+    });
+};
+
+const getAppliedStockTimestampRaw = (sourceFiles: any): string | null =>
+    String(
+        sourceFiles?.globalStockProcessedAt ||
+        sourceFiles?.stock?.syncedAt ||
+        sourceFiles?.lastStockUpdateAt ||
+        ''
+    ).trim() || null;
+
+const getGlobalStockTimestampRaw = (globalStockMeta: any): string | null =>
+    String(globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || '').trim() || null;
+
+const isGlobalStockDifferentFromApplied = (sourceFiles: any, globalStockMeta: any): boolean => {
+    if (!globalStockMeta) return false;
+    const globalRaw = getGlobalStockTimestampRaw(globalStockMeta);
+    const appliedRaw = getAppliedStockTimestampRaw(sourceFiles);
+    const globalTs = globalRaw ? new Date(globalRaw).getTime() : NaN;
+    const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
+    if (!Number.isFinite(globalTs)) return false;
+    if (Number.isFinite(appliedTs) && globalTs <= appliedTs + 1000) return false;
+
+    const globalSignature = getStockFileSignature(globalStockMeta);
+    const appliedSignature = getAppliedStockSignature(sourceFiles);
+    if (globalSignature && appliedSignature && globalSignature === appliedSignature) return false;
+
+    return true;
+};
+
 const getTermMetricsTimestamp = (metrics: any) => {
     const raw = metrics?.sourceUploadedAt || metrics?.financialDiffVerifiedAt || metrics?.updatedAt;
     const time = raw ? Date.parse(String(raw)) : 0;
@@ -1193,6 +1253,115 @@ const getWholeTermMetricsTotals = (metrics: any) => {
     };
 };
 
+const selectNonOverlappingTermMetricEntries = (
+    sourceData: any,
+    entries: Array<[string, any]>
+): Array<[string, any]> => {
+    if (!Array.isArray(entries) || entries.length <= 1) return entries || [];
+
+    const globalUnifiedEntries = entries.filter(([draftKey]) =>
+        draftKey.startsWith('custom|') && draftKey.includes(GLOBAL_UNIFIED_TERM_BATCH_ID)
+    );
+    if (globalUnifiedEntries.length > 0) return globalUnifiedEntries;
+
+    const norm = (value: unknown) => normalizeScopeId(value as any).trim();
+    const categoryKey = (g: any, d: any, c: any) => [norm(g?.id), norm(d?.id), norm(c?.id)].join('|');
+    const groups = Array.isArray(sourceData?.groups) ? sourceData.groups : [];
+
+    const expandScope = (scope: { groupId?: string; deptId?: string; catId?: string }) => {
+        const keys = new Set<string>();
+        const targetG = norm(scope.groupId);
+        const targetD = norm(scope.deptId);
+        const targetC = norm(scope.catId);
+        groups.forEach((group: any) => {
+            if (targetG && norm(group.id) !== targetG) return;
+            (group.departments || []).forEach((dept: any) => {
+                if (targetD && norm(dept.id) !== targetD && norm(dept.numericId) !== targetD) return;
+                (dept.categories || []).forEach((cat: any) => {
+                    if (targetC && norm(cat.id) !== targetC && norm(cat.numericId) !== targetC) return;
+                    keys.add(categoryKey(group, dept, cat));
+                });
+            });
+        });
+        return keys;
+    };
+
+    const parseEntryScopes = (draftKey: string) => {
+        if (draftKey.startsWith('custom|')) {
+            const meta = parseCustomDraftKeyMeta(draftKey);
+            return (meta?.scopesPart || '')
+                .split(',')
+                .map(part => part.trim())
+                .filter(Boolean)
+                .map(scopeKey => {
+                    const [groupId, deptId, catId] = scopeKey.split('|');
+                    return { groupId, deptId, catId };
+                });
+        }
+        const [type, groupId, deptId, catId] = draftKey.split('|');
+        if (!type || !groupId) return [];
+        if (type === 'group') return [{ groupId }];
+        if (type === 'department') return [{ groupId, deptId }];
+        if (type === 'category') return [{ groupId, deptId, catId }];
+        return [];
+    };
+
+    const getSpecificity = (draftKey: string) => {
+        if (draftKey.startsWith('custom|')) {
+            const scopes = parseEntryScopes(draftKey);
+            if (scopes.length === 0) return 0;
+            if (scopes.every(scope => norm(scope.catId))) return 3;
+            if (scopes.every(scope => norm(scope.deptId))) return 2;
+            return 1;
+        }
+        const [type] = draftKey.split('|');
+        if (type === 'category') return 3;
+        if (type === 'department') return 2;
+        if (type === 'group') return 1;
+        return 0;
+    };
+
+    const decorated = entries.map(([draftKey, metrics], index) => {
+        const coverage = new Set<string>();
+        parseEntryScopes(draftKey).forEach(scope => {
+            expandScope(scope).forEach(key => coverage.add(key));
+        });
+        return {
+            draftKey,
+            metrics,
+            index,
+            coverage,
+            specificity: getSpecificity(draftKey),
+            quality: getTermMetricsQualityScore(metrics),
+            timestamp: getTermMetricsTimestamp(metrics)
+        };
+    });
+
+    decorated.sort((a, b) =>
+        b.specificity - a.specificity ||
+        b.quality - a.quality ||
+        b.timestamp - a.timestamp ||
+        a.index - b.index
+    );
+
+    const covered = new Set<string>();
+    const selected: typeof decorated = [];
+    decorated.forEach(entry => {
+        if (entry.coverage.size === 0) {
+            if (selected.length === 0) selected.push(entry);
+            return;
+        }
+        const overlaps = Array.from(entry.coverage).some(key => covered.has(key));
+        if (overlaps) return;
+        selected.push(entry);
+        entry.coverage.forEach(key => covered.add(key));
+    });
+
+    return selected
+        .sort((a, b) => a.index - b.index)
+        .map(entry => [entry.draftKey, entry.metrics] as [string, any]);
+};
+
 const getAuthoritativeTermMetrics = (
     sourceData: any,
     sourceDrafts?: Record<string, TermForm>
@@ -1231,11 +1400,11 @@ const getAuthoritativeTermMetrics = (
         .filter(([, metrics]) => !!metrics);
     if (metricEntries.length === 0) return null;
 
-    const globalUnifiedEntries = metricEntries.filter(([draftKey]) =>
+    const selectedMetricEntries = selectNonOverlappingTermMetricEntries(sourceData, metricEntries);
+    const globalUnifiedEntries = selectedMetricEntries.filter(([draftKey]) =>
         draftKey.startsWith('custom|') && draftKey.includes(GLOBAL_UNIFIED_TERM_BATCH_ID)
     );
-    const pools = (globalUnifiedEntries.length > 0 ? globalUnifiedEntries : metricEntries)
-        .map(([, metrics]) => metrics);
+    const pools = selectedMetricEntries.map(([, metrics]) => metrics);
     const merged = mergeExcelMetricsPools(pools);
     if (!merged) return null;
 
@@ -1868,7 +2037,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (isStaleRequest()) return;
             if (latest && latest.status !== 'completed') {
                 completedAuditConsultationRef.current = false;
-                let canAutoOpenActive = allowActiveAuditAutoOpen;
+                const alreadyConfirmedOpenAudit = isAuditSessionConfirmed(latest.id);
+                let canAutoOpenActive = allowActiveAuditAutoOpen || alreadyConfirmedOpenAudit;
                 if (!canAutoOpenActive) {
                     if (silent) return;
                     canAutoOpenActive = true;
@@ -1877,18 +2047,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             const history = await fetchAuditsHistory(requestedFilial);
                             const completedCount = history.filter(item => item.status === 'completed').length;
                             const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
-                            const currentStockSyncedAt = sourceFiles?.globalStockProcessedAt || sourceFiles?.stock?.syncedAt || sourceFiles?.lastStockUpdateAt || null;
-                            const currentStockTs = currentStockSyncedAt ? new Date(currentStockSyncedAt).getTime() : NaN;
-                            const globalStockTsRaw = globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || null;
-                            const globalStockTs = globalStockTsRaw ? new Date(globalStockTsRaw).getTime() : NaN;
-                            const hasNewerGlobalStockAtOpenChoice = Number.isFinite(globalStockTs)
-                                && (!Number.isFinite(currentStockTs) || globalStockTs > currentStockTs + 1000);
+                            const hasNewerGlobalStockAtOpenChoice = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
                             if (completedCount > 0 && !hasNewerGlobalStockAtOpenChoice) {
                                 canAutoOpenActive = window.confirm(
                                     `Existe auditoria em aberto (Nº ${latest.audit_number}) e ${completedCount} inventário(s) concluído(s) nesta filial.\n\n` +
                                     `OK: prosseguir com a auditoria em aberto.\n` +
                                     `Cancelar: abrir a lista de inventários concluídos.`
                                 );
+                                if (canAutoOpenActive) {
+                                    setAllowActiveAuditAutoOpen(true);
+                                    markAuditSessionConfirmed(latest.id);
+                                }
                                 if (!canAutoOpenActive) {
                                     setShowCompletedAuditsModal(true);
                                 }
@@ -1962,15 +2131,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         const isNewSession = dbSessionId !== latest.id;
                         const alreadyConfirmed = isAuditSessionConfirmed(latest.id);
                         const resolveLatestStockTimestampForPrompt = (sessionTsRaw?: string | null) => {
-                            let bestRaw = sessionTsRaw || latest.created_at || null;
-                            const officialUploadRaw = String(globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || '').trim() || null;
-                            if (officialUploadRaw && !bestRaw) bestRaw = officialUploadRaw;
-
-                            const processedRaw = latest.data?.sourceFiles?.globalStockProcessedAt || bestRaw;
-                            const sessionTs = processedRaw ? new Date(processedRaw).getTime() : NaN;
-                            const remoteTs = officialUploadRaw ? new Date(officialUploadRaw).getTime() : NaN;
-                            const hasNewerGlobalStock = Number.isFinite(remoteTs) && (!Number.isFinite(sessionTs) || remoteTs > sessionTs + 1000);
-                            return { latestStockTs: officialUploadRaw || bestRaw, hasNewerGlobalStock };
+                            const officialUploadRaw = getGlobalStockTimestampRaw(globalStockMeta);
+                            const bestRaw = officialUploadRaw || sessionTsRaw || latest.created_at || null;
+                            const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
+                            return {
+                                latestStockTs: bestRaw,
+                                hasNewerGlobalStock: isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta)
+                            };
                         };
 
                         if (canUseAuditMasterTools) {
@@ -2263,17 +2430,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const stockHeaderInfo = useMemo(() => {
         const sourceFiles = ((data as any)?.sourceFiles || {}) as any;
-        const appliedRaw = String(
-            sourceFiles?.globalStockProcessedAt ||
-            sourceFiles?.stock?.syncedAt ||
-            sourceFiles?.lastStockUpdateAt ||
-            ''
-        ).trim() || null;
-        const baseRaw = String(globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || '').trim() || null;
+        const appliedRaw = getAppliedStockTimestampRaw(sourceFiles);
+        const baseRaw = getGlobalStockTimestampRaw(globalStockMeta);
         const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
-        const baseTs = baseRaw ? new Date(baseRaw).getTime() : NaN;
         const hasApplied = Number.isFinite(appliedTs);
-        const hasPendingBase = Number.isFinite(baseTs) && (!Number.isFinite(appliedTs) || baseTs > appliedTs + 1000);
+        const hasPendingBase = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
         return {
             appliedLabel: appliedRaw ? formatGlobalTimestamp(appliedRaw) : 'Nao aplicado',
             baseLabel: baseRaw ? formatGlobalTimestamp(baseRaw) : 'Sem data no Cadastro Base',
@@ -3439,16 +3600,19 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const prevSourceFiles = ((data as any)?.sourceFiles || {}) as any;
         const forcedStockSyncedAt = options?.stockSyncedAt || null;
         const previousGlobalStockProcessedAt = prevSourceFiles?.globalStockProcessedAt || null;
+        const stockSignature = getStockFileSignature(globalStockMeta || effectiveStockFile);
         const globalStockProcessedAt = forcedStockSyncedAt
             ? forcedStockSyncedAt
             : (stockSource === 'global_base'
-                ? (globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || previousGlobalStockProcessedAt || nowIso)
+                ? (getGlobalStockTimestampRaw(globalStockMeta) || previousGlobalStockProcessedAt || nowIso)
                 : previousGlobalStockProcessedAt);
         return {
             mode: 'initial-structure-import',
             importedAt: nowIso,
             lastStockUpdateAt: nowIso,
             globalStockProcessedAt,
+            globalStockSignature: stockSignature,
+            stockSignature,
             groups: effectiveGroupFiles.map(({ groupId, file }) => ({
                 groupId,
                 source: 'global_base',
@@ -3458,7 +3622,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             stock: effectiveStockFile ? {
                 ...toUploadedFileMeta(effectiveStockFile),
                 source: stockSource,
-                syncedAt: forcedStockSyncedAt || globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || null
+                syncedAt: forcedStockSyncedAt || getGlobalStockTimestampRaw(globalStockMeta),
+                signature: stockSignature
             } : null,
             deptIds: effectiveDeptIdsFile ? {
                 ...toUploadedFileMeta(effectiveDeptIdsFile),
@@ -3552,21 +3717,29 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const nowIso = new Date().toISOString();
         const prevSourceFiles = ((data as any).sourceFiles || {}) as any;
         const stockMeta = toUploadedFileMeta(stockFile);
+        const stockSignature = source === 'global_base'
+            ? getStockFileSignature(globalStockMeta || stockFile)
+            : getStockFileSignature(stockFile);
         const stockUpdates = Array.isArray(prevSourceFiles.stockUpdates) ? prevSourceFiles.stockUpdates : [];
         const nextSourceFiles = {
             ...prevSourceFiles,
             stock: {
                 ...stockMeta,
                 source,
-                syncedAt
+                syncedAt,
+                signature: stockSignature
             },
             lastStockUpdateAt: nowIso,
             globalStockProcessedAt: source === 'global_base'
                 ? (syncedAt || nowIso)
                 : (syncedAt || prevSourceFiles.globalStockProcessedAt || null),
+            globalStockSignature: source === 'global_base'
+                ? stockSignature
+                : (prevSourceFiles.globalStockSignature || stockSignature || null),
+            stockSignature,
             stockUpdates: [
                 ...stockUpdates,
-                { ...stockMeta, source, syncedAt, updatedAt: nowIso }
+                { ...stockMeta, source, syncedAt, updatedAt: nowIso, signature: stockSignature }
             ]
         };
         const preservedTermDrafts = composeTermDraftsForPersist(((data as any).termDrafts || {}) as Record<string, TermForm>, termDrafts) as Record<string, any>;
@@ -3621,14 +3794,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (!canUseAuditMasterTools) return;
         if (!globalStockFile || !globalStockMeta) return;
 
-        const globalTsRaw = globalStockMeta.uploaded_at || globalStockMeta.updated_at || null;
+        const globalTsRaw = getGlobalStockTimestampRaw(globalStockMeta);
         const globalTs = globalTsRaw ? new Date(globalTsRaw).getTime() : NaN;
         if (!Number.isFinite(globalTs)) return;
 
         const sourceFiles = ((data as any).sourceFiles || {}) as any;
-        const currentStockSyncedAt = sourceFiles?.globalStockProcessedAt || sourceFiles?.stock?.syncedAt || sourceFiles?.lastStockUpdateAt || null;
-        const currentTs = currentStockSyncedAt ? new Date(currentStockSyncedAt).getTime() : NaN;
-        const hasNewerGlobalStock = !Number.isFinite(currentTs) || globalTs > currentTs + 1000;
+        const hasNewerGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
         if (!hasNewerGlobalStock) return;
 
         const syncKey = `${dbSessionId || 'no_session'}|${selectedFilial}|${globalStockMeta.module_key}|${globalTs}`;
@@ -3672,12 +3843,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const hasOpenStructure = !!(data && data.groups && data.groups.length > 0);
         const shouldMergeStockOnly = hasOpenStructure;
         const sourceFiles = ((data as any)?.sourceFiles || {}) as any;
-        const currentStockSyncedAt = sourceFiles?.globalStockProcessedAt || sourceFiles?.stock?.syncedAt || sourceFiles?.lastStockUpdateAt || null;
-        const currentStockTs = currentStockSyncedAt ? new Date(currentStockSyncedAt).getTime() : NaN;
-        const globalStockSyncedAt = globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || null;
-        const globalStockTs = globalStockSyncedAt ? new Date(globalStockSyncedAt).getTime() : NaN;
-        const hasNewerGlobalStock = Number.isFinite(globalStockTs)
-            && (!Number.isFinite(currentStockTs) || globalStockTs > currentStockTs + 1000);
+        const globalStockSyncedAt = getGlobalStockTimestampRaw(globalStockMeta);
+        const hasNewerGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
         const shouldReclassifyOpen = hasOpenStructure && hasStructureFiles && hasNewerGlobalStock;
         const mergePreservingDone = (
             baseData: AuditData,
@@ -3924,7 +4091,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             if (shouldMergeStockOnly && data && !shouldReclassifyOpen) {
                 const stockSource = globalStockMeta ? 'global_base' : 'local_upload';
-                const syncedAt = globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || null;
+                const syncedAt = getGlobalStockTimestampRaw(globalStockMeta);
                 await applyStockMergeToOpenAudit(effectiveStockFile!, {
                     source: stockSource,
                     syncedAt,
@@ -4486,7 +4653,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const basePersistedData = {
                 ...finalData,
                 termDrafts: finalTermDrafts,
-                sourceFiles: buildStructureSourceMeta({ stockSyncedAt: globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || null })
+                sourceFiles: buildStructureSourceMeta({ stockSyncedAt: getGlobalStockTimestampRaw(globalStockMeta) })
             } as any;
             const persistedData = applyPartialScopes(
                 basePersistedData,
@@ -5065,10 +5232,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return true;
             })
             .map(([draftKey, draft]) => ({ draftKey, draft: draft! }));
-        const scopedPools = scopedEntries
+        const selectedScopedEntries = selectNonOverlappingTermMetricEntries(
+            data,
+            scopedEntries.map(({ draftKey, draft }) => [draftKey, draft.excelMetrics] as [string, any])
+        ).map(([draftKey, metrics]) => ({
+            draftKey,
+            draft: { excelMetrics: metrics } as TermForm
+        }));
+        const scopedPools = selectedScopedEntries
             .map(({ draft }) => draft.excelMetrics)
             .filter(Boolean);
-        if (scope.type === 'group' && scopedEntries.length > 0) {
+        if (scope.type === 'group' && selectedScopedEntries.length > 0) {
             const targetGroup = normalizeScopeId(scope.groupId);
             const entryGroups = (draftKey: string) => {
                 const groups = new Set<string>();
@@ -5086,11 +5260,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 if (normalized) groups.add(normalized);
                 return groups;
             };
-            const ownedByThisGroup = scopedEntries.filter(({ draftKey }) => {
+            const ownedByThisGroup = selectedScopedEntries.filter(({ draftKey }) => {
                 const groups = entryGroups(draftKey);
                 return groups.size === 1 && groups.has(targetGroup);
             });
-            if (ownedByThisGroup.length === scopedEntries.length) {
+            if (ownedByThisGroup.length === selectedScopedEntries.length) {
                 return getWholeTermMetricsTotals(mergeExcelMetricsPools(scopedPools as any[]));
             }
         }
@@ -5165,6 +5339,60 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             cost: roundAuditMoney(acc.cost + Number(item.totalCost || 0))
         }), { quantity: 0, cost: 0 });
     }, [postAuditAdjustments]);
+
+    const getPostAuditAdjustmentTotalsForScope = useCallback((scope: { groupId?: string; deptId?: string; catId?: string }) => {
+        const norm = (value: unknown) => normalizeScopeId(value as any).trim().toLowerCase();
+        const targetGroup = norm(scope.groupId);
+        const targetDept = norm(scope.deptId);
+        const targetCat = norm(scope.catId);
+        return postAuditAdjustments.reduce((acc, item) => {
+            if (targetGroup && norm(item.groupId) !== targetGroup) return acc;
+            if (targetDept && norm(item.deptId) !== targetDept) return acc;
+            if (targetCat && norm(item.catId) !== targetCat) return acc;
+            return {
+                quantity: acc.quantity + Number(item.quantity || 0),
+                cost: roundAuditMoney(acc.cost + Number(item.totalCost || 0))
+            };
+        }, { quantity: 0, cost: 0 });
+    }, [postAuditAdjustments]);
+
+    const applyPostAuditAdjustmentsToMetrics = useCallback((
+        metrics: any | null,
+        scope: { groupId?: string; deptId?: string; catId?: string }
+    ) => {
+        const adjustments = getPostAuditAdjustmentTotalsForScope(scope);
+        if (!metrics) {
+            if (Math.abs(adjustments.quantity) <= 0.01 && Math.abs(adjustments.cost) <= 0.01) return null;
+            return {
+                sysQty: 0,
+                sysCost: 0,
+                countedQty: adjustments.quantity,
+                countedCost: adjustments.cost,
+                diffQty: adjustments.quantity,
+                diffCost: adjustments.cost
+            };
+        }
+        return {
+            ...metrics,
+            countedQty: Number(metrics.countedQty || 0) + Number(adjustments.quantity || 0),
+            countedCost: roundAuditMoney(Number(metrics.countedCost || 0) + Number(adjustments.cost || 0)),
+            diffQty: Number(metrics.diffQty || 0) + Number(adjustments.quantity || 0),
+            diffCost: roundAuditMoney(Number(metrics.diffCost || 0) + Number(adjustments.cost || 0))
+        };
+    }, [getPostAuditAdjustmentTotalsForScope]);
+
+    const getAdjustedAuditedCostForScope = useCallback((
+        rawAuditedCost: number,
+        metrics: any | null,
+        scope: { groupId?: string; deptId?: string; catId?: string }
+    ) => {
+        const adjustments = getPostAuditAdjustmentTotalsForScope(scope);
+        return roundAuditMoney(
+            Number(rawAuditedCost || 0) +
+            Number(metrics?.diffCost || 0) +
+            Number(adjustments.cost || 0)
+        );
+    }, [getPostAuditAdjustmentTotalsForScope]);
 
     const authoritativeTermMetrics = useMemo(
         () => getAuthoritativeTermMetrics(data, termDrafts),
@@ -10252,6 +10480,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         const groupAllDone = totalSkus > 0 && doneSkus >= totalSkus;
                         const groupPartialPercent = groupHasInProgress ? getPartialPercentForGroup(group, totalSkus) : 0;
                         const groupProgressValue = groupAllDone ? 100 : groupHasInProgress ? groupPartialPercent : m.progress;
+                        const groupScope = { groupId: group.id };
+                        const groupMetrics = getGroupVerifiedMetrics(group);
+                        const groupDisplayMetrics = applyPostAuditAdjustmentsToMetrics(groupMetrics, groupScope);
+                        const groupAdjustedDoneCost = getAdjustedAuditedCostForScope(m.doneCost, groupMetrics, groupScope);
                         return (
                             <div key={group.id} className={`rounded-[2.5rem] p-8 border shadow-sm hover:shadow-xl transition-all group flex flex-col relative overflow-hidden ${groupHasInProgress ? 'bg-blue-50/60 border-blue-200' : 'bg-white border-slate-200'}`}>
                                 <div className="absolute top-0 right-0 w-32 h-32 bg-indigo-50 rounded-full -mr-16 -mt-16 group-hover:bg-indigo-100 transition-colors z-0"></div>
@@ -10315,16 +10547,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         <p className="text-[8px] font-black text-slate-400 uppercase italic">Valor Total (Custo)</p>
                                         <div className="flex flex-col sm:flex-row sm:justify-between gap-1 text-sm font-black min-w-0">
                                             <span className="text-slate-400 mobile-metric-number leading-tight break-words">R$ {m.cost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
-                                            <span className="text-emerald-600 mobile-metric-number leading-tight break-words">R$ {m.doneCost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} Aud.</span>
+                                            <span className="text-emerald-600 mobile-metric-number leading-tight break-words">R$ {groupAdjustedDoneCost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} Aud.</span>
                                         </div>
                                     </div>
 
                                     {/* Injeção do Dashboard de Excel (Geral) — usa os TOTAIS das excelMetrics */}
-                                    {(() => {
-                                        const metrics = getGroupVerifiedMetrics(group);
-                                        if (!metrics) return null;
-                                        return <ExcelMetricsDashboard metrics={metrics} auditedBaseCost={m.doneCost} />;
-                                    })()}
+                                    {groupDisplayMetrics && (
+                                        <ExcelMetricsDashboard metrics={groupDisplayMetrics} auditedBaseCost={groupAdjustedDoneCost} />
+                                    )}
 
                                     <div className="mt-6">
                                         <ProgressBar percentage={groupProgressValue} size="md" label={`Progresso do Grupo`} tone={groupAllDone ? 'green' : groupHasInProgress ? 'blue' : 'auto'} />
@@ -10589,6 +10819,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         const deptAllDone = totalSkus > 0 && doneSkus >= totalSkus;
                         const deptPartialPercent = deptHasInProgress ? getPartialPercentForDept(selectedGroup!, dept, totalSkus) : 0;
                         const deptProgressValue = deptAllDone ? 100 : deptHasInProgress ? deptPartialPercent : m.progress;
+                        const deptScope = { groupId: selectedGroup!.id, deptId: dept.id };
+                        const deptMetrics = getScopedMetrics({ type: 'department', groupId: selectedGroup!.id, deptId: dept.id });
+                        const deptDisplayMetrics = applyPostAuditAdjustmentsToMetrics(deptMetrics, deptScope);
+                        const deptAdjustedDoneCost = getAdjustedAuditedCostForScope(m.doneCost, deptMetrics, deptScope);
                         return (
                             <div key={dept.id} className={`rounded-[2rem] border shadow-sm hover:shadow-md transition-all p-4 sm:p-6 lg:p-8 flex flex-col lg:flex-row items-stretch lg:items-center gap-4 sm:gap-6 lg:gap-10 group ${deptHasInProgress ? 'bg-blue-50/60 border-blue-200' : 'bg-white border-slate-200'}`}>
                                 <div className="flex flex-col items-center justify-center bg-slate-50 rounded-[2rem] p-4 sm:p-6 w-full lg:w-auto lg:min-w-[160px] border border-slate-100 shadow-inner">
@@ -10636,14 +10870,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         <div className="flex flex-col min-w-0"><span className="text-[9px] font-black text-slate-400 uppercase italic mb-1">Unid Totais</span><span className="mobile-metric-number text-lg font-black text-slate-400 break-words">{Math.round(m.units).toLocaleString()}</span></div>
                                         <div className="flex flex-col min-w-0"><span className="text-[9px] font-black text-slate-400 uppercase italic mb-1">Unid Aud.</span><span className="mobile-metric-number text-xl font-black text-indigo-600 break-words">{Math.round(m.doneUnits).toLocaleString()}</span></div>
                                         <div className="flex flex-col min-w-0"><span className="text-[9px] font-black text-slate-400 uppercase italic mb-1">Custo Total</span><span className="mobile-metric-number text-lg font-black text-slate-400 break-words">R$ {m.cost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span></div>
-                                        <div className="flex flex-col min-w-0"><span className="text-[9px] font-black text-slate-400 uppercase italic mb-1">Custo Aud.</span><span className="mobile-metric-number text-xl font-black text-emerald-600 break-words">R$ {m.doneCost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span></div>
+                                        <div className="flex flex-col min-w-0"><span className="text-[9px] font-black text-slate-400 uppercase italic mb-1">Custo Aud.</span><span className="mobile-metric-number text-xl font-black text-emerald-600 break-words">R$ {deptAdjustedDoneCost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span></div>
                                     </div>
 
-                                    {(() => {
-                                        const metrics = getScopedMetrics({ type: 'department', groupId: selectedGroup!.id, deptId: dept.id });
-                                        if (!metrics) return null;
-                                        return <ExcelMetricsDashboard metrics={metrics} auditedBaseCost={m.doneCost} />;
-                                    })()}
+                                    {deptDisplayMetrics && (
+                                        <ExcelMetricsDashboard metrics={deptDisplayMetrics} auditedBaseCost={deptAdjustedDoneCost} />
+                                    )}
 
                                     <ProgressBar percentage={deptProgressValue} size="md" label={`Status do Departamento`} tone={deptAllDone ? 'green' : deptHasInProgress ? 'blue' : 'auto'} />
                                 </div>
@@ -10681,6 +10913,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         const canFinalize = canUseAuditMasterTools && catStatus !== AuditStatus.TODO;
                         const startLabel = catStatus === AuditStatus.DONE ? 'REABRIR' : catStatus === AuditStatus.IN_PROGRESS ? 'PAUSAR' : 'INICIAR';
                         const catProgressValue = catStatus === AuditStatus.DONE ? 100 : catStatus === AuditStatus.IN_PROGRESS ? 50 : 0;
+                        const catScope = { groupId: selectedGroup!.id, deptId: selectedDept!.id, catId: cat.id };
+                        const catMetrics = getScopedMetrics({ type: 'category', groupId: selectedGroup!.id, deptId: selectedDept!.id, catId: cat.id });
+                        const catDisplayMetrics = applyPostAuditAdjustmentsToMetrics(catMetrics, catScope);
+                        const catAdjustedCost = getAdjustedAuditedCostForScope(cat.totalCost, catMetrics, catScope);
                         return (
                             <div key={cat.id} className={`p-4 sm:p-6 lg:p-8 rounded-[2rem] border-2 flex flex-col lg:flex-row items-stretch lg:items-center gap-4 sm:gap-6 lg:gap-10 transition-all hover:shadow-lg group ${catStatus === AuditStatus.DONE ? 'border-slate-200 bg-white' : catStatus === AuditStatus.IN_PROGRESS ? 'border-blue-200 bg-blue-50/40' : 'border-slate-50 bg-white'}`}>
                                 <div className="flex flex-col items-center justify-center bg-slate-50 rounded-[2rem] p-4 sm:p-6 w-full lg:w-auto lg:min-w-[160px] border border-slate-100 shadow-inner">
@@ -10701,15 +10937,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         </div>
                                         <div className="flex flex-col min-w-0">
                                             <span className="text-[9px] font-black text-slate-400 uppercase italic">Valor em Custo</span>
-                                            <span className="mobile-metric-number text-md font-black text-emerald-600 leading-none break-words">R$ {cat.totalCost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+                                            <span className="mobile-metric-number text-md font-black text-emerald-600 leading-none break-words">R$ {catAdjustedCost.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
                                         </div>
 
                                     </div>
-                                    {(() => {
-                                        const metrics = getScopedMetrics({ type: 'category', groupId: selectedGroup!.id, deptId: selectedDept!.id, catId: cat.id });
-                                        if (!metrics) return null;
-                                        return <ExcelMetricsDashboard metrics={metrics} auditedBaseCost={cat.totalCost} />;
-                                    })()}
+                                    {catDisplayMetrics && (
+                                        <ExcelMetricsDashboard metrics={catDisplayMetrics} auditedBaseCost={catAdjustedCost} />
+                                    )}
                                     <div className="mt-4">
                                         <ProgressBar
                                             percentage={catProgressValue}
