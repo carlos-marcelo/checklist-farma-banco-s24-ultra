@@ -336,6 +336,25 @@ const getPostAuditAdjustmentTotals = (parsedData: any) => {
     }, { quantity: 0, cost: 0 });
 };
 
+const auditMetricsContainsPostAuditAdjustments = (metrics: any) => {
+    const normalizeText = (value: unknown) =>
+        String(value ?? '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim();
+    const rows = [
+        ...(Array.isArray(metrics?.items) ? metrics.items : []),
+        ...(Array.isArray(metrics?.groupedDifferences) ? metrics.groupedDifferences : [])
+    ];
+    return rows.some((row: any) =>
+        row?.isPostAuditAdjustment === true ||
+        String(row?.groupId || '').trim().toLowerCase() === '__post_audit_adjustments__' ||
+        normalizeText(row?.groupName) === normalizeText('AJUSTES APÓS AUDITORIA')
+    );
+};
+
 const getAuditTermMetricsTimestamp = (metrics: any) => {
     const raw = metrics?.sourceUploadedAt || metrics?.financialDiffVerifiedAt || metrics?.updatedAt;
     const time = raw ? Date.parse(String(raw)) : 0;
@@ -511,6 +530,212 @@ const parseAuditCustomDraftKeyMeta = (draftKey: string): null | { batchId?: stri
     return { batchId: undefined, scopesPart: match[1] || '' };
 };
 
+const getAuditCompletedTermBatchIds = (parsedData: any) => {
+    const set = new Set<string>();
+    const completed = Array.isArray(parsedData?.partialCompleted) ? parsedData.partialCompleted : [];
+    completed.forEach((entry: any) => {
+        const batchId = String(
+            entry?.batchId ||
+            [entry?.groupId || '', entry?.deptId || '', entry?.catId || ''].join('|')
+        ).trim().toLowerCase();
+        if (batchId) set.add(batchId);
+    });
+    return set;
+};
+
+const isAuditTermDraftBatchActive = (parsedData: any, draftKey: string) => {
+    if (!draftKey.startsWith('custom|')) return true;
+    if (draftKey.includes(AUDIT_GLOBAL_UNIFIED_TERM_BATCH_ID)) return true;
+    const activeBatchIds = getAuditCompletedTermBatchIds(parsedData);
+    if (activeBatchIds.size === 0) return true;
+    const batchId = String(parseAuditCustomDraftKeyMeta(draftKey)?.batchId || '').trim().toLowerCase();
+    return !batchId || activeBatchIds.has(batchId);
+};
+
+const normalizeAuditScopeText = (value: unknown) =>
+    String(value ?? '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+
+const makeAuditScopeAliasSet = (values: unknown[]) => {
+    const set = new Set<string>();
+    values.forEach(value => {
+        const raw = String(value ?? '').trim().toLowerCase();
+        if (raw) {
+            set.add(raw);
+            const lastDashPart = raw.split('-').filter(Boolean).pop();
+            if (lastDashPart) set.add(lastDashPart);
+        }
+        const digits = String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) set.add(digits);
+    });
+    return set;
+};
+
+const auditAliasSetsIntersect = (a: Set<string>, b: Set<string>) => {
+    for (const value of a) {
+        if (b.has(value)) return true;
+    }
+    return false;
+};
+
+const parseAuditCustomTermScopeEntries = (scopesPart?: string) =>
+    String(scopesPart || '')
+        .split(',')
+        .map(part => part.trim())
+        .filter(Boolean)
+        .map(scopeKey => {
+            const [groupId, deptId, catId] = scopeKey.split('|');
+            return { groupId, deptId, catId };
+        });
+
+const buildAuditTermScopeEntries = (
+    parsedData: any,
+    scopes: Array<{ groupId?: string; deptId?: string; catId?: string }>
+) => {
+    const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
+    const entries: Array<{
+        groupIds: Set<string>;
+        groupName?: string;
+        deptIds: Set<string>;
+        deptName?: string;
+        catIds: Set<string>;
+        catName?: string;
+    }> = [];
+
+    scopes.forEach(scope => {
+        const targetGroupIds = makeAuditScopeAliasSet([scope.groupId]);
+        const targetDeptIds = makeAuditScopeAliasSet([scope.deptId]);
+        const targetCatIds = makeAuditScopeAliasSet([scope.catId]);
+        let matched = false;
+
+        groups.forEach((group: any) => {
+            const groupIds = makeAuditScopeAliasSet([group?.id, group?.numericId]);
+            if (targetGroupIds.size > 0 && !auditAliasSetsIntersect(targetGroupIds, groupIds)) return;
+
+            (group?.departments || []).forEach((dept: any) => {
+                const deptIds = makeAuditScopeAliasSet([dept?.id, dept?.numericId]);
+                if (targetDeptIds.size > 0 && !auditAliasSetsIntersect(targetDeptIds, deptIds)) return;
+
+                (dept?.categories || []).forEach((cat: any) => {
+                    const catIds = makeAuditScopeAliasSet([cat?.id, cat?.numericId]);
+                    if (targetCatIds.size > 0 && !auditAliasSetsIntersect(targetCatIds, catIds)) return;
+                    matched = true;
+                    entries.push({
+                        groupIds,
+                        groupName: group?.name,
+                        deptIds,
+                        deptName: dept?.name,
+                        catIds,
+                        catName: cat?.name
+                    });
+                });
+            });
+        });
+
+        if (!matched) {
+            entries.push({
+                groupIds: targetGroupIds,
+                deptIds: targetDeptIds,
+                catIds: targetCatIds
+            });
+        }
+    });
+
+    return entries;
+};
+
+const auditRowMatchesTermScopeEntry = (row: any, entry: ReturnType<typeof buildAuditTermScopeEntries>[number]) => {
+    const matchPart = (
+        rowId: unknown,
+        rowName: unknown,
+        targetIds: Set<string>,
+        targetName?: string
+    ) => {
+        if (targetIds.size === 0) return true;
+        const rowIds = makeAuditScopeAliasSet([rowId]);
+        if (rowIds.size > 0 && auditAliasSetsIntersect(rowIds, targetIds)) return true;
+        const rowText = normalizeAuditScopeText(rowName || '');
+        const targetText = normalizeAuditScopeText(targetName || '');
+        return !!rowText && !!targetText && rowText === targetText;
+    };
+
+    return (
+        matchPart(row?.groupId, row?.groupName, entry.groupIds, entry.groupName) &&
+        matchPart(row?.deptId, row?.deptName, entry.deptIds, entry.deptName) &&
+        matchPart(row?.catId, row?.catName, entry.catIds, entry.catName)
+    );
+};
+
+const buildGroupedAuditTermRowsFromItems = (items: any[]) => {
+    const groupedMap: Record<string, any> = {};
+    items.forEach((item: any) => {
+        const gId = String(item?.groupId ?? '').trim().toLowerCase();
+        const dId = String(item?.deptId ?? '').trim().toLowerCase();
+        const cId = String(item?.catId ?? '').trim().toLowerCase();
+        const key = `${gId || normalizeAuditScopeText(item?.groupName)}|${dId || normalizeAuditScopeText(item?.deptName)}|${cId || normalizeAuditScopeText(item?.catName)}`;
+        if (!groupedMap[key]) {
+            groupedMap[key] = {
+                groupId: gId || undefined,
+                groupName: item?.groupName || 'DIVERSOS (SEM GRUPO)',
+                deptId: dId || undefined,
+                deptName: item?.deptName || 'DIVERSOS (SEM DEPARTAMENTO)',
+                catId: cId || undefined,
+                catName: item?.catName || 'DIVERSOS (SEM CATEGORIA)',
+                sysQty: 0,
+                sysCost: 0,
+                countedQty: 0,
+                countedCost: 0,
+                diffQty: 0,
+                diffCost: 0
+            };
+        }
+        groupedMap[key].sysQty += Number(item?.sysQty || 0);
+        groupedMap[key].sysCost += Number(item?.sysCost || 0);
+        groupedMap[key].countedQty += Number(item?.countedQty || 0);
+        groupedMap[key].countedCost += Number(item?.countedCost || 0);
+        groupedMap[key].diffQty += Number(item?.diffQty || 0);
+        groupedMap[key].diffCost += Number(item?.diffCost || 0);
+    });
+    return Object.values(groupedMap).sort((a: any, b: any) => Number(a.diffCost || 0) - Number(b.diffCost || 0));
+};
+
+const sanitizeAuditTermMetricsForDraftScope = (parsedData: any, draftKey: string, metrics: any) => {
+    if (!metrics || !draftKey.startsWith('custom|')) return metrics;
+    const meta = parseAuditCustomDraftKeyMeta(draftKey);
+    const scopes = parseAuditCustomTermScopeEntries(meta?.scopesPart || '');
+    if (scopes.length === 0) return metrics;
+
+    const scopeEntries = buildAuditTermScopeEntries(parsedData, scopes);
+    if (scopeEntries.length === 0) return metrics;
+
+    const matchesAnyScope = (row: any) => scopeEntries.some(entry => auditRowMatchesTermScopeEntry(row, entry));
+    const cleanItems = (Array.isArray(metrics.items) ? metrics.items : []).filter((item: any) => !isAuditTermMetadataRow(item));
+    const groupedRows = Array.isArray(metrics.groupedDifferences) ? metrics.groupedDifferences : [];
+    const scopedItems = cleanItems.filter(matchesAnyScope);
+    const scopedGrouped = groupedRows.filter(matchesAnyScope);
+    const itemCountChanged = cleanItems.length > 0 && scopedItems.length > 0 && scopedItems.length !== cleanItems.length;
+    const groupedCountChanged = groupedRows.length > 0 && scopedGrouped.length > 0 && scopedGrouped.length !== groupedRows.length;
+    if (!itemCountChanged && !groupedCountChanged) return metrics;
+
+    const sourceRows = scopedItems.length > 0 ? scopedItems : scopedGrouped;
+    if (sourceRows.length === 0) return metrics;
+
+    const totals = summarizeAuditTermRows(sourceRows);
+    const nextMetrics = { ...metrics };
+    delete nextMetrics.officialDiffCost;
+    delete nextMetrics.financialDiffSource;
+    return {
+        ...nextMetrics,
+        ...totals,
+        items: scopedItems.length > 0 ? scopedItems : [],
+        groupedDifferences: scopedItems.length > 0 ? buildGroupedAuditTermRowsFromItems(scopedItems) : scopedGrouped
+    };
+};
+
 const selectNonOverlappingAuditTermMetricEntries = (
     parsedData: any,
     entries: Array<[string, any]>
@@ -620,17 +845,34 @@ const selectNonOverlappingAuditTermMetricEntries = (
 };
 
 const getAuditTermMetricsFromData = (parsedData: any) => {
-    const metricsByKey = new Map<string, any>();
+    const backupMetricsByKey = new Map<string, any>();
     Object.entries(((parsedData?.termExcelMetricsByKey || {}) as Record<string, any>)).forEach(([draftKey, metrics]) => {
-        if (metrics) metricsByKey.set(draftKey, metrics);
+        if (metrics) backupMetricsByKey.set(draftKey, metrics);
     });
-    Object.entries(((parsedData?.termDrafts || {}) as Record<string, any>)).forEach(([draftKey, draftValue]) => {
+    const mergedDrafts = ((parsedData?.termDrafts || {}) as Record<string, any>);
+    const metricsByKey = new Map<string, any>();
+    const activeDraftKeys = new Set<string>();
+    Object.entries(mergedDrafts).forEach(([draftKey, draftValue]) => {
+        if (draftValue && !(draftValue?.excelMetricsRemovedAt && !draftValue?.excelMetrics)) {
+            activeDraftKeys.add(draftKey);
+        }
+    });
+    backupMetricsByKey.forEach((metrics, draftKey) => {
+        if (activeDraftKeys.has(draftKey)) metricsByKey.set(draftKey, metrics);
+    });
+    Object.entries(mergedDrafts).forEach(([draftKey, draftValue]) => {
         if (draftValue?.excelMetricsRemovedAt && !draftValue?.excelMetrics) {
             metricsByKey.delete(draftKey);
             return;
         }
         if (draftValue?.excelMetrics) metricsByKey.set(draftKey, draftValue.excelMetrics);
     });
+    if (metricsByKey.size === 0) {
+        backupMetricsByKey.forEach((metrics, draftKey) => metricsByKey.set(draftKey, metrics));
+        Object.entries(mergedDrafts).forEach(([draftKey, draftValue]) => {
+            if (draftValue?.excelMetricsRemovedAt && !draftValue?.excelMetrics) metricsByKey.delete(draftKey);
+        });
+    }
 
     const dedupedMetricsByKey = new Map<string, { draftKey: string; metrics: any }>();
     metricsByKey.forEach((metrics, draftKey) => {
@@ -646,7 +888,8 @@ const getAuditTermMetricsFromData = (parsedData: any) => {
     });
 
     const metricEntries = Array.from(dedupedMetricsByKey.values())
-        .map(({ draftKey, metrics }) => [draftKey, metrics] as [string, any])
+        .filter(({ draftKey }) => isAuditTermDraftBatchActive(parsedData, draftKey))
+        .map(({ draftKey, metrics }) => [draftKey, sanitizeAuditTermMetricsForDraftScope(parsedData, draftKey, metrics)] as [string, any])
         .filter(([, metrics]) => !!metrics);
     if (metricEntries.length === 0) return null;
     const selectedMetricEntries = selectNonOverlappingAuditTermMetricEntries(parsedData, metricEntries);
@@ -6830,8 +7073,11 @@ const App: React.FC = () => {
             }
             const postAuditAdjustmentTotals = getPostAuditAdjustmentTotals(parsedData);
             if (
-                Math.abs(Number(postAuditAdjustmentTotals.quantity || 0)) > 0.01 ||
-                Math.abs(Number(postAuditAdjustmentTotals.cost || 0)) > 0.01
+                !auditMetricsContainsPostAuditAdjustments(authoritativeTermMetrics) &&
+                (
+                    Math.abs(Number(postAuditAdjustmentTotals.quantity || 0)) > 0.01 ||
+                    Math.abs(Number(postAuditAdjustmentTotals.cost || 0)) > 0.01
+                )
             ) {
                 diffQty += Number(postAuditAdjustmentTotals.quantity || 0);
                 diffCost = roundAuditMoney(diffCost + Number(postAuditAdjustmentTotals.cost || 0));
@@ -7440,8 +7686,11 @@ const App: React.FC = () => {
             }
             const postAuditAdjustmentTotals = getPostAuditAdjustmentTotals(parsedData);
             if (
-                Math.abs(Number(postAuditAdjustmentTotals.quantity || 0)) > 0.01 ||
-                Math.abs(Number(postAuditAdjustmentTotals.cost || 0)) > 0.01
+                !auditMetricsContainsPostAuditAdjustments(authoritativeTermMetrics) &&
+                (
+                    Math.abs(Number(postAuditAdjustmentTotals.quantity || 0)) > 0.01 ||
+                    Math.abs(Number(postAuditAdjustmentTotals.cost || 0)) > 0.01
+                )
             ) {
                 diffQty += Number(postAuditAdjustmentTotals.quantity || 0);
                 diffCost = roundAuditMoney(diffCost + Number(postAuditAdjustmentTotals.cost || 0));

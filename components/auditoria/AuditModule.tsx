@@ -1004,6 +1004,212 @@ const normalizeCustomScopesPart = (scopesPart?: string) =>
 const getCustomDraftScopesPart = (draftKey: string) =>
     normalizeCustomScopesPart(parseCustomDraftKeyMeta(draftKey)?.scopesPart || '');
 
+const getCompletedTermBatchIds = (sourceData: any) => {
+    const set = new Set<string>();
+    const completed = Array.isArray(sourceData?.partialCompleted) ? sourceData.partialCompleted : [];
+    completed.forEach((entry: any) => {
+        const batchId = normalizeScopeId(getEntryBatchId(entry));
+        if (batchId) set.add(batchId);
+    });
+    return set;
+};
+
+const isTermDraftBatchActive = (sourceData: any, draftKey: string) => {
+    if (!draftKey.startsWith('custom|')) return true;
+    if (draftKey.includes(GLOBAL_UNIFIED_TERM_BATCH_ID)) return true;
+    const activeBatchIds = getCompletedTermBatchIds(sourceData);
+    if (activeBatchIds.size === 0) return true;
+    const batchId = normalizeScopeId(parseCustomDraftKeyMeta(draftKey)?.batchId);
+    return !batchId || activeBatchIds.has(batchId);
+};
+
+const makeTermScopeAliasSet = (values: unknown[]) => {
+    const set = new Set<string>();
+    values.forEach(value => {
+        const raw = normalizeScopeId(value as any).trim();
+        if (raw) {
+            set.add(raw);
+            const lastDashPart = raw.split('-').filter(Boolean).pop();
+            if (lastDashPart) set.add(normalizeScopeId(lastDashPart));
+        }
+        const digits = String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) set.add(digits);
+    });
+    return set;
+};
+
+const termAliasSetsIntersect = (a: Set<string>, b: Set<string>) => {
+    for (const value of a) {
+        if (b.has(value)) return true;
+    }
+    return false;
+};
+
+const normalizeTermScopeText = (value: unknown) =>
+    String(value ?? '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+
+const parseCustomTermScopeEntries = (scopesPart?: string) =>
+    String(scopesPart || '')
+        .split(',')
+        .map(part => part.trim())
+        .filter(Boolean)
+        .map(scopeKey => {
+            const [groupId, deptId, catId] = scopeKey.split('|');
+            return { groupId, deptId, catId };
+        });
+
+const buildTermScopeEntries = (
+    sourceData: any,
+    scopes: Array<{ groupId?: string; deptId?: string; catId?: string }>
+) => {
+    const groups = Array.isArray(sourceData?.groups) ? sourceData.groups : [];
+    const entries: Array<{
+        groupIds: Set<string>;
+        groupName?: string;
+        deptIds: Set<string>;
+        deptName?: string;
+        catIds: Set<string>;
+        catName?: string;
+    }> = [];
+
+    scopes.forEach(scope => {
+        const targetGroupIds = makeTermScopeAliasSet([scope.groupId]);
+        const targetDeptIds = makeTermScopeAliasSet([scope.deptId]);
+        const targetCatIds = makeTermScopeAliasSet([scope.catId]);
+        let matched = false;
+
+        groups.forEach((group: any) => {
+            const groupIds = makeTermScopeAliasSet([group?.id, group?.numericId]);
+            if (targetGroupIds.size > 0 && !termAliasSetsIntersect(targetGroupIds, groupIds)) return;
+
+            (group?.departments || []).forEach((dept: any) => {
+                const deptIds = makeTermScopeAliasSet([dept?.id, dept?.numericId]);
+                if (targetDeptIds.size > 0 && !termAliasSetsIntersect(targetDeptIds, deptIds)) return;
+
+                (dept?.categories || []).forEach((cat: any) => {
+                    const catIds = makeTermScopeAliasSet([cat?.id, cat?.numericId]);
+                    if (targetCatIds.size > 0 && !termAliasSetsIntersect(targetCatIds, catIds)) return;
+                    matched = true;
+                    entries.push({
+                        groupIds,
+                        groupName: group?.name,
+                        deptIds,
+                        deptName: dept?.name,
+                        catIds,
+                        catName: cat?.name
+                    });
+                });
+            });
+        });
+
+        if (!matched) {
+            entries.push({
+                groupIds: targetGroupIds,
+                deptIds: targetDeptIds,
+                catIds: targetCatIds
+            });
+        }
+    });
+
+    return entries;
+};
+
+const rowMatchesTermScopeEntry = (row: any, entry: ReturnType<typeof buildTermScopeEntries>[number]) => {
+    const matchPart = (
+        rowId: unknown,
+        rowName: unknown,
+        targetIds: Set<string>,
+        targetName?: string
+    ) => {
+        if (targetIds.size === 0) return true;
+        const rowIds = makeTermScopeAliasSet([rowId]);
+        if (rowIds.size > 0 && termAliasSetsIntersect(rowIds, targetIds)) return true;
+        const rowText = normalizeTermScopeText(rowName || '');
+        const targetText = normalizeTermScopeText(targetName || '');
+        return !!rowText && !!targetText && rowText === targetText;
+    };
+
+    return (
+        matchPart(row?.groupId, row?.groupName, entry.groupIds, entry.groupName) &&
+        matchPart(row?.deptId, row?.deptName, entry.deptIds, entry.deptName) &&
+        matchPart(row?.catId, row?.catName, entry.catIds, entry.catName)
+    );
+};
+
+const buildGroupedTermRowsFromItems = (items: any[]) => {
+    const groupedMap: Record<string, any> = {};
+    items.forEach((item: any) => {
+        const gId = normalizeScopeId(item?.groupId);
+        const dId = normalizeScopeId(item?.deptId);
+        const cId = normalizeScopeId(item?.catId);
+        const key = `${gId || normalizeTermScopeText(item?.groupName)}|${dId || normalizeTermScopeText(item?.deptName)}|${cId || normalizeTermScopeText(item?.catName)}`;
+        if (!groupedMap[key]) {
+            groupedMap[key] = {
+                groupId: gId || undefined,
+                groupName: item?.groupName || 'DIVERSOS (SEM GRUPO)',
+                deptId: dId || undefined,
+                deptName: item?.deptName || 'DIVERSOS (SEM DEPARTAMENTO)',
+                catId: cId || undefined,
+                catName: item?.catName || 'DIVERSOS (SEM CATEGORIA)',
+                sysQty: 0,
+                sysCost: 0,
+                countedQty: 0,
+                countedCost: 0,
+                diffQty: 0,
+                diffCost: 0
+            };
+        }
+        groupedMap[key].sysQty += Number(item?.sysQty || 0);
+        groupedMap[key].sysCost += Number(item?.sysCost || 0);
+        groupedMap[key].countedQty += Number(item?.countedQty || 0);
+        groupedMap[key].countedCost += Number(item?.countedCost || 0);
+        groupedMap[key].diffQty += Number(item?.diffQty || 0);
+        groupedMap[key].diffCost += Number(item?.diffCost || 0);
+    });
+    return Object.values(groupedMap).sort((a: any, b: any) => Number(a.diffCost || 0) - Number(b.diffCost || 0));
+};
+
+const sanitizeTermMetricsForDraftScope = (sourceData: any, draftKey: string, metrics: any) => {
+    const normalized = normalizeTermMetricsToOfficial(metrics);
+    if (!normalized || !draftKey.startsWith('custom|')) return normalized;
+
+    const meta = parseCustomDraftKeyMeta(draftKey);
+    const scopes = parseCustomTermScopeEntries(meta?.scopesPart || '');
+    if (scopes.length === 0) return normalized;
+
+    const scopeEntries = buildTermScopeEntries(sourceData, scopes);
+    if (scopeEntries.length === 0) return normalized;
+
+    const matchesAnyScope = (row: any) => scopeEntries.some(entry => rowMatchesTermScopeEntry(row, entry));
+    const cleanItems = (Array.isArray(normalized.items) ? normalized.items : []).filter((item: any) => !isTermMetadataRow(item));
+    const groupedRows = Array.isArray(normalized.groupedDifferences) ? normalized.groupedDifferences : [];
+    const scopedItems = cleanItems.filter(matchesAnyScope);
+    const scopedGrouped = groupedRows.filter(matchesAnyScope);
+
+    const itemCountChanged = cleanItems.length > 0 && scopedItems.length > 0 && scopedItems.length !== cleanItems.length;
+    const groupedCountChanged = groupedRows.length > 0 && scopedGrouped.length > 0 && scopedGrouped.length !== groupedRows.length;
+    if (!itemCountChanged && !groupedCountChanged) return normalized;
+
+    const sourceRows = scopedItems.length > 0 ? scopedItems : scopedGrouped;
+    if (sourceRows.length === 0) return normalized;
+
+    const totals = summarizeTermRows(sourceRows);
+    const baseMetrics = { ...normalized };
+    delete (baseMetrics as any).officialDiffCost;
+    delete (baseMetrics as any).financialDiffSource;
+    return normalizeTermMetricsToOfficial({
+        ...baseMetrics,
+        ...totals,
+        items: scopedItems.length > 0 ? scopedItems : [],
+        groupedDifferences: scopedItems.length > 0 ? buildGroupedTermRowsFromItems(scopedItems) : scopedGrouped
+    });
+};
+
 const GLOBAL_UNIFIED_TERM_BATCH_ID = '__global_unified_term__';
 
 const roundAuditMoney = (value: unknown) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -1366,14 +1572,24 @@ const getAuthoritativeTermMetrics = (
     sourceData: any,
     sourceDrafts?: Record<string, TermForm>
 ) => {
-    const metricsByKey = new Map<string, any>();
+    const backupMetricsByKey = new Map<string, any>();
     Object.entries(((sourceData?.termExcelMetricsByKey || {}) as Record<string, any>)).forEach(([draftKey, metrics]) => {
-        if (metrics) metricsByKey.set(draftKey, metrics);
+        if (metrics) backupMetricsByKey.set(draftKey, metrics);
     });
     const mergedDrafts = {
         ...(((sourceData?.termDrafts || {}) as Record<string, TermForm>) || {}),
         ...((sourceDrafts || {}) as Record<string, TermForm>)
     };
+    const metricsByKey = new Map<string, any>();
+    const activeDraftKeys = new Set<string>();
+    Object.entries(mergedDrafts || {}).forEach(([draftKey, draftValue]) => {
+        if (draftValue && !(draftValue.excelMetricsRemovedAt && !draftValue.excelMetrics)) {
+            activeDraftKeys.add(draftKey);
+        }
+    });
+    backupMetricsByKey.forEach((metrics, draftKey) => {
+        if (activeDraftKeys.has(draftKey)) metricsByKey.set(draftKey, metrics);
+    });
     Object.entries(mergedDrafts || {}).forEach(([draftKey, draftValue]) => {
         if (draftValue?.excelMetricsRemovedAt && !draftValue?.excelMetrics) {
             metricsByKey.delete(draftKey);
@@ -1381,6 +1597,12 @@ const getAuthoritativeTermMetrics = (
         }
         if (draftValue?.excelMetrics) metricsByKey.set(draftKey, draftValue.excelMetrics);
     });
+    if (metricsByKey.size === 0) {
+        backupMetricsByKey.forEach((metrics, draftKey) => metricsByKey.set(draftKey, metrics));
+        Object.entries(mergedDrafts || {}).forEach(([draftKey, draftValue]) => {
+            if (draftValue?.excelMetricsRemovedAt && !draftValue?.excelMetrics) metricsByKey.delete(draftKey);
+        });
+    }
 
     const dedupedMetricsByKey = new Map<string, { draftKey: string; metrics: any }>();
     metricsByKey.forEach((metrics, draftKey) => {
@@ -1396,7 +1618,8 @@ const getAuthoritativeTermMetrics = (
     });
 
     const metricEntries = Array.from(dedupedMetricsByKey.values())
-        .map(({ draftKey, metrics }) => [draftKey, metrics] as [string, any])
+        .filter(({ draftKey }) => isTermDraftBatchActive(sourceData, draftKey))
+        .map(({ draftKey, metrics }) => [draftKey, sanitizeTermMetricsForDraftScope(sourceData, draftKey, metrics)] as [string, any])
         .filter(([, metrics]) => !!metrics);
     if (metricEntries.length === 0) return null;
 
@@ -5339,6 +5562,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }), { quantity: 0, cost: 0 });
     }, [postAuditAdjustments]);
 
+    const metricsContainsPostAuditAdjustments = useCallback((metrics: any) => {
+        const rows = [
+            ...(Array.isArray(metrics?.items) ? metrics.items : []),
+            ...(Array.isArray(metrics?.groupedDifferences) ? metrics.groupedDifferences : [])
+        ];
+        return rows.some((row: any) =>
+            row?.isPostAuditAdjustment === true ||
+            normalizeScopeId(row?.groupId) === '__post_audit_adjustments__' ||
+            normalizeText(row?.groupName) === normalizeText('AJUSTES APÓS AUDITORIA')
+        );
+    }, []);
+
     const getPostAuditAdjustmentTotalsForScope = useCallback((scope: { groupId?: string; deptId?: string; catId?: string }) => {
         const norm = (value: unknown) => normalizeScopeId(value as any).trim().toLowerCase();
         const targetGroup = norm(scope.groupId);
@@ -5355,11 +5590,205 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }, { quantity: 0, cost: 0 });
     }, [postAuditAdjustments]);
 
+    const normalizeTermScopeLike = useCallback((scope?: { type?: TermScopeType; groupId?: string; deptId?: string; catId?: string } | null): TermScope | null => {
+        if (!scope?.groupId) return null;
+        return {
+            type: scope.type || (scope.catId ? 'category' : scope.deptId ? 'department' : 'group'),
+            groupId: scope.groupId,
+            deptId: scope.deptId,
+            catId: scope.catId
+        };
+    }, []);
+
+    const getPostAuditAdjustmentsForTermScope = useCallback((scope?: TermScope | null) => {
+        if (!scope || postAuditAdjustments.length === 0) return [] as PostAuditAdjustment[];
+
+        const normalizeDigits = (value: unknown) => String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
+        const makeAliasSet = (values: unknown[]) => {
+            const set = new Set<string>();
+            values.forEach(value => {
+                const raw = normalizeScopeId(value as any).trim().toLowerCase();
+                if (raw) set.add(raw);
+                const digits = normalizeDigits(value);
+                if (digits) set.add(digits);
+            });
+            return set;
+        };
+        const hasIntersection = (a: Set<string>, b: Set<string>) => {
+            for (const value of a) {
+                if (b.has(value)) return true;
+            }
+            return false;
+        };
+        const matchByIdOrName = (
+            itemIds: Set<string>,
+            targetIds: Set<string>,
+            itemName?: string,
+            targetName?: string
+        ) => {
+            if (itemIds.size > 0 && targetIds.size > 0 && hasIntersection(itemIds, targetIds)) return true;
+            const itemText = normalizeText(itemName || '');
+            const targetText = normalizeText(targetName || '');
+            return !!itemText && !!targetText && itemText === targetText;
+        };
+        const matchesEntry = (
+            item: PostAuditAdjustment,
+            entry: { group: Group; dept: Department; cat: Category },
+            specificity: 'group' | 'department' | 'category'
+        ) => {
+            const itemGroupIds = makeAliasSet([item.groupId]);
+            const targetGroupIds = makeAliasSet([entry.group.id, (entry.group as any).numericId]);
+            if (!matchByIdOrName(itemGroupIds, targetGroupIds, item.groupName, entry.group.name)) return false;
+            if (specificity === 'group') return true;
+
+            const itemDeptIds = makeAliasSet([item.deptId]);
+            const targetDeptIds = makeAliasSet([entry.dept.id, entry.dept.numericId]);
+            if (!matchByIdOrName(itemDeptIds, targetDeptIds, item.deptName, entry.dept.name)) return false;
+            if (specificity === 'department') return true;
+
+            const itemCatIds = makeAliasSet([item.catId]);
+            const targetCatIds = makeAliasSet([entry.cat.id, entry.cat.numericId]);
+            return matchByIdOrName(itemCatIds, targetCatIds, item.catName, entry.cat.name);
+        };
+        const matchesFallbackPartial = (
+            item: PostAuditAdjustment,
+            partial: { groupId?: string; deptId?: string; catId?: string },
+            specificity: 'group' | 'department' | 'category'
+        ) => {
+            const itemGroupIds = makeAliasSet([item.groupId]);
+            if (!hasIntersection(itemGroupIds, makeAliasSet([partial.groupId]))) return false;
+            if (specificity === 'group') return true;
+            const itemDeptIds = makeAliasSet([item.deptId]);
+            if (!hasIntersection(itemDeptIds, makeAliasSet([partial.deptId]))) return false;
+            if (specificity === 'department') return true;
+            const itemCatIds = makeAliasSet([item.catId]);
+            return hasIntersection(itemCatIds, makeAliasSet([partial.catId]));
+        };
+        const matchesPartial = (
+            item: PostAuditAdjustment,
+            partial: { groupId?: string; deptId?: string; catId?: string }
+        ) => {
+            if (!normalizeScopeId(partial.groupId)) return false;
+            const specificity = partial.catId ? 'category' : partial.deptId ? 'department' : 'group';
+            const entries = getScopeCategories(partial.groupId, partial.deptId, partial.catId);
+            if (entries.length === 0) return matchesFallbackPartial(item, partial, specificity);
+            return entries.some(entry => matchesEntry(item, entry, specificity));
+        };
+
+        if (scope.type === 'custom') {
+            const partials = scope.customScopes || [];
+            return postAuditAdjustments.filter(item => partials.some(partial => matchesPartial(item, partial)));
+        }
+
+        return postAuditAdjustments.filter(item => matchesPartial(item, scope));
+    }, [postAuditAdjustments, data]);
+
+    const getPostAuditAdjustmentTotalsForTermScope = useCallback((scope?: TermScope | { groupId?: string; deptId?: string; catId?: string } | null) => {
+        const resolvedScope = normalizeTermScopeLike(scope as any);
+        const adjustments = getPostAuditAdjustmentsForTermScope(resolvedScope);
+        return adjustments.reduce((acc, item) => ({
+            quantity: acc.quantity + Number(item.quantity || 0),
+            cost: roundAuditMoney(acc.cost + Number(item.totalCost || 0))
+        }), { quantity: 0, cost: 0 });
+    }, [getPostAuditAdjustmentsForTermScope, normalizeTermScopeLike]);
+
+    const termDisplayMetrics = useMemo(() => {
+        if (!termComparisonMetrics) return null;
+        if (metricsContainsPostAuditAdjustments(termComparisonMetrics)) return termComparisonMetrics;
+        const adjustments = getPostAuditAdjustmentsForTermScope(termModal ? termModal : null);
+        const totals = adjustments.reduce((acc, item) => ({
+            quantity: acc.quantity + Number(item.quantity || 0),
+            cost: roundAuditMoney(acc.cost + Number(item.totalCost || 0))
+        }), { quantity: 0, cost: 0 });
+
+        if (adjustments.length === 0 || (Math.abs(totals.quantity) <= 0.0001 && Math.abs(totals.cost) <= 0.001)) {
+            return termComparisonMetrics;
+        }
+
+        const adjustmentItems = adjustments.map((item) => {
+            const previousQty = item.mode === 'replace'
+                ? Number(item.previousAuditedQty || 0)
+                : 0;
+            const correctedQty = item.mode === 'replace'
+                ? Number(item.replacementQuantity ?? (previousQty + Number(item.quantity || 0)))
+                : Number(item.quantity || 0);
+            const previousCost = roundAuditMoney(previousQty * Number(item.unitCost || 0));
+            const correctedCost = roundAuditMoney(previousCost + Number(item.totalCost || 0));
+            const hierarchy = [item.groupName, item.deptName, item.catName].filter(Boolean).join(' > ');
+
+            return {
+                code: item.reducedCode || item.code || item.barcode || '',
+                description: hierarchy
+                    ? `AJUSTE PÓS-AUDITORIA - ${item.description} (${hierarchy})`
+                    : `AJUSTE PÓS-AUDITORIA - ${item.description}`,
+                lab: item.mode === 'replace' ? 'SUBSTITUIR' : 'AJUSTE',
+                groupId: '__post_audit_adjustments__',
+                groupName: 'AJUSTES APÓS AUDITORIA',
+                deptId: '__post_audit_adjustments__',
+                deptName: 'CORREÇÕES MANUAIS',
+                catId: '__post_audit_adjustments__',
+                catName: 'AJUSTES LANÇADOS',
+                sysQty: previousQty,
+                sysCost: previousCost,
+                countedQty: correctedQty,
+                countedCost: correctedCost,
+                diffQty: Number(item.quantity || 0),
+                diffCost: roundAuditMoney(item.totalCost || 0),
+                isPostAuditAdjustment: true,
+                note: item.note,
+                createdAt: item.createdAt
+            };
+        });
+        const adjustmentGroupedRow = adjustmentItems.reduce((acc: any, item: any) => ({
+            ...acc,
+            sysQty: acc.sysQty + Number(item.sysQty || 0),
+            sysCost: roundAuditMoney(acc.sysCost + Number(item.sysCost || 0)),
+            countedQty: acc.countedQty + Number(item.countedQty || 0),
+            countedCost: roundAuditMoney(acc.countedCost + Number(item.countedCost || 0)),
+            diffQty: acc.diffQty + Number(item.diffQty || 0),
+            diffCost: roundAuditMoney(acc.diffCost + Number(item.diffCost || 0))
+        }), {
+            groupId: '__post_audit_adjustments__',
+            groupName: 'AJUSTES APÓS AUDITORIA',
+            deptId: '__post_audit_adjustments__',
+            deptName: 'CORREÇÕES MANUAIS',
+            catId: '__post_audit_adjustments__',
+            catName: 'AJUSTES LANÇADOS',
+            sysQty: 0,
+            sysCost: 0,
+            countedQty: 0,
+            countedCost: 0,
+            diffQty: 0,
+            diffCost: 0,
+            isPostAuditAdjustment: true
+        });
+        const adjustedDiffCost = roundAuditMoney(Number(termComparisonMetrics.diffCost || 0) + totals.cost);
+
+        return {
+            ...termComparisonMetrics,
+            countedQty: Number(termComparisonMetrics.countedQty || 0) + totals.quantity,
+            countedCost: roundAuditMoney(Number(termComparisonMetrics.countedCost || 0) + totals.cost),
+            diffQty: Number(termComparisonMetrics.diffQty || 0) + totals.quantity,
+            diffCost: adjustedDiffCost,
+            officialDiffCost: adjustedDiffCost,
+            financialDiffSource: termComparisonMetrics.financialDiffSource
+                ? `${termComparisonMetrics.financialDiffSource}_with_post_audit_adjustments`
+                : 'post_audit_adjustments',
+            items: [...(termComparisonMetrics.items || []), ...adjustmentItems],
+            groupedDifferences: [...(termComparisonMetrics.groupedDifferences || []), adjustmentGroupedRow],
+            postAuditAdjustmentTotals: {
+                count: adjustments.length,
+                quantity: totals.quantity,
+                cost: totals.cost
+            }
+        };
+    }, [termComparisonMetrics, termModal, getPostAuditAdjustmentsForTermScope, metricsContainsPostAuditAdjustments]);
+
     const applyPostAuditAdjustmentsToMetrics = useCallback((
         metrics: any | null,
         scope: { groupId?: string; deptId?: string; catId?: string }
     ) => {
-        const adjustments = getPostAuditAdjustmentTotalsForScope(scope);
+        const adjustments = getPostAuditAdjustmentTotalsForTermScope(scope);
         if (!metrics) {
             if (Math.abs(adjustments.quantity) <= 0.01 && Math.abs(adjustments.cost) <= 0.01) return null;
             return {
@@ -5378,20 +5807,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             diffQty: Number(metrics.diffQty || 0) + Number(adjustments.quantity || 0),
             diffCost: roundAuditMoney(Number(metrics.diffCost || 0) + Number(adjustments.cost || 0))
         };
-    }, [getPostAuditAdjustmentTotalsForScope]);
+    }, [getPostAuditAdjustmentTotalsForTermScope]);
 
     const getAdjustedAuditedCostForScope = useCallback((
         rawAuditedCost: number,
         metrics: any | null,
         scope: { groupId?: string; deptId?: string; catId?: string }
     ) => {
-        const adjustments = getPostAuditAdjustmentTotalsForScope(scope);
+        const adjustments = getPostAuditAdjustmentTotalsForTermScope(scope);
         return roundAuditMoney(
             Number(rawAuditedCost || 0) +
             Number(metrics?.diffCost || 0) +
             Number(adjustments.cost || 0)
         );
-    }, [getPostAuditAdjustmentTotalsForScope]);
+    }, [getPostAuditAdjustmentTotalsForTermScope]);
 
     const authoritativeTermMetrics = useMemo(
         () => getAuthoritativeTermMetrics(data, termDrafts),
@@ -5418,14 +5847,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         let diffQty = 0;
         let diffCost = 0;
         let groupsWithDivergence = 0;
+        let sourceAlreadyHasPostAuditAdjustments = false;
         if (authoritativeTermMetrics) {
             diffQty = Number(authoritativeTermMetrics.diffQty || 0);
             diffCost = roundAuditMoney(authoritativeTermMetrics.diffCost);
             groupsWithDivergence = Math.abs(diffQty) > 0.01 || Math.abs(diffCost) > 0.01 ? 1 : 0;
+            sourceAlreadyHasPostAuditAdjustments = metricsContainsPostAuditAdjustments(authoritativeTermMetrics);
         } else {
             data.groups.forEach(group => {
                 const metrics = getGroupVerifiedMetrics(group);
                 if (!metrics) return;
+                if (metricsContainsPostAuditAdjustments(metrics)) sourceAlreadyHasPostAuditAdjustments = true;
                 const currentDiffQty = Number(metrics.diffQty || 0);
                 const currentDiffCost = Number(metrics.diffCost || 0);
                 diffQty += currentDiffQty;
@@ -5436,7 +5868,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             });
             diffCost = roundAuditMoney(diffCost);
         }
-        if (postAuditAdjustments.length > 0) {
+        if (postAuditAdjustments.length > 0 && !sourceAlreadyHasPostAuditAdjustments) {
             diffQty += Number(postAuditAdjustmentTotals.quantity || 0);
             diffCost = roundAuditMoney(diffCost + Number(postAuditAdjustmentTotals.cost || 0));
             if (
@@ -5467,7 +5899,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             doneCost: roundAuditMoney(Number(branchMetrics.doneCost || 0) + diffCost),
             totalCost: Number(branchMetrics.cost || 0)
         };
-    }, [data, authoritativeTermMetrics, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost, postAuditAdjustments.length, postAuditAdjustmentTotals.quantity, postAuditAdjustmentTotals.cost]);
+    }, [data, authoritativeTermMetrics, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost, postAuditAdjustments.length, postAuditAdjustmentTotals.quantity, postAuditAdjustmentTotals.cost, metricsContainsPostAuditAdjustments]);
 
     const createDefaultTermForm = (): TermForm => ({
         inventoryNumber: inventoryNumber || data?.inventoryNumber || '',
@@ -7631,6 +8063,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } catch (err) {
             console.error("Error saving term draft:", err);
         }
+        const termMetricsForOutput = termDisplayMetrics || termComparisonMetrics;
         const isGlobalUnifiedTermPdf =
             termModal.type === 'custom' &&
             normalizeScopeId((termModal as any).batchId) === GLOBAL_UNIFIED_TERM_BATCH_ID;
@@ -7750,7 +8183,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         let contentStartY = afterSignY;
 
         // 1. Resumo financeiro logo após assinaturas
-        if (termComparisonMetrics) {
+        if (termMetricsForOutput) {
             if (contentStartY > 250) {
                 doc.addPage();
                 contentStartY = 20;
@@ -7761,9 +8194,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             doc.text('RESUMO FINANCEIRO DA CONFERÊNCIA', 14, contentStartY);
             contentStartY += 6;
 
-            const diffType = termComparisonMetrics.diffCost < 0 ? 'Prejuízo (Falta)' : termComparisonMetrics.diffCost > 0 ? 'Sobra (Excesso)' : 'Zero';
-            const scopeAuditedCost = (scopeInfo.products || []).reduce((sum: number, p: any) => sum + ((p.quantity || 0) * (p.cost || 0)), 0);
-            const representativity = getFinancialRepresentativity(scopeAuditedCost, termComparisonMetrics.diffCost);
+            const diffType = termMetricsForOutput.diffCost < 0 ? 'Prejuízo (Falta)' : termMetricsForOutput.diffCost > 0 ? 'Sobra (Excesso)' : 'Zero';
+            const rawScopeAuditedCost = (scopeInfo.products || []).reduce((sum: number, p: any) => sum + ((p.quantity || 0) * (p.cost || 0)), 0);
+            const adjustmentTotals = (termMetricsForOutput as any).postAuditAdjustmentTotals || { count: 0, quantity: 0, cost: 0 };
+            const scopeAuditedCost = roundAuditMoney(Number(rawScopeAuditedCost || 0) + Number(adjustmentTotals.cost || 0));
+            const representativity = getFinancialRepresentativity(scopeAuditedCost, termMetricsForOutput.diffCost);
             const representativityLabel = representativity === null
                 ? 'N/A'
                 : `${representativity.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
@@ -7784,12 +8219,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 ['Divergência R$', fmtCurrency(Number(filialTotalsMetrics.diffCost || 0))],
                 ['Rep. Divergência', `${Number(filialTotalsMetrics.repDivergencePct || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`],
                 [{ content: 'DADOS DO TERMO (ESCOPO)', styles: { fontStyle: 'bold', fillColor: [238, 242, 255], halign: 'center' } }, { content: '', styles: { fillColor: [238, 242, 255] } }],
-                ['Estoque Sistema (Qtde)', Math.round(termComparisonMetrics.sysQty).toLocaleString('pt-BR')],
-                ['Custo Total Sistema', fmtCurrency(Number(termComparisonMetrics.sysCost || 0))],
-                ['Estoque Físico (Qtde)', Math.round(termComparisonMetrics.countedQty).toLocaleString('pt-BR')],
-                ['Custo Total Físico', fmtCurrency(Number(termComparisonMetrics.countedCost || 0))],
-                ['Diferença de Estoque (Qtde)', termComparisonMetrics.diffQty.toLocaleString('pt-BR')],
-                ['Resultado Financeiro', fmtCurrency(Number(termComparisonMetrics.diffCost || 0)) + ` (${diffType})`],
+                ...(Number(adjustmentTotals.count || 0) > 0
+                    ? [[
+                        'Ajustes Após Auditoria',
+                        `${Number(adjustmentTotals.quantity || 0) > 0 ? '+' : ''}${fmtInt(Number(adjustmentTotals.quantity || 0))} un. / ${fmtCurrency(Number(adjustmentTotals.cost || 0))}`
+                    ]]
+                    : []),
+                ['Estoque Sistema (Qtde)', Math.round(termMetricsForOutput.sysQty).toLocaleString('pt-BR')],
+                ['Custo Total Sistema', fmtCurrency(Number(termMetricsForOutput.sysCost || 0))],
+                ['Estoque Físico (Qtde)', Math.round(termMetricsForOutput.countedQty).toLocaleString('pt-BR')],
+                ['Custo Total Físico', fmtCurrency(Number(termMetricsForOutput.countedCost || 0))],
+                ['Diferença de Estoque (Qtde)', termMetricsForOutput.diffQty.toLocaleString('pt-BR')],
+                ['Resultado Financeiro', fmtCurrency(Number(termMetricsForOutput.diffCost || 0)) + ` (${diffType})`],
                 ['Representatividade no Auditado', representativityLabel]
             ];
 
@@ -7810,7 +8251,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     const isDiffMoney = rowLabel === 'divergência r$';
                     if (isFinancialResult || isDiffMoney) {
                         hookData.cell.styles.fontStyle = 'bold';
-                        const value = isFinancialResult ? Number(termComparisonMetrics.diffCost || 0) : Number(filialTotalsMetrics.diffCost || 0);
+                        const value = isFinancialResult ? Number(termMetricsForOutput.diffCost || 0) : Number(filialTotalsMetrics.diffCost || 0);
                         if (value < 0) hookData.cell.styles.textColor = [220, 38, 38];
                         if (value > 0) hookData.cell.styles.textColor = [22, 163, 74];
                     }
@@ -7823,7 +8264,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         let cursorY = contentStartY;
 
-        if (termComparisonMetrics && termComparisonMetrics.groupedDifferences && termComparisonMetrics.groupedDifferences.length > 0) {
+        if (termMetricsForOutput && termMetricsForOutput.groupedDifferences && termMetricsForOutput.groupedDifferences.length > 0) {
             if (cursorY > 240) {
                 doc.addPage();
                 cursorY = 20;
@@ -7834,7 +8275,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             const groupHead = [['Item / Hierarquia', 'Dif Qtd', 'Sist.', 'Fís.', 'Dif R$']];
             const groupBody: any[] = [];
-            termComparisonMetrics.groupedDifferences.forEach((g: any) => {
+            termMetricsForOutput.groupedDifferences.forEach((g: any) => {
                 groupBody.push([
                     { content: `${g.groupName} > ${g.deptName} > ${g.catName}`, colSpan: 1, styles: { fontStyle: 'bold', fillColor: [243, 244, 246] } },
                     { content: `${g.diffQty > 0 ? '+' : ''}${Math.round(g.diffQty).toLocaleString('pt-BR')} un.`, styles: { fontStyle: 'bold', fillColor: [243, 244, 246] } },
@@ -7843,7 +8284,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     { content: `R$ ${g.diffCost.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, styles: { fontStyle: 'bold', fillColor: [243, 244, 246] } }
                 ]);
 
-                const catItems = termComparisonMetrics.items.filter(
+                const catItems = termMetricsForOutput.items.filter(
                     (item: any) =>
                         item.catName?.toLowerCase() === g.catName?.toLowerCase() &&
                         item.deptName?.toLowerCase() === g.deptName?.toLowerCase() &&
@@ -7897,7 +8338,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             cursorY = doc.lastAutoTable?.finalY ? doc.lastAutoTable.finalY + 10 : cursorY + 30;
         }
 
-        if (termComparisonMetrics && termComparisonMetrics.items && termComparisonMetrics.items.length > 0) {
+        if (termMetricsForOutput && termMetricsForOutput.items && termMetricsForOutput.items.length > 0) {
             if (cursorY > 240) {
                 doc.addPage();
                 cursorY = 20;
@@ -7907,7 +8348,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             doc.text('DIVERGÊNCIAS (PLANILHA DE CONFRONTO)', 14, cursorY);
 
             const divHead = [['Cód', 'Descrição', 'Lab', 'Est Sist', 'Est Fis', 'Dif Qtd', 'Custo Sist', 'Custo Físico', 'Dif R$']];
-            const divBody = termComparisonMetrics.items.map(p => [
+            const divBody = termMetricsForOutput.items.map(p => [
                 p.code,
                 p.description,
                 p.lab,
@@ -7920,12 +8361,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             ]);
             const divFoot = [[
                 { content: 'TOTAIS DAS DIVERGÊNCIAS', colSpan: 3, styles: { halign: 'right', fontStyle: 'bold' } },
-                Math.round(termComparisonMetrics.sysQty).toLocaleString(),
-                Math.round(termComparisonMetrics.countedQty).toLocaleString(),
-                Math.round(termComparisonMetrics.diffQty).toLocaleString(),
-                `R$ ${(termComparisonMetrics.sysCost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-                `R$ ${(termComparisonMetrics.countedCost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-                `R$ ${(termComparisonMetrics.diffCost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                Math.round(termMetricsForOutput.sysQty).toLocaleString(),
+                Math.round(termMetricsForOutput.countedQty).toLocaleString(),
+                Math.round(termMetricsForOutput.diffQty).toLocaleString(),
+                `R$ ${(termMetricsForOutput.sysCost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+                `R$ ${(termMetricsForOutput.countedCost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+                `R$ ${(termMetricsForOutput.diffCost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
             ]];
 
             autoTable(doc, {
@@ -11436,9 +11877,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     </div>
                                 </div>
 
-                                {termComparisonMetrics && (
+                                {termDisplayMetrics && (
                                     <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-3 sm:p-4 relative animate-in fade-in slide-in-from-top-2">
                                         {(() => {
+                                            const termComparisonMetrics = termDisplayMetrics;
+                                            if (!termComparisonMetrics) return null;
                                             const scopeAuditedCost = (termScopeInfo?.products || []).reduce(
                                                 (sum: number, p: any) => sum + ((p.quantity || 0) * (p.cost || 0)),
                                                 0
@@ -11447,7 +11890,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 (sum: number, p: any) => sum + (p.quantity || 0),
                                                 0
                                             );
-                                            const representativity = getFinancialRepresentativity(scopeAuditedCost, termComparisonMetrics.diffCost);
+                                            const adjustmentTotals = (termComparisonMetrics as any).postAuditAdjustmentTotals || { count: 0, quantity: 0, cost: 0 };
+                                            const adjustedScopeAuditedQty = Number(scopeAuditedQty || 0) + Number(adjustmentTotals.quantity || 0);
+                                            const adjustedScopeAuditedCost = roundAuditMoney(Number(scopeAuditedCost || 0) + Number(adjustmentTotals.cost || 0));
+                                            const representativity = getFinancialRepresentativity(adjustedScopeAuditedCost, termComparisonMetrics.diffCost);
                                             return (
                                                 <>
                                                     <button
@@ -11459,7 +11905,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                         <X className="w-4 h-4" />
                                                     </button>
                                                     <div className="mb-3 flex flex-col gap-2 pr-7 sm:flex-row sm:items-center sm:justify-between">
-                                                        <h5 className="text-[10px] font-black text-indigo-800 uppercase tracking-wide sm:tracking-widest">Resumo Identificado</h5>
+                                                        <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+                                                            <h5 className="text-[10px] font-black text-indigo-800 uppercase tracking-wide sm:tracking-widest">Resumo Identificado</h5>
+                                                            {Number(adjustmentTotals.count || 0) > 0 && (
+                                                                <span className={`inline-flex w-fit items-center rounded-full px-2 py-0.5 text-[8px] font-black uppercase tracking-widest ${
+                                                                    Number(adjustmentTotals.cost || 0) < 0
+                                                                        ? 'bg-red-100 text-red-700'
+                                                                        : 'bg-emerald-100 text-emerald-700'
+                                                                }`}>
+                                                                    Ajustes: {Number(adjustmentTotals.quantity || 0) > 0 ? '+' : ''}{Math.round(Number(adjustmentTotals.quantity || 0)).toLocaleString('pt-BR')} un. / {Number(adjustmentTotals.cost || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                                </span>
+                                                            )}
+                                                        </div>
                                                         <button
                                                             type="button"
                                                             onClick={downloadTermComparisonExcel}
@@ -11531,10 +11988,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                         </p>
                                                         <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                                                             <span className="font-black text-slate-700 tabular-nums">
-                                                                {Math.round(scopeAuditedQty).toLocaleString('pt-BR')} un.
+                                                                {Math.round(adjustedScopeAuditedQty).toLocaleString('pt-BR')} un.
                                                             </span>
                                                             <span className="font-black text-slate-700 tabular-nums break-words">
-                                                                {scopeAuditedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                                {adjustedScopeAuditedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
                                                             </span>
                                                         </div>
                                                     </div>
