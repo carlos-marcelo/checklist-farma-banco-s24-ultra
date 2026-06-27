@@ -2037,8 +2037,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (isStaleRequest()) return;
             if (latest && latest.status !== 'completed') {
                 completedAuditConsultationRef.current = false;
-                const alreadyConfirmedOpenAudit = isAuditSessionConfirmed(latest.id);
-                let canAutoOpenActive = allowActiveAuditAutoOpen || alreadyConfirmedOpenAudit;
+                let canAutoOpenActive = allowActiveAuditAutoOpen;
                 if (!canAutoOpenActive) {
                     if (silent) return;
                     canAutoOpenActive = true;
