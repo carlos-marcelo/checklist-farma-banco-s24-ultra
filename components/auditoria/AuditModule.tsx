@@ -1988,6 +1988,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const lastAuditUpdateRef = useRef<string | null>(null);
     const activeFilialRef = useRef<string>('');
     const completedAuditConsultationRef = useRef(false);
+    const activeAuditOpenChoiceRef = useRef<Map<string, 'open' | 'completed'>>(new Map());
 
     function enterStockUpdateMode(options?: { stockTsRaw?: string | null; syncKey?: string | null; showAlert?: boolean }) {
         const syncKey = String(options?.syncKey || '').trim();
@@ -2261,7 +2262,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (isStaleRequest()) return;
             if (latest && latest.status !== 'completed') {
                 completedAuditConsultationRef.current = false;
-                let canAutoOpenActive = allowActiveAuditAutoOpen;
+                const openChoiceKey = `${requestedFilial}|${latest.id || 'no_session'}|${latest.audit_number}`;
+                const previousOpenChoice = activeAuditOpenChoiceRef.current.get(openChoiceKey);
+                let canAutoOpenActive =
+                    allowActiveAuditAutoOpen ||
+                    previousOpenChoice === 'open' ||
+                    isAuditSessionConfirmed(latest.id);
+                if (!canAutoOpenActive && previousOpenChoice === 'completed') {
+                    if (!silent) setShowCompletedAuditsModal(true);
+                    setIsUpdatingStock(false);
+                    setDbSessionId(undefined);
+                    setNextAuditNumber(latest.audit_number + 1);
+                    setData(null);
+                    setTermDrafts({});
+                    return;
+                }
                 if (!canAutoOpenActive) {
                     if (silent) return;
                     canAutoOpenActive = true;
@@ -2277,6 +2292,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     `OK: prosseguir com a auditoria em aberto.\n` +
                                     `Cancelar: abrir a lista de inventários concluídos.`
                                 );
+                                activeAuditOpenChoiceRef.current.set(openChoiceKey, canAutoOpenActive ? 'open' : 'completed');
                                 if (canAutoOpenActive) {
                                     setAllowActiveAuditAutoOpen(true);
                                     markAuditSessionConfirmed(latest.id);
@@ -3441,6 +3457,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setNextAuditNumber(target.audit_number);
             setDbSessionId(target.id);
             setAllowActiveAuditAutoOpen(true);
+            activeAuditOpenChoiceRef.current.set(
+                `${selectedFilial}|${target.id || 'no_session'}|${target.audit_number}`,
+                'open'
+            );
+            markAuditSessionConfirmed(target.id);
             setIsUpdatingStock(false);
             setIsReadOnlyCompletedView(false);
             setConsultingAuditNumber(null);
