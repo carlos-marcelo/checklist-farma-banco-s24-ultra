@@ -2025,6 +2025,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (!(nextData as any).partialCompleted) {
             (nextData as any).partialCompleted = [];
         }
+        (nextData as any).postAuditAdjustments = normalizePostAuditAdjustments((nextData as any).postAuditAdjustments);
         if ((nextData as any).partialCompleted) {
             const deduped = new Map<string, any>();
             (nextData as any).partialCompleted.forEach((p: any) => {
@@ -3965,7 +3966,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             ]
         };
         const preservedTermDrafts = composeTermDraftsForPersist(((data as any).termDrafts || {}) as Record<string, TermForm>, termDrafts) as Record<string, any>;
-        const basePersistedData = { ...newData, termDrafts: preservedTermDrafts, sourceFiles: nextSourceFiles } as any;
+        const preservedPostAuditAdjustments = normalizePostAuditAdjustments((data as any).postAuditAdjustments);
+        const basePersistedData = {
+            ...newData,
+            postAuditAdjustments: preservedPostAuditAdjustments,
+            termDrafts: preservedTermDrafts,
+            sourceFiles: nextSourceFiles
+        } as any;
         const persistedData = applyPartialScopes(basePersistedData, safePartialStarts);
         const progress = calculateProgress(persistedData as AuditData);
         const savedSession = await persistAuditSession({
@@ -4204,6 +4211,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const merged: AuditData = {
                 ...rebuiltData,
                 termDrafts: baseData.termDrafts,
+                postAuditAdjustments: normalizePostAuditAdjustments((baseData as any).postAuditAdjustments),
                 partialStarts: baseData.partialStarts,
                 partialCompleted: baseData.partialCompleted,
                 lastPartialBatchId: baseData.lastPartialBatchId,
@@ -4872,8 +4880,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const finalTermDrafts = (shouldReclassifyOpen && data)
                 ? (composeTermDraftsForPersist(((data as any).termDrafts || {}) as Record<string, TermForm>, termDrafts) as Record<string, any>)
                 : {};
+            const finalPostAuditAdjustments = (shouldReclassifyOpen && data)
+                ? normalizePostAuditAdjustments((data as any).postAuditAdjustments)
+                : [];
             const basePersistedData = {
                 ...finalData,
+                postAuditAdjustments: finalPostAuditAdjustments,
                 termDrafts: finalTermDrafts,
                 sourceFiles: buildStructureSourceMeta({ stockSyncedAt: getGlobalStockTimestampRaw(globalStockMeta) })
             } as any;
@@ -9728,6 +9740,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             postAuditAdjustments: nextAdjustments,
             termDrafts: composeTermDraftsForPersist(((data as any).termDrafts || {}) as Record<string, TermForm>, termDrafts)
         } as AuditData;
+        const dataToPersist = {
+            ...nextData,
+            __replacePostAuditAdjustments: true
+        } as any;
         setData(nextData);
         const progress = calculateProgress(nextData);
         const savedSession = await persistAuditSession({
@@ -9735,7 +9751,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             branch: selectedFilial,
             audit_number: nextAuditNumber,
             status: 'open',
-            data: nextData,
+            data: dataToPersist,
             progress,
             user_email: userEmail,
             updated_at: lastAuditUpdateRef.current || undefined

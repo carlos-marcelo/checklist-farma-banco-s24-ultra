@@ -1118,6 +1118,40 @@ export interface DbAuditPartialTerm {
   created_at?: string;
 }
 
+const POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG = '__replacePostAuditAdjustments';
+
+const normalizeAuditAdjustmentNumber = (value: unknown) => {
+  const parsed = Number(value || 0);
+  return Number.isFinite(parsed) ? Math.round((parsed + Number.EPSILON) * 100) / 100 : 0;
+};
+
+const normalizeAuditAdjustmentList = (value: unknown): any[] => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item: any) => item && typeof item === 'object')
+    .map((item: any) => ({
+      ...item,
+      id: String(item.id || `${item.reducedCode || item.code || item.barcode || 'adj'}_${item.createdAt || ''}_${item.quantity || 0}_${item.totalCost || 0}`),
+      quantity: Number(item.quantity || 0),
+      unitCost: normalizeAuditAdjustmentNumber(item.unitCost),
+      totalCost: normalizeAuditAdjustmentNumber(item.totalCost),
+      createdAt: String(item.createdAt || new Date().toISOString())
+    }))
+    .filter((item: any) => Number.isFinite(Number(item.quantity)) && Math.abs(Number(item.quantity)) > 0);
+};
+
+const mergeAuditPostAdjustments = (...lists: unknown[]): any[] => {
+  const byId = new Map<string, any>();
+  lists.forEach(list => {
+    normalizeAuditAdjustmentList(list).forEach(item => {
+      byId.set(String(item.id), item);
+    });
+  });
+  return Array.from(byId.values()).sort((a: any, b: any) =>
+    String(a.createdAt || '').localeCompare(String(b.createdAt || ''))
+  );
+};
+
 export async function fetchAuditSession(branch: string, auditNumber: number): Promise<DbAuditSession | null> {
   try {
     const { data, error } = await supabase
@@ -1182,6 +1216,28 @@ export async function fetchLatestAuditMetadata(branch: string): Promise<{ id: st
 export async function upsertAuditSession(session: DbAuditSession): Promise<DbAuditSession | null> {
   try {
     let safeData = session.data ? JSON.parse(JSON.stringify(session.data)) : null;
+    const replacePostAuditAdjustments = !!safeData?.[POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG];
+    if (safeData && Object.prototype.hasOwnProperty.call(safeData, POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG)) {
+      delete safeData[POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG];
+    }
+
+    if (safeData) {
+      const { data: existing } = await supabase
+        .from('audit_sessions')
+        .select('data')
+        .eq('branch', String(session.branch))
+        .eq('audit_number', session.audit_number)
+        .maybeSingle();
+
+      if (replacePostAuditAdjustments) {
+        safeData.postAuditAdjustments = normalizeAuditAdjustmentList(safeData.postAuditAdjustments);
+      } else {
+        safeData.postAuditAdjustments = mergeAuditPostAdjustments(
+          existing?.data?.postAuditAdjustments,
+          safeData.postAuditAdjustments
+        );
+      }
+    }
 
     const payload: any = {
       branch: String(session.branch), // Ensure string
