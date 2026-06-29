@@ -1989,6 +1989,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const activeFilialRef = useRef<string>('');
     const completedAuditConsultationRef = useRef(false);
     const activeAuditOpenChoiceRef = useRef<Map<string, 'open' | 'completed'>>(new Map());
+    const partialFinalizeInFlightRef = useRef(false);
 
     function enterStockUpdateMode(options?: { stockTsRaw?: string | null; syncKey?: string | null; showAlert?: boolean }) {
         const syncKey = String(options?.syncKey || '').trim();
@@ -8610,6 +8611,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, [data, dbSessionId, selectedFilial, nextAuditNumber, applyPartialScopes, calculateProgress, isUpdatingStock, PARTIAL_EXPIRED_ALERT_KEY]);
 
     const finalizeActivePartials = useCallback(async () => {
+        if (partialFinalizeInFlightRef.current) return;
         if (isReadOnlyCompletedView) {
             alert("Modo consulta ativo: este inventário concluído não pode ser editado.");
             return;
@@ -8658,23 +8660,37 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
 
         const nextData = applyPartialScopes(nextDataRaw, []);
-        setData(nextData);
+        const nextDataWithTerms = {
+            ...reconcileAuditStateFromCompletedScopes(nextData),
+            termDrafts: composeTermDraftsForPersist(
+                (((nextData as any)?.termDrafts || {}) as Record<string, TermForm>),
+                (((data as any)?.termDrafts || {}) as Record<string, TermForm>),
+                termDrafts
+            )
+        } as any;
+        setData(nextDataWithTerms);
+        partialFinalizeInFlightRef.current = true;
 
         try {
             // Persistence consolidated in audit_sessions (data field)
-            const progress = calculateProgress(nextData);
+            const progress = calculateProgress(nextDataWithTerms);
             const savedSession = await persistAuditSession({
                 id: dbSessionId,
                 branch: selectedFilial,
                 audit_number: nextAuditNumber,
                 status: 'open',
-                data: { ...nextData, termDrafts: composeTermDraftsForPersist((((nextData as any)?.termDrafts || {}) as Record<string, TermForm>), (((data as any)?.termDrafts || {}) as Record<string, TermForm>), termDrafts) } as any,
+                data: nextDataWithTerms,
                 progress: progress,
                 user_email: userEmail
             }, { allowProgressRegression: true });
-            if (savedSession) {
-                await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
-            }
+            if (!savedSession) throw new Error("Falha ao salvar contagens parciais concluídas.");
+            const savedData = savedSession.data
+                ? reconcileAuditStateFromCompletedScopes(savedSession.data as AuditData)
+                : nextDataWithTerms;
+            const normalizedSaved = (normalizeAuditDataStructure(savedData).data || savedData) as AuditData;
+            setData(normalizedSaved);
+            await AuditStorage.saveLocalAuditSession(normalizedSaved, false);
+            await CacheService.set(`audit_session_${selectedFilial}`, { ...savedSession, data: normalizedSaved } as any);
             insertAppEventLog({
                 company_id: selectedCompany?.id || null,
                 branch: selectedFilial || null,
@@ -8690,13 +8706,22 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 source: 'web',
                 event_meta: { total_scopes: toComplete.length }
             }).catch(() => { });
+            await new Promise<void>(resolve => {
+                if (typeof window === 'undefined' || !window.requestAnimationFrame) {
+                    setTimeout(resolve, 0);
+                    return;
+                }
+                window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+            });
             alert("Contagens parciais concluídas.");
 
         } catch (err) {
             console.error("Error finalizing partials:", err);
             alert("Erro ao concluir contagens parciais no Supabase.");
+        } finally {
+            partialFinalizeInFlightRef.current = false;
         }
-    }, [data, dbSessionId, selectedFilial, nextAuditNumber, applyPartialScopes, calculateProgress, canUseAuditMasterTools, isReadOnlyCompletedView]);
+    }, [data, dbSessionId, selectedFilial, nextAuditNumber, applyPartialScopes, calculateProgress, canUseAuditMasterTools, isReadOnlyCompletedView, composeTermDraftsForPersist, termDrafts]);
 
     const clearActivePartialsShortcut = useCallback(async () => {
         if (isReadOnlyCompletedView) {
