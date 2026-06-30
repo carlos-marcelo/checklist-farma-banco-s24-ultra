@@ -349,6 +349,20 @@ export async function fetchUsers(): Promise<DbUser[]> {
   }
 }
 
+export async function fetchUsersMetadata(): Promise<Partial<DbUser>[]> {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('email, name, phone, role, approved, rejected, preferred_theme, company_id, area, filial, created_at');
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error('Error fetching users metadata:', error);
+    return [];
+  }
+}
+
 export type LoginAuthResult =
   | { status: 'success'; user: DbUser }
   | { status: 'invalid_credentials' }

@@ -1518,6 +1518,32 @@ const INITIAL_USERS: User[] = normalizeProtectedMasterUsers([
     { email: 'contato@marcelo.far.br', password: 'marcelo1508', name: 'Contato Marcelo', phone: '99999999999', role: 'MASTER', approved: true, rejected: false },
 ]);
 
+const loadInitialUsersFromLocalCache = (): User[] => {
+    if (typeof window === 'undefined') return INITIAL_USERS;
+    try {
+        const raw = window.localStorage.getItem('APP_USERS');
+        if (!raw) return INITIAL_USERS;
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed) || parsed.length === 0) return INITIAL_USERS;
+        return normalizeProtectedMasterUsers(parsed);
+    } catch {
+        return INITIAL_USERS;
+    }
+};
+
+const scheduleBackgroundTask = (task: () => void, timeout = 800) => {
+    if (typeof window === 'undefined') {
+        task();
+        return;
+    }
+    const requestIdleCallback = (window as any).requestIdleCallback as undefined | ((cb: () => void, opts?: { timeout?: number }) => number);
+    if (requestIdleCallback) {
+        requestIdleCallback(task, { timeout });
+        return;
+    }
+    window.setTimeout(task, Math.min(timeout, 300));
+};
+
 // --- COMPONENTS ---
 
 // Custom Date Input 3D
@@ -2039,7 +2065,7 @@ const App: React.FC = () => {
     const [isLoadingData, setIsLoadingData] = useState(true);
 
     // Auth State
-    const [users, setUsers] = useState<User[]>(INITIAL_USERS);
+    const [users, setUsers] = useState<User[]>(loadInitialUsersFromLocalCache);
     const [currentUser, setCurrentUser] = useState<User | null>(null);
     const [showBranchSelectionModal, setShowBranchSelectionModal] = useState(false);
     const [branchSelectionMode, setBranchSelectionMode] = useState<'required' | 'confirm'>('required');
@@ -2265,6 +2291,7 @@ const App: React.FC = () => {
 
         try {
             await SupabaseService.upsertAccessMatrix(levelId, updatedLevel);
+            await CacheService.remove(CACHE_KEY_ACCESS);
         } catch (error) {
             console.error('Erro ao salvar permissão de acesso:', error);
             const message = error instanceof Error ? error.message : JSON.stringify(error);
@@ -2463,6 +2490,119 @@ const App: React.FC = () => {
     const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
     const CACHE_KEY_REPORTS = 'CACHE_REPORT_HISTORY';
     const CACHE_KEY_STOCK = 'CACHE_STOCK_HISTORY';
+    const CACHE_KEY_USERS = 'users_list';
+    const CACHE_KEY_CONFIG = 'app_config';
+    const CACHE_KEY_COMPANIES = 'companies_list';
+    const CACHE_KEY_ACCESS = 'access_matrix';
+    const CACHE_KEY_TICKETS = 'tickets_list';
+    const CACHE_KEY_CHECKLIST_DEFS = 'checklist_definitions';
+    const CACHE_KEY_AUDIT_DASHBOARD_PREFIX = 'audit_dashboard_sessions';
+    const CACHE_KEY_USERS_META = 'users_list_meta_signature';
+    const STATIC_REFERENCE_CACHE_MS = 15 * 60 * 1000;
+    const HISTORY_BACKGROUND_CACHE_MS = 2 * 60 * 1000;
+
+    const mapUsersForState = (items: any[] = []) =>
+        normalizeProtectedMasterUsers((items || []).map(u => ({
+            ...u,
+            preferredTheme: u.preferredTheme ?? (u.preferred_theme as ThemeColor | undefined)
+        })));
+
+    const mapAccessRowsToMatrix = (rows: any[] = []) => {
+        if (!rows || rows.length === 0) return createInitialAccessMatrix();
+        const mapped = rows.reduce((acc: any, entry: any) => {
+            acc[entry.level] = entry.modules || {};
+            return acc;
+        }, {});
+        return mergeAccessMatrixWithDefaults(mapped);
+    };
+
+    const hashCacheKey = (value: string) => {
+        let hash = 0;
+        for (let i = 0; i < value.length; i += 1) {
+            hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
+        }
+        return Math.abs(hash).toString(36);
+    };
+
+    const buildAuditDashboardCacheKey = (status: 'open' | 'completed', branches: string[]) => {
+        const scope = branches.length > 0
+            ? branches.slice().sort((a, b) => a.localeCompare(b, 'pt-BR')).join('|')
+            : 'all';
+        return `${CACHE_KEY_AUDIT_DASHBOARD_PREFIX}_${status}_${hashCacheKey(scope)}`;
+    };
+
+    const buildAuditMetadataSignature = (rows: Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'updated_at' | 'created_at'>>) =>
+        rows
+            .map(row => [
+                row.id || '',
+                normalizeBranchLabel(row.branch || ''),
+                Number(row.audit_number || 0),
+                row.status || '',
+                Number(row.progress || 0),
+                row.updated_at || row.created_at || ''
+            ].join(':'))
+            .sort((a, b) => a.localeCompare(b))
+            .join('|');
+
+    const buildUsersMetadataSignature = (rows: Array<Partial<SupabaseService.DbUser>> = []) =>
+        rows
+            .map(user => [
+                normalizeUserEmail(user.email),
+                user.name || '',
+                user.phone || '',
+                user.role || '',
+                user.approved ? '1' : '0',
+                user.rejected ? '1' : '0',
+                user.preferred_theme || '',
+                user.company_id || '',
+                user.area || '',
+                user.filial || '',
+                user.created_at || ''
+            ].join(':'))
+            .sort((a, b) => a.localeCompare(b))
+            .join('|');
+
+    const refreshUsersIfChanged = async (applyUsers?: (rows: any[]) => void) => {
+        const [metadata, cachedSignature] = await Promise.all([
+            SupabaseService.fetchUsersMetadata(),
+            CacheService.get<string>(CACHE_KEY_USERS_META)
+        ]);
+        const metadataSignature = buildUsersMetadataSignature(metadata || []);
+        const cachedRows = await CacheService.get<SupabaseService.DbUser[]>(CACHE_KEY_USERS);
+
+        if (!metadataSignature && Array.isArray(cachedRows) && cachedRows.length > 0) {
+            return cachedRows;
+        }
+
+        if (
+            metadataSignature &&
+            cachedSignature === metadataSignature &&
+            Array.isArray(cachedRows) &&
+            cachedRows.length === (metadata || []).length
+        ) {
+            return cachedRows;
+        }
+
+        const dbUsers = await SupabaseService.fetchUsers();
+        if ((!dbUsers || dbUsers.length === 0) && Array.isArray(cachedRows) && cachedRows.length > 0) {
+            return cachedRows;
+        }
+
+        const normalized = normalizeProtectedMasterUsers(dbUsers || []);
+        await Promise.all([
+            CacheService.set(CACHE_KEY_USERS, normalized),
+            CacheService.set(CACHE_KEY_USERS_META, buildUsersMetadataSignature(dbUsers || []))
+        ]);
+        if (applyUsers) applyUsers(normalized);
+        return normalized;
+    };
+
+    const invalidateUsersCache = async () => {
+        await Promise.all([
+            CacheService.remove(CACHE_KEY_USERS),
+            CacheService.remove(CACHE_KEY_USERS_META)
+        ]);
+    };
 
     const saveHistoryCache = (key: string, data: any[]) => {
         try {
@@ -2483,6 +2623,8 @@ const App: React.FC = () => {
     const clearHistoryCache = () => {
         sessionStorage.removeItem(CACHE_KEY_REPORTS);
         sessionStorage.removeItem(CACHE_KEY_STOCK);
+        void CacheService.remove(CACHE_KEY_REPORTS);
+        void CacheService.remove(CACHE_KEY_STOCK);
     };
 
     const handleReloadReports = async () => {
@@ -2505,6 +2647,8 @@ const App: React.FC = () => {
             setHasMoreStockConferences(dbStockReports.length === STOCK_PAGE_SIZE);
             saveHistoryCache(CACHE_KEY_REPORTS, formattedReports);
             saveHistoryCache(CACHE_KEY_STOCK, dbStockReports);
+            await CacheService.set(CACHE_KEY_REPORTS, dbReports);
+            await CacheService.set(CACHE_KEY_STOCK, dbStockReports);
             setLastHistoryCacheAt(new Date());
             console.log('✅ Relatórios recarregados:', formattedReports.length, '| Conferências:', dbStockReports.length);
         } catch (error) {
@@ -2556,87 +2700,167 @@ const App: React.FC = () => {
         }
     };
 
-    // MAIN INITIALIZATION - Load all data from Supabase on mount (was cut off, restoring generic structure found in previous views)
     useEffect(() => {
+        const semanticClickableSelector = [
+            'button',
+            'a',
+            'select',
+            'summary',
+            'label[for]',
+            '[role="button"]',
+            '[role="tab"]',
+            '[role="menuitem"]',
+            '[onclick]',
+            '.cursor-pointer',
+            'input[type="button"]',
+            'input[type="submit"]',
+            'input[type="checkbox"]',
+            'input[type="radio"]'
+        ].join(',');
+
+        const getReactProps = (element: Element) => {
+            const propKey = Object.getOwnPropertyNames(element).find(key => key.startsWith('__reactProps$'));
+            return propKey ? (element as any)[propKey] : null;
+        };
+
+        const markClickableElement = (target: EventTarget | null) => {
+            let element = target instanceof Element ? target : null;
+            let depth = 0;
+
+            while (element && element !== document.documentElement && depth < 8) {
+                if (element.matches(semanticClickableSelector)) return;
+                const props = getReactProps(element);
+                if (
+                    props &&
+                    (typeof props.onClick === 'function' ||
+                        typeof props.onMouseDown === 'function' ||
+                        typeof props.onPointerDown === 'function')
+                ) {
+                    element.classList.add('app-clickable-cursor');
+                    return;
+                }
+                element = element.parentElement;
+                depth += 1;
+            }
+        };
+
+        const handlePointerOver = (event: PointerEvent) => markClickableElement(event.target);
+        const handleFocusIn = (event: FocusEvent) => markClickableElement(event.target);
+
+        document.addEventListener('pointerover', handlePointerOver, true);
+        document.addEventListener('focusin', handleFocusIn, true);
+        return () => {
+            document.removeEventListener('pointerover', handlePointerOver, true);
+            document.removeEventListener('focusin', handleFocusIn, true);
+        };
+    }, []);
+
+    // MAIN INITIALIZATION - cache-first boot; dados pesados entram em background.
+    useEffect(() => {
+        let cancelled = false;
+
+        const applyUsers = (rows: any[] | null | undefined) => {
+            if (!rows || rows.length === 0 || cancelled) return;
+            setUsers(mapUsersForState(rows));
+        };
+
+        const applyConfig = (row: any | null | undefined) => {
+            if (!row || cancelled) return;
+            setConfig({ pharmacyName: row.pharmacy_name, logo: row.logo });
+        };
+
+        const applyReports = (rows: any[] | null | undefined) => {
+            if (!rows || cancelled) return;
+            const formatted = rows.map(mapDbReportToHistoryItem);
+            setReportHistory(formatted);
+            setHasMoreReports(rows.length === REPORTS_PAGE_SIZE);
+            setReportsPage(0);
+            setLastHistoryCacheAt(new Date());
+        };
+
+        const applyStockReports = (rows: any[] | null | undefined) => {
+            if (!rows || cancelled) return;
+            handleStockReportsLoaded(rows as SupabaseService.DbStockConferenceReport[]);
+            setHasMoreStockConferences(rows.length === STOCK_PAGE_SIZE);
+            setStockConferencePage(0);
+            setLastHistoryCacheAt(new Date());
+        };
+
+        const applyCompanies = (rows: any[] | null | undefined) => {
+            if (!rows || rows.length === 0 || cancelled) return;
+            setCompanies(rows);
+        };
+
+        const applyAccessMatrix = (rows: any[] | null | undefined) => {
+            if (!rows || rows.length === 0 || cancelled) return;
+            setAccessMatrix(mapAccessRowsToMatrix(rows));
+        };
+
+        const refreshCoreData = async () => {
+            await Promise.allSettled([
+                refreshUsersIfChanged(applyUsers),
+                CacheService.fetchWithCache(CACHE_KEY_CONFIG, SupabaseService.fetchConfig, applyConfig, {
+                    maxAgeMs: STATIC_REFERENCE_CACHE_MS,
+                    revalidate: 'stale',
+                    timeoutMs: 6000
+                }),
+                CacheService.fetchWithCache(CACHE_KEY_COMPANIES, SupabaseService.fetchCompanies, applyCompanies, {
+                    maxAgeMs: STATIC_REFERENCE_CACHE_MS,
+                    revalidate: 'stale',
+                    timeoutMs: 8000
+                }),
+                CacheService.fetchWithCache(CACHE_KEY_ACCESS, SupabaseService.fetchAccessMatrix, applyAccessMatrix, {
+                    maxAgeMs: STATIC_REFERENCE_CACHE_MS,
+                    revalidate: 'stale',
+                    timeoutMs: 8000
+                })
+            ]);
+        };
+
+        const preloadSecondaryData = async () => {
+            await Promise.allSettled([
+                CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE), applyReports, {
+                    maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
+                    revalidate: 'stale',
+                    timeoutMs: 10000
+                }),
+                CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE), applyStockReports, {
+                    maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
+                    revalidate: 'stale',
+                    timeoutMs: 10000
+                }),
+                CacheService.fetchWithCache(CACHE_KEY_TICKETS, SupabaseService.fetchTickets, (data) => {
+                    if (!cancelled) setTickets(data || []);
+                }, {
+                    maxAgeMs: 60 * 1000,
+                    revalidate: 'stale',
+                    timeoutMs: 8000
+                }),
+                loadPendingStockReports()
+            ]);
+        };
+
         const initializeData = async () => {
             try {
                 setIsLoadingData(true);
 
-                // 1. Launch all primary fetches in parallel with Cache-First strategy
-                const [
-                    dbUsers,
-                    dbConfig,
-                    dbReportsSummary,
-                    dbStockReportsSummary,
-                    dbCompanies,
-                    dbMatrix,
-                    dbTickets
-                ] = await Promise.all([
-                    CacheService.fetchWithCache('users_list', SupabaseService.fetchUsers, (data) => {
-                        if (data && data.length > 0) {
-                            setUsers(normalizeProtectedMasterUsers(data.map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined }))));
-                        }
-                    }),
-                    CacheService.fetchWithCache('app_config', SupabaseService.fetchConfig, (data) => {
-                        if (data) setConfig({ pharmacyName: data.pharmacy_name, logo: data.logo });
-                    }),
-                    CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE), (data) => {
-                        if (data && data.length > 0) setReportHistory(data.map(mapDbReportToHistoryItem));
-                    }),
-                    CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE), (data) => {
-                        if (data) handleStockReportsLoaded(data as SupabaseService.DbStockConferenceReport[]);
-                    }),
-                    CacheService.fetchWithCache('companies_list', SupabaseService.fetchCompanies, (data) => {
-                        if (data && data.length > 0) setCompanies(data);
-                    }),
-                    CacheService.fetchWithCache('access_matrix', SupabaseService.fetchAccessMatrix, (data) => {
-                        if (data && data.length > 0) {
-                            const mapped = data.reduce((acc: any, entry: any) => {
-                                acc[entry.level] = entry.modules || {};
-                                return acc;
-                            }, {});
-                            setAccessMatrix(mergeAccessMatrixWithDefaults(mapped));
-                        }
-                    }),
-                    CacheService.fetchWithCache('tickets_list', SupabaseService.fetchTickets, (data) => {
-                        if (data && data.length > 0) setTickets(data);
-                    }),
-                    loadPendingStockReports()
+                const cached = await CacheService.getMany<any>([
+                    CACHE_KEY_USERS,
+                    CACHE_KEY_CONFIG,
+                    CACHE_KEY_COMPANIES,
+                    CACHE_KEY_ACCESS,
+                    CACHE_KEY_REPORTS,
+                    CACHE_KEY_STOCK,
+                    CACHE_KEY_TICKETS
                 ]);
 
-                // 2. Initial State Population (from the result of Promise.all, which could be Cache or Remote)
-                if (dbUsers && dbUsers.length > 0) {
-                    setUsers(normalizeProtectedMasterUsers(dbUsers.map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined }))));
-                }
-
-                if (dbConfig) {
-                    setConfig({ pharmacyName: dbConfig.pharmacy_name, logo: dbConfig.logo });
-                }
-
-                if (dbReportsSummary && dbReportsSummary.length > 0) {
-                    const formatted = dbReportsSummary.map(mapDbReportToHistoryItem);
-                    setReportHistory(formatted);
-                    setHasMoreReports(dbReportsSummary.length === REPORTS_PAGE_SIZE);
-                    setLastHistoryCacheAt(new Date());
-                }
-
-                if (dbStockReportsSummary) {
-                    handleStockReportsLoaded(dbStockReportsSummary as SupabaseService.DbStockConferenceReport[]);
-                    setHasMoreStockConferences(dbStockReportsSummary.length === STOCK_PAGE_SIZE);
-                    setLastHistoryCacheAt(new Date());
-                }
-
-                if (dbCompanies) setCompanies(dbCompanies);
-
-                if (dbMatrix && dbMatrix.length > 0) {
-                    const mapped = dbMatrix.reduce((acc: any, entry: any) => {
-                        acc[entry.level] = entry.modules || {};
-                        return acc;
-                    }, {});
-                    setAccessMatrix(mergeAccessMatrixWithDefaults(mapped));
-                }
-
-                if (dbTickets) setTickets(dbTickets);
+                applyUsers(cached[CACHE_KEY_USERS] as any[]);
+                applyConfig(cached[CACHE_KEY_CONFIG]);
+                applyCompanies(cached[CACHE_KEY_COMPANIES] as any[]);
+                applyAccessMatrix(cached[CACHE_KEY_ACCESS] as any[]);
+                applyReports(cached[CACHE_KEY_REPORTS] as any[]);
+                applyStockReports(cached[CACHE_KEY_STOCK] as any[]);
+                if (cached[CACHE_KEY_TICKETS] && !cancelled) setTickets(cached[CACHE_KEY_TICKETS] as DbTicket[]);
 
                 // F5/refresh sempre volta para o dashboard inicial.
                 localStorage.setItem('APP_CURRENT_VIEW', 'dashboard');
@@ -2650,32 +2874,107 @@ const App: React.FC = () => {
                 const localUsers = localStorage.getItem('APP_USERS');
                 if (localUsers) setUsers(normalizeProtectedMasterUsers(JSON.parse(localUsers)));
             } finally {
-                setIsLoadingData(false);
+                if (!cancelled) {
+                    setIsLoadingData(false);
+                    void refreshCoreData();
+                    scheduleBackgroundTask(() => {
+                        void preloadSecondaryData();
+                    }, 1200);
+                }
             }
         };
         initializeData();
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     useEffect(() => {
-        const loadChecklistDefinitions = async () => {
-            try {
-                const dbDefinitions = await SupabaseService.fetchChecklistDefinitions();
-                if (!dbDefinitions || dbDefinitions.length === 0) return;
-                const serverMap = dbDefinitions.reduce((acc: Record<string, ChecklistDefinition>, entry) => {
-                    acc[entry.id] = entry.definition;
-                    return acc;
-                }, {});
-                const ordered = BASE_CHECKLISTS.map(base => serverMap[base.id] || base);
-                const extras = dbDefinitions
-                    .filter(entry => !BASE_CHECKLISTS.some(base => base.id === entry.id))
-                    .map(entry => entry.definition);
-                setChecklists([...ordered, ...extras]);
-            } catch (error) {
-                console.error('Erro ao carregar definições dos checklists:', error);
-            }
+        let cancelled = false;
+        const applyChecklistDefinitions = (dbDefinitions: SupabaseService.DbChecklistDefinition[] | null) => {
+            if (cancelled || !dbDefinitions || dbDefinitions.length === 0) return;
+            const serverMap = dbDefinitions.reduce((acc: Record<string, ChecklistDefinition>, entry) => {
+                acc[entry.id] = entry.definition;
+                return acc;
+            }, {});
+            const ordered = BASE_CHECKLISTS.map(base => serverMap[base.id] || base);
+            const extras = dbDefinitions
+                .filter(entry => !BASE_CHECKLISTS.some(base => base.id === entry.id))
+                .map(entry => entry.definition);
+            setChecklists([...ordered, ...extras]);
         };
-        loadChecklistDefinitions();
+
+        CacheService.fetchWithCache(CACHE_KEY_CHECKLIST_DEFS, SupabaseService.fetchChecklistDefinitions, applyChecklistDefinitions, {
+            maxAgeMs: STATIC_REFERENCE_CACHE_MS,
+            revalidate: 'stale',
+            timeoutMs: 8000
+        }).then(applyChecklistDefinitions).catch(error => {
+            console.error('Erro ao carregar definições dos checklists:', error);
+        });
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
+
+    useEffect(() => {
+        if (currentView !== 'support') return;
+        let cancelled = false;
+        CacheService.fetchWithCache(CACHE_KEY_TICKETS, SupabaseService.fetchTickets, (data) => {
+            if (!cancelled) setTickets(data || []);
+        }, {
+            maxAgeMs: 15 * 1000,
+            revalidate: 'always',
+            timeoutMs: 8000
+        }).then(data => {
+            if (!cancelled && data) setTickets(data);
+        }).catch(error => {
+            console.error('Erro ao carregar tickets do suporte:', error);
+        });
+        return () => {
+            cancelled = true;
+        };
+    }, [currentView]);
+
+    useEffect(() => {
+        if (currentView !== 'history') return;
+        let cancelled = false;
+
+        const applyReports = (rows: any[] | null | undefined) => {
+            if (cancelled || !rows) return;
+            const formatted = rows.map(mapDbReportToHistoryItem);
+            setReportHistory(formatted);
+            setHasMoreReports(rows.length === REPORTS_PAGE_SIZE);
+            setReportsPage(0);
+            setLastHistoryCacheAt(new Date());
+        };
+
+        const applyStockReports = (rows: any[] | null | undefined) => {
+            if (cancelled || !rows) return;
+            handleStockReportsLoaded(rows as SupabaseService.DbStockConferenceReport[]);
+            setHasMoreStockConferences(rows.length === STOCK_PAGE_SIZE);
+            setStockConferencePage(0);
+            setLastHistoryCacheAt(new Date());
+        };
+
+        Promise.allSettled([
+            CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE), applyReports, {
+                maxAgeMs: 30 * 1000,
+                revalidate: 'stale',
+                timeoutMs: 10000
+            }).then(applyReports),
+            CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE), applyStockReports, {
+                maxAgeMs: 30 * 1000,
+                revalidate: 'stale',
+                timeoutMs: 10000
+            }).then(applyStockReports)
+        ]).catch(() => { });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [currentView]);
 
     useEffect(() => {
         if (checklists.length === 0) return;
@@ -2917,6 +3216,7 @@ const App: React.FC = () => {
             const resolvedArea = resolveAreaFromCompanyBranch(currentUser.company_id, currentBranch);
             if (resolvedArea && resolvedArea !== (currentUser.area || '')) {
                 await SupabaseService.updateUser(currentUser.email, { area: resolvedArea });
+                await invalidateUsersCache();
                 setUsers(prev => prev.map(u => u.email === currentUser.email ? { ...u, area: resolvedArea } : u));
                 setCurrentUser(prev => prev && prev.email === currentUser.email ? { ...prev, area: resolvedArea } : prev);
             }
@@ -2949,10 +3249,20 @@ const App: React.FC = () => {
 
     const loadGlobalBaseFiles = async () => {
         if (!currentUser?.company_id) return;
+        const cacheKey = `global_base_meta_${currentUser.company_id}`;
         setIsLoadingGlobalBaseFiles(true);
         try {
-            const files = await SupabaseService.fetchGlobalBaseFilesMeta(currentUser.company_id);
-            setGlobalBaseFiles(files);
+            const files = await CacheService.fetchWithCache(
+                cacheKey,
+                () => SupabaseService.fetchGlobalBaseFilesMeta(currentUser.company_id!),
+                (fresh) => setGlobalBaseFiles(fresh || []),
+                {
+                    maxAgeMs: STATIC_REFERENCE_CACHE_MS,
+                    revalidate: 'stale',
+                    timeoutMs: 8000
+                }
+            );
+            if (files) setGlobalBaseFiles(files);
         } finally {
             setIsLoadingGlobalBaseFiles(false);
         }
@@ -2986,6 +3296,7 @@ const App: React.FC = () => {
                 alert('Não foi possível salvar o arquivo no Supabase.');
                 return;
             }
+            await CacheService.remove(`global_base_meta_${currentUser.company_id}`);
             await loadGlobalBaseFiles();
             await CadastrosBaseService.clearCache();
             SupabaseService.insertAppEventLog({
@@ -3040,6 +3351,7 @@ const App: React.FC = () => {
                 filial: selectedBranch,
                 area: resolvedArea || null
             } : u));
+            await invalidateUsersCache();
             setCurrentUser(prev => prev && prev.email === currentUser.email ? {
                 ...prev,
                 filial: selectedBranch,
@@ -3201,6 +3513,10 @@ const App: React.FC = () => {
             // Save to Supabase (async, with debounce)
             const timeoutId = setTimeout(async () => {
                 await SupabaseService.saveConfig({
+                    pharmacy_name: config.pharmacyName,
+                    logo: config.logo
+                });
+                await CacheService.set(CACHE_KEY_CONFIG, {
                     pharmacy_name: config.pharmacyName,
                     logo: config.logo
                 });
@@ -3606,11 +3922,9 @@ const App: React.FC = () => {
             if (inFlight) return;
             inFlight = true;
             try {
-                const dbUsers = await SupabaseService.fetchUsers();
-                if (cancelled) return;
-                const mapped = normalizeProtectedMasterUsers((dbUsers || []).map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined })));
-                setUsers(mapped);
-                await CacheService.set('users_list', normalizeProtectedMasterUsers(dbUsers || []));
+                await refreshUsersIfChanged((dbUsers) => {
+                    if (!cancelled) setUsers(mapUsersForState(dbUsers || []));
+                });
             } catch (error) {
                 console.error('Erro ao atualizar usuários pendentes:', error);
             } finally {
@@ -3637,6 +3951,7 @@ const App: React.FC = () => {
     const handleRegister = async (newUser: User) => {
         try {
             const created = await SupabaseService.createUser(newUser);
+            await invalidateUsersCache();
             setUsers(prev => [...prev, created]);
             if (currentUser?.email) {
                 SupabaseService.insertAppEventLog({
@@ -3675,6 +3990,7 @@ const App: React.FC = () => {
         }
         // Update in Supabase
         await SupabaseService.updateUser(email, { approved, rejected: false });
+        await invalidateUsersCache();
         // Update local state
         setUsers(prev => prev.map(u => u.email === email ? { ...u, approved, rejected: false } : u));
         if (currentUser?.email) {
@@ -3708,6 +4024,7 @@ const App: React.FC = () => {
         }
         // Update in Supabase
         await SupabaseService.updateUser(email, { approved: false, rejected: true });
+        await invalidateUsersCache();
         // Update local state
         setUsers(prev => prev.map(u => u.email === email ? { ...u, approved: false, rejected: true } : u));
         if (currentUser?.email) {
@@ -3740,6 +4057,7 @@ const App: React.FC = () => {
          try {
              const success = await SupabaseService.deleteUser(email);
              if (success) {
+                 await invalidateUsersCache();
                  setUsers(prev => prev.filter(u => u.email !== email));
                  if (currentUser?.email) {
                      SupabaseService.insertAppEventLog({
@@ -3786,6 +4104,7 @@ const App: React.FC = () => {
             }
 
             setUsers(prev => prev.map(u => u.email === targetUser.email ? { ...u, password: nextPassword } : u));
+            await invalidateUsersCache();
             setTeamPasswordDrafts(prev => {
                 const next = { ...prev };
                 delete next[targetUser.email];
@@ -3835,11 +4154,13 @@ const App: React.FC = () => {
                 setUsers(prevUsers => prevUsers.map(u => u.email === currentUser.email ? { ...u, phone: val } : u));
                 // Update in Supabase
                 await SupabaseService.updateUser(currentUser.email, { phone: val });
+                await invalidateUsersCache();
             }
         } else {
             setUsers(prevUsers => prevUsers.map(u => u.email === currentUser.email ? { ...u, [field]: value } : u));
             // Update in Supabase
             await SupabaseService.updateUser(currentUser.email, { [field]: value } as any);
+            await invalidateUsersCache();
             if (currentUser?.email && ['company_id', 'area', 'filial', 'role'].includes(field)) {
                 SupabaseService.insertAppEventLog({
                     company_id: currentUser.company_id || null,
@@ -3877,6 +4198,7 @@ const App: React.FC = () => {
                 // Update in Supabase
                 if (currentUser) {
                     await SupabaseService.updateUser(currentUser.email, { photo });
+                    await invalidateUsersCache();
                     SupabaseService.insertAppEventLog({
                         company_id: currentUser.company_id || null,
                         branch: currentUser.filial || null,
@@ -3908,6 +4230,7 @@ const App: React.FC = () => {
 
         // Save to Supabase (map camelCase to snake_case)
         await SupabaseService.updateUser(currentUser.email, { preferred_theme: theme } as any);
+        await invalidateUsersCache();
         SupabaseService.insertAppEventLog({
             company_id: currentUser.company_id || null,
             branch: currentUser.filial || null,
@@ -3957,6 +4280,7 @@ const App: React.FC = () => {
             setCurrentUser(prev => prev ? { ...prev, password: newPassInput } : prev);
             // Update Password in Supabase
             await SupabaseService.updateUser(currentUser.email, { password: newPassInput });
+            await invalidateUsersCache();
         }
 
         // Clear password fields
@@ -4045,6 +4369,7 @@ const App: React.FC = () => {
 
         try {
             const created = await SupabaseService.createUser(newUser);
+            await invalidateUsersCache();
             setUsers(prev => [...prev, created]);
         } catch (error) {
             console.error('Erro ao criar usuário interno:', error);
@@ -4262,6 +4587,7 @@ const App: React.FC = () => {
         setIsSavingChecklistDefinition(true);
         try {
             await SupabaseService.upsertChecklistDefinition(editingChecklistDefinition);
+            await CacheService.remove(CACHE_KEY_CHECKLIST_DEFS);
             setChecklists(prev => {
                 const exists = prev.some(entry => entry.id === editingChecklistDefinition.id);
                 const updated = prev.map(entry =>
@@ -6264,9 +6590,29 @@ const App: React.FC = () => {
 
             const latestMetadata = Array.from(latestByBranchAndNumber.values()).filter(s => !!s.id);
             const detailIds = latestMetadata.map(s => String(s.id));
+            const dashboardCacheKey = buildAuditDashboardCacheKey('open', queryBranches);
+            const dashboardMetaKey = `${dashboardCacheKey}_meta`;
+            const metadataSignature = buildAuditMetadataSignature(latestMetadata);
+
+            const [cachedSignature, cachedRows] = await Promise.all([
+                CacheService.get<string>(dashboardMetaKey),
+                CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
+            ]);
+
+            if (
+                cachedSignature === metadataSignature &&
+                Array.isArray(cachedRows) &&
+                cachedRows.length === latestMetadata.length
+            ) {
+                setDashboardAuditSessions(cachedRows);
+                setDashboardAuditsFetchedAt(new Date().toISOString());
+                return;
+            }
 
             if (detailIds.length === 0) {
                 setDashboardAuditSessions([]);
+                await CacheService.set(dashboardMetaKey, metadataSignature);
+                await CacheService.set(dashboardCacheKey, []);
                 setDashboardAuditsFetchedAt(new Date().toISOString());
                 return;
             }
@@ -6293,6 +6639,8 @@ const App: React.FC = () => {
                 .filter((row): row is SupabaseService.DbAuditSession => Boolean(row));
 
             setDashboardAuditSessions(resolvedRows);
+            await CacheService.set(dashboardMetaKey, metadataSignature);
+            await CacheService.set(dashboardCacheKey, resolvedRows);
             setDashboardAuditsFetchedAt(new Date().toISOString());
         } catch (error) {
             console.error('Erro ao carregar sessões abertas de auditoria para o dashboard:', error);
@@ -6354,9 +6702,29 @@ const App: React.FC = () => {
 
             const latestMetadata = Array.from(latestByBranchAndNumber.values()).filter(s => !!s.id);
             const detailIds = latestMetadata.map(s => String(s.id));
+            const dashboardCacheKey = buildAuditDashboardCacheKey('completed', queryBranches);
+            const dashboardMetaKey = `${dashboardCacheKey}_meta`;
+            const metadataSignature = buildAuditMetadataSignature(latestMetadata);
+
+            const [cachedSignature, cachedRows] = await Promise.all([
+                CacheService.get<string>(dashboardMetaKey),
+                CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
+            ]);
+
+            if (
+                cachedSignature === metadataSignature &&
+                Array.isArray(cachedRows) &&
+                cachedRows.length === latestMetadata.length
+            ) {
+                setDashboardCompletedAuditSessions(cachedRows);
+                setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
+                return;
+            }
 
             if (detailIds.length === 0) {
                 setDashboardCompletedAuditSessions([]);
+                await CacheService.set(dashboardMetaKey, metadataSignature);
+                await CacheService.set(dashboardCacheKey, []);
                 setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
                 return;
             }
@@ -6383,6 +6751,8 @@ const App: React.FC = () => {
                 .filter((row): row is SupabaseService.DbAuditSession => Boolean(row));
 
             setDashboardCompletedAuditSessions(resolvedRows);
+            await CacheService.set(dashboardMetaKey, metadataSignature);
+            await CacheService.set(dashboardCacheKey, resolvedRows);
             setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
         } catch (error) {
             console.error('Erro ao carregar sessões concluídas de auditoria para o dashboard:', error);
@@ -8458,6 +8828,7 @@ const App: React.FC = () => {
                                                                             logo: editCompanyLogo,
                                                                             areas: editCompanyAreas
                                                                         });
+                                                                        await CacheService.remove(CACHE_KEY_COMPANIES);
                                                                         setCompanies(companies.map(c =>
                                                                             c.id === selectedCompanyId
                                                                                 ? { ...c, name: editCompanyName, cnpj: editCompanyCnpj, phone: editCompanyPhone, logo: editCompanyLogo, areas: editCompanyAreas }
@@ -8466,6 +8837,7 @@ const App: React.FC = () => {
                                                                         if (config.pharmacyName === companies.find(c => c.id === selectedCompanyId)?.name) {
                                                                             setConfig({ pharmacyName: editCompanyName, logo: editCompanyLogo });
                                                                             await saveConfig({ pharmacy_name: editCompanyName, logo: editCompanyLogo });
+                                                                            await CacheService.remove(CACHE_KEY_CONFIG);
                                                                         }
                                                                         alert('Alterações salvas com sucesso!');
                                                                         if (currentUser?.email) {
@@ -8682,6 +9054,7 @@ const App: React.FC = () => {
                                                         };
                                                         const created = await createCompany(newCompany);
                                                         if (created) {
+                                                            await CacheService.remove(CACHE_KEY_COMPANIES);
                                                             setCompanies([...companies, created]);
                                                             setNewCompanyName('');
                                                             setNewCompanyCnpj('');
@@ -10678,6 +11051,7 @@ const App: React.FC = () => {
                                                 };
                                                 const created = await createTicket(ticket as DbTicket);
                                                 if (created) {
+                                                    await CacheService.remove(CACHE_KEY_TICKETS);
                                                     setTickets([created, ...tickets]);
                                                     setNewTicketTitle('');
                                                     setNewTicketDesc('');
@@ -10819,6 +11193,7 @@ const App: React.FC = () => {
                                                                                 const responseText = adminResponseInput[ticket.id!] || '';
                                                                                 const success = await updateTicketStatus(ticket.id!, 'IN_PROGRESS', responseText);
                                                                                 if (success) {
+                                                                                    await CacheService.remove(CACHE_KEY_TICKETS);
                                                                                     setTickets(prev => prev.map(t => t.id === ticket.id ? { ...t, status: 'IN_PROGRESS', admin_response: responseText } : t));
                                                                                     alert('Status alterado para "Em Análise"!');
                                                                                 }
@@ -10832,6 +11207,7 @@ const App: React.FC = () => {
                                                                                 const responseText = adminResponseInput[ticket.id!] || '';
                                                                                 const success = await updateTicketStatus(ticket.id!, 'IGNORED', responseText);
                                                                                 if (success) {
+                                                                                    await CacheService.remove(CACHE_KEY_TICKETS);
                                                                                     setTickets(prev => prev.map(t => t.id === ticket.id ? { ...t, status: 'IGNORED', admin_response: responseText } : t));
                                                                                     alert('Ticket arquivado!');
                                                                                 }
@@ -10845,6 +11221,7 @@ const App: React.FC = () => {
                                                                                 const responseText = adminResponseInput[ticket.id!] || '';
                                                                                 const success = await updateTicketStatus(ticket.id!, 'DONE', responseText);
                                                                                 if (success) {
+                                                                                    await CacheService.remove(CACHE_KEY_TICKETS);
                                                                                     setTickets(prev => prev.map(t => t.id === ticket.id ? { ...t, status: 'DONE', admin_response: responseText } : t));
                                                                                     alert('Ticket concluído!');
                                                                                 }
