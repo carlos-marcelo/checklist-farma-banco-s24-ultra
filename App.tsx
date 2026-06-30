@@ -1494,6 +1494,7 @@ const StockConferenceReportViewer = ({ report, onClose, currentUser }: StockConf
 };
 
 const PROTECTED_MASTER_EMAILS = new Set(['asconavietagestor@gmail.com', 'contato@marcelo.far.br']);
+const AUDIT_MANUAL_BRANCH_SELECTION_KEY = 'APP_AUDIT_MANUAL_BRANCH_SELECTION_REQUIRED';
 
 const normalizeUserEmail = (email?: string | null) => String(email || '').trim().toLowerCase();
 
@@ -2149,6 +2150,22 @@ const App: React.FC = () => {
     const [completedAuditNumberFilter, setCompletedAuditNumberFilter] = useState<string>('all');
     const [dashboardClockMinute, setDashboardClockMinute] = useState(() => Date.now());
     const [auditJumpFilial, setAuditJumpFilial] = useState<string>('');
+    const [auditManualBranchSelectionRequired, setAuditManualBranchSelectionRequired] = useState(() =>
+        typeof window !== 'undefined' && window.sessionStorage.getItem(AUDIT_MANUAL_BRANCH_SELECTION_KEY) === '1'
+    );
+    const markAuditManualBranchSelectionRequired = useCallback(() => {
+        setAuditManualBranchSelectionRequired(true);
+        if (typeof window !== 'undefined') {
+            window.sessionStorage.setItem(AUDIT_MANUAL_BRANCH_SELECTION_KEY, '1');
+        }
+    }, []);
+
+    const clearAuditManualBranchSelectionRequired = useCallback(() => {
+        setAuditManualBranchSelectionRequired(false);
+        if (typeof window !== 'undefined') {
+            window.sessionStorage.removeItem(AUDIT_MANUAL_BRANCH_SELECTION_KEY);
+        }
+    }, []);
 
     // Logs & Eventos
     const [appEventLogs, setAppEventLogs] = useState<SupabaseService.DbAppEventLog[]>([]);
@@ -3743,6 +3760,7 @@ const App: React.FC = () => {
         setCurrentUser(user);
         setBranchPromptCheckedForUser(null);
         setShowBranchSelectionModal(false);
+        clearAuditManualBranchSelectionRequired();
 
         SupabaseService.insertAppEventLog({
             company_id: user.company_id || null,
@@ -3796,6 +3814,7 @@ const App: React.FC = () => {
         localStorage.removeItem('APP_VIEWING_STOCK_REPORT_ID');
         localStorage.removeItem('APP_VIEW_HISTORY_ITEM');
         localStorage.removeItem('APP_VIEW_STOCK_REPORT');
+        clearAuditManualBranchSelectionRequired();
 
         setBranchPromptCheckedForUser(null);
         setShowBranchSelectionModal(false);
@@ -3808,7 +3827,7 @@ const App: React.FC = () => {
         setRemoteForceLogoutDeadline(null);
         setCurrentView('dashboard');
         logoutInFlightRef.current = false;
-    }, [currentUser, currentView]);
+    }, [clearAuditManualBranchSelectionRequired, currentUser, currentView]);
 
     const handleRemoteForceLogoutNow = useCallback(async () => {
         setRemoteForceLogoutDeadline(null);
@@ -8236,11 +8255,12 @@ const App: React.FC = () => {
         if (!raw) return;
         const numeric = raw.match(/\d+/)?.[0] || '';
         const filial = numeric || raw;
+        clearAuditManualBranchSelectionRequired();
         setAuditJumpFilial(filial);
         setCurrentView('audit');
         window.scrollTo(0, 0);
         setIsSidebarOpen(isMobileLayout());
-    }, []);
+    }, [clearAuditManualBranchSelectionRequired]);
 
     useEffect(() => {
         if (currentView !== 'audit' && auditJumpFilial) {
@@ -8515,6 +8535,9 @@ const App: React.FC = () => {
                                 userFilial={currentUser?.filial || null}
                                 companies={companies}
                                 initialFilial={auditJumpFilial}
+                                forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
+                                onAuditExited={markAuditManualBranchSelectionRequired}
+                                onFilialSelected={clearAuditManualBranchSelectionRequired}
                             />
                         </div>
                     )}

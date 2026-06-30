@@ -1828,9 +1828,12 @@ interface AuditModuleProps {
     userFilial?: string | null;
     companies: any[];
     initialFilial?: string;
+    forceManualFilialSelection?: boolean;
+    onAuditExited?: () => void;
+    onFilialSelected?: () => void;
 }
 
-const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, userCompanyId, userArea, userFilial, companies, initialFilial }) => {
+const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, userCompanyId, userArea, userFilial, companies, initialFilial, forceManualFilialSelection = false, onAuditExited, onFilialSelected }) => {
     const isMaster = userRole === 'MASTER';
     const isAdmin = userRole === 'ADMINISTRATIVO';
     const canUseAuditMasterTools = isMaster || isAdmin;
@@ -1915,7 +1918,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const postAdjustmentQtyInputRef = useRef<HTMLInputElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
     const [selectedEmpresa, setSelectedEmpresa] = useState("Drogaria Cidade");
-    const [selectedFilial, setSelectedFilial] = useState(toAuditBranchValue(initialFilial || userFilial || ''));
+    const [selectedFilial, setSelectedFilial] = useState(() => {
+        const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
+        if (forceManualFilialSelection && !forcedInitialFilial) return '';
+        return toAuditBranchValue(forcedInitialFilial || userFilial || '');
+    });
     const allowedCompanies = useMemo(() => {
         if (isMaster || !userCompanyId) return companies;
         const scoped = companies.filter(c => c.id === userCompanyId);
@@ -2101,6 +2108,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (!isMaster && allowedAuditBranches.length > 0 && !allowedAuditBranchSet.has(normalized)) return;
         setSelectedFilial(prev => (prev === normalized ? prev : normalized));
     }, [initialFilial, isMaster, allowedAuditBranches.length, allowedAuditBranchSet]);
+
+    useEffect(() => {
+        const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
+        if (!forceManualFilialSelection || forcedInitialFilial) return;
+        setSelectedFilial('');
+        setData(null);
+        setDbSessionId(undefined);
+        setAllowActiveAuditAutoOpen(false);
+        setIsReadOnlyCompletedView(false);
+        setConsultingAuditNumber(null);
+        setView({ level: 'groups' });
+    }, [forceManualFilialSelection, initialFilial]);
 
     useEffect(() => {
         if (isMaster || !selectedFilial || allowedAuditBranches.length === 0) return;
@@ -2791,12 +2810,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 // Restoration of basic settings - but let loadAuditNum fetch full fresh context usually.
                 // However, we can use savedData if Supabase fails.
                 const forcedInitialFilial = String(initialFilial || '').trim();
-                if (!forcedInitialFilial && savedData.filial) setSelectedFilial(savedData.filial);
+                if (!forceManualFilialSelection && !forcedInitialFilial && savedData.filial) setSelectedFilial(savedData.filial);
                 if (savedData.inventoryNumber) setInventoryNumber(savedData.inventoryNumber);
             }
         };
         loadLocal();
-    }, [initialFilial]);
+    }, [forceManualFilialSelection, initialFilial]);
 
     useEffect(() => {
         if (data) {
@@ -2804,6 +2823,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             AuditStorage.saveLocalAuditSession(data, !!data.pendingSync);
         }
     }, [data]);
+
+    const handleSelectedFilialChange = useCallback((value: string) => {
+        setSelectedFilial(value);
+        if (value) {
+            onFilialSelected?.();
+        }
+    }, [onFilialSelected]);
 
     const persistAuditSession = useCallback(async (
         session: DbAuditSession,
@@ -3033,6 +3059,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setInitialDoneUnits(0);
             setSessionStartTime(Date.now());
             setView({ level: 'groups' });
+            onAuditExited?.();
         };
 
         if (!selectedFilial) {
@@ -3218,6 +3245,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     setInitialDoneUnits(0);
                     setSessionStartTime(Date.now());
                     setView({ level: 'groups' });
+                    onAuditExited?.();
                     // Nota: AuditStorage.clearLocalAuditSession() NÃO deve ser chamado se estiver pendente.
                     if (savedSession) {
                         await AuditStorage.clearLocalAuditSession();
@@ -10192,7 +10220,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             </div>
                             <div className="space-y-1">
                                 <label className="text-[10px] font-black uppercase text-slate-400">Selecione a Filial</label>
-                                <select className="w-full bg-slate-50 border-2 rounded-xl px-4 py-3 font-bold border-slate-100" value={selectedFilial} onChange={e => setSelectedFilial(e.target.value)}>
+                                <select className="w-full bg-slate-50 border-2 rounded-xl px-4 py-3 font-bold border-slate-100" value={selectedFilial} onChange={e => handleSelectedFilialChange(e.target.value)}>
                                     <option value="">Selecione...</option>
                                     {allowedAuditBranches.map(f => <option key={f} value={f}>Filial {f}</option>)}
                                 </select>

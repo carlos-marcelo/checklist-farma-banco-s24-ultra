@@ -8,6 +8,7 @@ import {
 import { Loader2, DollarSign, Target, Activity, MonitorSmartphone, Package, TrendingUp, Filter, MapPin, Building2, Sparkles, Camera } from 'lucide-react';
 import { User, CompanyArea } from '../../types';
 import * as SupabaseService from '../../supabaseService';
+import { CacheService } from '../../src/cacheService';
 
 interface AnaliseDashboardProps {
     currentUser: User;
@@ -39,6 +40,33 @@ interface RawDataState {
     vendasUpdatedAt?: string;
 }
 
+interface AnalysisParsedCache {
+    signature: string;
+    state: Omit<RawDataState, 'loading' | 'error'>;
+    savedAt: string;
+}
+
+const ANALYSIS_VENDAS_MODULE_KEY = 'analysis_vendas_totais';
+const ANALYSIS_PEDIDOS_MODULE_KEY = 'analysis_pedidos';
+
+const buildAnalysisFileSignature = (
+    companyId: string,
+    companyAreasSignature: string,
+    files: Array<Partial<SupabaseService.DbGlobalBaseFile> | null | undefined>
+) => [
+    companyId || '',
+    companyAreasSignature,
+    ...files
+        .map(file => [
+            file?.module_key || '',
+            file?.id || '',
+            file?.file_name || '',
+            file?.file_size || 0,
+            file?.updated_at || file?.uploaded_at || ''
+        ].join(':'))
+        .sort()
+].join('|');
+
 const formatDateToBr = (dateStr?: string) => {
     if (!dateStr) return '';
     try {
@@ -52,6 +80,17 @@ const formatDateToBr = (dateStr?: string) => {
 export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser, companies = [] }) => {
     const dashboardRef = useRef<HTMLDivElement>(null);
     const [isExporting, setIsExporting] = useState(false);
+    const companyAreasSignature = useMemo(() => {
+        const company = companies.find(c => c.id === currentUser?.company_id);
+        if (!company) return currentUser?.company_id || '';
+        return JSON.stringify({
+            id: company.id,
+            areas: (company.areas || []).map((area: CompanyArea) => ({
+                name: area.name,
+                branches: [...(area.branches || [])].sort()
+            })).sort((a: any, b: any) => String(a.name).localeCompare(String(b.name), 'pt-BR'))
+        });
+    }, [companies, currentUser?.company_id]);
 
     const [rawState, setRawState] = useState<RawDataState>({
         loading: true,
@@ -128,16 +167,59 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
     };
 
     useEffect(() => {
+        let cancelled = false;
+
         const loadAndParseData = async () => {
+            let hadUsableCache = false;
             try {
-                if (!currentUser?.company_id) throw new Error("Empresa não selecionada.");
+                const companyId = currentUser?.company_id || '';
+                if (!companyId) throw new Error("Empresa não selecionada.");
 
-                const vendasFileMeta = await SupabaseService.fetchGlobalBaseFileFull(currentUser.company_id, 'analysis_vendas_totais');
-                const pedidosFileMeta = await SupabaseService.fetchGlobalBaseFileFull(currentUser.company_id, 'analysis_pedidos');
+                const cacheKey = `analysis_resultados_parsed_${companyId}`;
+                const cached = await CacheService.get<AnalysisParsedCache>(cacheKey);
+                if (cached?.state) {
+                    hadUsableCache = true;
+                    if (!cancelled) {
+                        setRawState({
+                            loading: false,
+                            error: null,
+                            ...cached.state
+                        });
+                    }
+                } else if (!cancelled) {
+                    setRawState(prev => ({ ...prev, loading: true, error: null }));
+                }
 
-                if (!vendasFileMeta?.file_data_base64) {
+                const [vendasMeta, pedidosMeta] = await Promise.all([
+                    SupabaseService.fetchGlobalBaseFileMeta(companyId, ANALYSIS_VENDAS_MODULE_KEY),
+                    SupabaseService.fetchGlobalBaseFileMeta(companyId, ANALYSIS_PEDIDOS_MODULE_KEY)
+                ]);
+
+                const metadataSignature = buildAnalysisFileSignature(companyId, companyAreasSignature, [vendasMeta, pedidosMeta]);
+
+                if (!vendasMeta) {
+                    if (hadUsableCache) return;
                     throw new Error("Arquivo de 'Vendas Totais' não encontrado. Carregue o arquivo em Cadastros Base.");
                 }
+
+                if (cached?.signature === metadataSignature && cached.state) {
+                    return;
+                }
+
+                const [vendasFileMeta, pedidosFileMeta] = await Promise.all([
+                    SupabaseService.fetchGlobalBaseFileFull(companyId, ANALYSIS_VENDAS_MODULE_KEY),
+                    pedidosMeta ? SupabaseService.fetchGlobalBaseFileFull(companyId, ANALYSIS_PEDIDOS_MODULE_KEY) : Promise.resolve(null)
+                ]);
+
+                if (!vendasFileMeta?.file_data_base64) {
+                    if (hadUsableCache) return;
+                    throw new Error("Arquivo de 'Vendas Totais' não encontrado. Carregue o arquivo em Cadastros Base.");
+                }
+
+                const parsedSignature = buildAnalysisFileSignature(companyId, companyAreasSignature, [
+                    vendasFileMeta || vendasMeta,
+                    pedidosFileMeta || pedidosMeta
+                ]);
 
                 // 1. Parse Vendas Totais
                 const vendasRes = await fetch(vendasFileMeta.file_data_base64);
@@ -323,23 +405,40 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     }
                 }
 
-                setRawState({
-                    loading: false,
-                    error: null,
+                const nextState: AnalysisParsedCache['state'] = {
                     rawLinesVendas: parsedVendas,
                     rawLinesEcom: parsedEcom,
                     rawBranchTickets: rawBranchTickets,
                     rawBranchDevols: rawBranchDevols,
                     vendasUpdatedAt: String(vendasFileMeta.updated_at || vendasFileMeta.created_at || '')
+                };
+
+                await CacheService.set<AnalysisParsedCache>(cacheKey, {
+                    signature: parsedSignature,
+                    state: nextState,
+                    savedAt: new Date().toISOString()
                 });
 
+                if (!cancelled) {
+                    setRawState({
+                        loading: false,
+                        error: null,
+                        ...nextState
+                    });
+                }
+
             } catch (err: any) {
-                setRawState(prev => ({ ...prev, loading: false, error: err.message || "Erro desconhecido ao carregar planilhas." }));
+                if (!cancelled && !hadUsableCache) {
+                    setRawState(prev => ({ ...prev, loading: false, error: err.message || "Erro desconhecido ao carregar planilhas." }));
+                }
             }
         };
 
         loadAndParseData();
-    }, [currentUser?.company_id, companies]);
+        return () => {
+            cancelled = true;
+        };
+    }, [currentUser?.company_id, companyAreasSignature]);
 
     // Data Engine calculations based on filters
     const filteredData = useMemo(() => {
