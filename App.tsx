@@ -3226,12 +3226,26 @@ const App: React.FC = () => {
         return true;
     };
 
+    const isSameCompanyScope = (user?: Pick<User, 'company_id'> | null) => {
+        if (!currentUser || !user) return false;
+        if (currentUser.company_id && user.company_id && currentUser.company_id !== user.company_id) return false;
+        return true;
+    };
+
     const canManageTeamUser = (targetUser?: User | null) => {
         if (!currentUser || !targetUser) return false;
         if (currentUser.role === 'MASTER') return true;
         if (currentUser.role !== 'ADMINISTRATIVO') return false;
         if (targetUser.role === 'MASTER') return false;
         return isSameTeamArea(targetUser);
+    };
+
+    const canApproveAccessUser = (targetUser?: User | null) => {
+        if (!currentUser || !targetUser) return false;
+        if (currentUser.role === 'MASTER') return true;
+        if (currentUser.role !== 'ADMINISTRATIVO') return false;
+        if (targetUser.role === 'MASTER') return false;
+        return isSameCompanyScope(targetUser);
     };
 
     const getEffectiveNewUserCompanyId = () =>
@@ -3258,7 +3272,7 @@ const App: React.FC = () => {
     const pendingUsers = users.filter(u => {
         if (u.approved || u.rejected) return false;
         if (currentUser?.role === 'MASTER') return true;
-        if (currentUser?.role === 'ADMINISTRATIVO') return canManageTeamUser(u);
+        if (currentUser?.role === 'ADMINISTRATIVO') return canApproveAccessUser(u);
         return false;
     });
     const pendingUsersCount = pendingUsers.length;
@@ -3560,8 +3574,8 @@ const App: React.FC = () => {
     // Polling curto para fila de aprovação de usuários (evita atraso para aparecer novos cadastros).
     useEffect(() => {
         if (!currentUser) return;
-        if (!hasModuleAccess('userApproval')) return;
-        if (currentView !== 'access') return;
+        const canPollUserApprovals = hasModuleAccess('userApproval') || currentUser.role === 'ADMINISTRATIVO';
+        if (!canPollUserApprovals) return;
 
         let cancelled = false;
         let inFlight = false;
@@ -3596,7 +3610,7 @@ const App: React.FC = () => {
             document.removeEventListener('visibilitychange', handleWake);
             window.removeEventListener('focus', handleWake);
         };
-    }, [currentUser?.email, currentUser?.role, accessMatrix, currentView, USER_APPROVAL_POLL_MS]);
+    }, [currentUser?.email, currentUser?.role, accessMatrix, USER_APPROVAL_POLL_MS]);
 
     const handleRegister = async (newUser: User) => {
         try {
@@ -3633,8 +3647,8 @@ const App: React.FC = () => {
             alert("Você não pode alterar o status do próprio usuário por aqui.");
             return;
         }
-        if (!canManageTeamUser(targetUser)) {
-            alert("Você só pode alterar usuários da sua própria área.");
+        if (!canApproveAccessUser(targetUser)) {
+            alert("Você só pode alterar usuários da sua própria empresa.");
             return;
         }
         // Update in Supabase
@@ -3666,8 +3680,8 @@ const App: React.FC = () => {
             alert("Você não pode bloquear o próprio usuário por aqui.");
             return;
         }
-        if (!canManageTeamUser(targetUser)) {
-            alert("Você só pode bloquear usuários da sua própria área.");
+        if (!canApproveAccessUser(targetUser)) {
+            alert("Você só pode bloquear usuários da sua própria empresa.");
             return;
         }
         // Update in Supabase
@@ -7916,7 +7930,7 @@ const App: React.FC = () => {
     const canEditCompanies = hasModuleAccess('companyEditing');
     const canManageUsers = hasModuleAccess('userManagement') || currentUser.role === 'ADMINISTRATIVO';
     const canRespondTickets = hasModuleAccess('supportTickets');
-    const canApproveUsers = hasModuleAccess('userApproval');
+    const canApproveUsers = hasModuleAccess('userApproval') || currentUser.role === 'ADMINISTRATIVO';
     const isReadOnly = currentView === 'view_history' || !canControlChecklists;
 
     // Dynamic Header Logic: Use 'filial' input if available, otherwise default config
