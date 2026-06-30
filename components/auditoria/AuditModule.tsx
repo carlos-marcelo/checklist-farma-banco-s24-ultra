@@ -1911,6 +1911,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [isSavingPostAdjustment, setIsSavingPostAdjustment] = useState(false);
     const lastAutoPostAdjustmentNoteRef = useRef('');
     const auditLookupInputRef = useRef<HTMLInputElement | null>(null);
+    const postAdjustmentCodeInputRef = useRef<HTMLInputElement | null>(null);
+    const postAdjustmentQtyInputRef = useRef<HTMLInputElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
     const [selectedEmpresa, setSelectedEmpresa] = useState("Drogaria Cidade");
     const [selectedFilial, setSelectedFilial] = useState(toAuditBranchValue(initialFilial || userFilial || ''));
@@ -11135,16 +11137,24 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     </div>
                                     <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px] gap-2">
                                         <input
+                                            ref={postAdjustmentCodeInputRef}
                                             value={postAdjustmentCode}
                                             onChange={(event) => {
                                                 setPostAdjustmentCode(event.target.value);
                                                 setPostAdjustmentError(null);
+                                            }}
+                                            onKeyDown={(event) => {
+                                                if (event.key !== 'Enter') return;
+                                                event.preventDefault();
+                                                postAdjustmentQtyInputRef.current?.focus();
+                                                postAdjustmentQtyInputRef.current?.select();
                                             }}
                                             disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
                                             placeholder="Reduzido, barras ou descrição"
                                             className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-700 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
                                         />
                                         <input
+                                            ref={postAdjustmentQtyInputRef}
                                             value={postAdjustmentQty}
                                             onChange={(event) => {
                                                 setPostAdjustmentQty(event.target.value);
