@@ -1493,11 +1493,30 @@ const StockConferenceReportViewer = ({ report, onClose, currentUser }: StockConf
     );
 };
 
+const PROTECTED_MASTER_EMAILS = new Set(['asconavietagestor@gmail.com', 'contato@marcelo.far.br']);
+
+const normalizeUserEmail = (email?: string | null) => String(email || '').trim().toLowerCase();
+
+const isProtectedMasterEmail = (email?: string | null) => PROTECTED_MASTER_EMAILS.has(normalizeUserEmail(email));
+
+const normalizeProtectedMasterUser = <T extends { email?: string | null; role?: UserRole; approved?: boolean; rejected?: boolean }>(user: T): T => {
+    if (!isProtectedMasterEmail(user.email)) return user;
+    return {
+        ...user,
+        role: 'MASTER',
+        approved: true,
+        rejected: false
+    };
+};
+
+const normalizeProtectedMasterUsers = <T extends { email?: string | null; role?: UserRole; approved?: boolean; rejected?: boolean }>(items: T[] = []): T[] =>
+    items.map(normalizeProtectedMasterUser);
+
 // --- FALLBACK USERS (usado apenas se Supabase falhar) ---
-const INITIAL_USERS: User[] = [
+const INITIAL_USERS: User[] = normalizeProtectedMasterUsers([
     { email: 'asconavietagestor@gmail.com', password: 'marcelo1508', name: 'Marcelo Asconavieta', phone: '99999999999', role: 'MASTER', approved: true, rejected: false },
     { email: 'contato@marcelo.far.br', password: 'marcelo1508', name: 'Contato Marcelo', phone: '99999999999', role: 'MASTER', approved: true, rejected: false },
-];
+]);
 
 // --- COMPONENTS ---
 
@@ -1739,10 +1758,10 @@ const LoginScreen = ({
                 const result = await SupabaseService.authenticateUser(email, password);
 
                 if (result.status === 'success') {
-                    onLogin({
+                    onLogin(normalizeProtectedMasterUser({
                         ...result.user,
                         preferredTheme: result.user.preferred_theme as ThemeColor | undefined
-                    });
+                    }));
                     return;
                 }
 
@@ -2555,7 +2574,7 @@ const App: React.FC = () => {
                 ] = await Promise.all([
                     CacheService.fetchWithCache('users_list', SupabaseService.fetchUsers, (data) => {
                         if (data && data.length > 0) {
-                            setUsers(data.map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined })));
+                            setUsers(normalizeProtectedMasterUsers(data.map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined }))));
                         }
                     }),
                     CacheService.fetchWithCache('app_config', SupabaseService.fetchConfig, (data) => {
@@ -2587,7 +2606,7 @@ const App: React.FC = () => {
 
                 // 2. Initial State Population (from the result of Promise.all, which could be Cache or Remote)
                 if (dbUsers && dbUsers.length > 0) {
-                    setUsers(dbUsers.map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined })));
+                    setUsers(normalizeProtectedMasterUsers(dbUsers.map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined }))));
                 }
 
                 if (dbConfig) {
@@ -2629,7 +2648,7 @@ const App: React.FC = () => {
             } catch (error) {
                 console.error('Error initializing:', error);
                 const localUsers = localStorage.getItem('APP_USERS');
-                if (localUsers) setUsers(JSON.parse(localUsers));
+                if (localUsers) setUsers(normalizeProtectedMasterUsers(JSON.parse(localUsers)));
             } finally {
                 setIsLoadingData(false);
             }
@@ -2722,14 +2741,16 @@ const App: React.FC = () => {
         if (currentUser) {
             const freshUser = users.find(u => u.email === currentUser.email);
             if (freshUser) {
-                if (freshUser.name !== currentUser.name ||
-                    freshUser.phone !== currentUser.phone ||
-                    freshUser.photo !== currentUser.photo ||
-                    freshUser.preferredTheme !== currentUser.preferredTheme ||
-                    freshUser.company_id !== currentUser.company_id ||
-                    freshUser.area !== currentUser.area ||
-                    freshUser.filial !== currentUser.filial) {
-                    setCurrentUser(freshUser);
+                const normalizedFreshUser = normalizeProtectedMasterUser(freshUser);
+                if (normalizedFreshUser.name !== currentUser.name ||
+                    normalizedFreshUser.phone !== currentUser.phone ||
+                    normalizedFreshUser.photo !== currentUser.photo ||
+                    normalizedFreshUser.preferredTheme !== currentUser.preferredTheme ||
+                    normalizedFreshUser.company_id !== currentUser.company_id ||
+                    normalizedFreshUser.area !== currentUser.area ||
+                    normalizedFreshUser.filial !== currentUser.filial ||
+                    normalizedFreshUser.role !== currentUser.role) {
+                    setCurrentUser(normalizedFreshUser);
                 }
             }
         }
@@ -2747,15 +2768,16 @@ const App: React.FC = () => {
                 localStorage.removeItem('APP_VIEW_HISTORY_ITEM');
                 localStorage.removeItem('APP_VIEW_STOCK_REPORT');
                 setCurrentView('dashboard');
-                setCurrentUser(u);
+                const normalizedUser = normalizeProtectedMasterUser(u);
+                setCurrentUser(normalizedUser);
                 if (!autoLoginLoggedRef.current) {
                     autoLoginLoggedRef.current = true;
                     SupabaseService.insertAppEventLog({
-                        company_id: u.company_id || null,
-                        branch: u.filial || null,
-                        area: u.area || null,
-                        user_email: u.email,
-                        user_name: u.name,
+                        company_id: normalizedUser.company_id || null,
+                        branch: normalizedUser.filial || null,
+                        area: normalizedUser.area || null,
+                        user_email: normalizedUser.email,
+                        user_name: normalizedUser.name,
                         app: 'sistema',
                         event_type: 'login_auto',
                         status: 'success',
@@ -3586,9 +3608,9 @@ const App: React.FC = () => {
             try {
                 const dbUsers = await SupabaseService.fetchUsers();
                 if (cancelled) return;
-                const mapped = (dbUsers || []).map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined }));
+                const mapped = normalizeProtectedMasterUsers((dbUsers || []).map(u => ({ ...u, preferredTheme: u.preferred_theme as ThemeColor | undefined })));
                 setUsers(mapped);
-                await CacheService.set('users_list', dbUsers || []);
+                await CacheService.set('users_list', normalizeProtectedMasterUsers(dbUsers || []));
             } catch (error) {
                 console.error('Erro ao atualizar usuários pendentes:', error);
             } finally {
@@ -3800,6 +3822,10 @@ const App: React.FC = () => {
 
     const handleUpdateUserProfile = async (field: keyof User, value: string | null) => {
         if (!currentUser) return;
+        if (field === 'role' && isProtectedMasterEmail(currentUser.email) && value !== 'MASTER') {
+            alert('Este usuário é Master protegido e não pode ser rebaixado.');
+            return;
+        }
 
         // Custom handling for phone in profile to limit 11 digits
         if (field === 'phone') {
@@ -6133,12 +6159,14 @@ const App: React.FC = () => {
     );
 
     const scopedCompanies = useMemo(() => {
+        if (currentUser?.role === 'MASTER') return companies;
         if (!currentUser?.company_id) return companies;
         return companies.filter(c => c.id === currentUser.company_id);
-    }, [companies, currentUser?.company_id]);
+    }, [companies, currentUser?.company_id, currentUser?.role]);
 
     const scopedUsers = useMemo(() => {
         if (!currentUser) return [];
+        if (currentUser.role === 'MASTER') return users;
         if (currentUser.role !== 'MASTER' && currentUser.role !== 'ADMINISTRATIVO') {
             return users.filter(u => u.email === currentUser.email);
         }
@@ -6216,30 +6244,25 @@ const App: React.FC = () => {
                     return normalizeBranchLabel(sessionRaw) === normalizeBranchLabel(currentBranch);
                 });
 
-            // Reduz carga: manter só a sessão aberta mais recente por filial antes de buscar o JSON pesado.
-            const latestByBranch = new Map<string, typeof scopedMetadata[number]>();
+            // Mantem a versão mais recente de cada filial + inventário.
+            const latestByBranchAndNumber = new Map<string, typeof scopedMetadata[number]>();
             scopedMetadata.forEach((session) => {
                 const branchLabel = normalizeBranchLabel(session.branch);
-                const prev = latestByBranch.get(branchLabel);
+                const auditNumber = Number(session.audit_number || 0);
+                const key = `${branchLabel}_${auditNumber}`;
+                const prev = latestByBranchAndNumber.get(key);
                 if (!prev) {
-                    latestByBranch.set(branchLabel, session);
+                    latestByBranchAndNumber.set(key, session);
                     return;
                 }
-                const prevAudit = Number(prev.audit_number || 0);
-                const curAudit = Number(session.audit_number || 0);
-                if (curAudit > prevAudit) {
-                    latestByBranch.set(branchLabel, session);
-                    return;
-                }
-                if (curAudit < prevAudit) return;
                 const prevTs = Date.parse(String(prev.updated_at || prev.created_at || '')) || 0;
                 const curTs = Date.parse(String(session.updated_at || session.created_at || '')) || 0;
                 if (curTs > prevTs) {
-                    latestByBranch.set(branchLabel, session);
+                    latestByBranchAndNumber.set(key, session);
                 }
             });
 
-            const latestMetadata = Array.from(latestByBranch.values()).filter(s => !!s.id);
+            const latestMetadata = Array.from(latestByBranchAndNumber.values()).filter(s => !!s.id);
             const detailIds = latestMetadata.map(s => String(s.id));
 
             if (detailIds.length === 0) {
@@ -6669,25 +6692,20 @@ const App: React.FC = () => {
             filteredSessions = filteredSessions.filter(s => Number(s.audit_number || 0) === tgtNum);
         }
 
-        const latestByBranch = new Map<string, SupabaseService.DbAuditSession>();
+        const latestByBranchAndNumber = new Map<string, SupabaseService.DbAuditSession>();
         filteredSessions.forEach(session => {
             const branchLabel = normalizeBranchLabel(session.branch);
-            const prev = latestByBranch.get(branchLabel);
+            const auditNumber = Number(session.audit_number || 0);
+            const key = `${branchLabel}_${auditNumber}`;
+            const prev = latestByBranchAndNumber.get(key);
             if (!prev) {
-                latestByBranch.set(branchLabel, session);
+                latestByBranchAndNumber.set(key, session);
                 return;
             }
-            const prevAudit = Number(prev.audit_number || 0);
-            const curAudit = Number(session.audit_number || 0);
-            if (curAudit > prevAudit) {
-                latestByBranch.set(branchLabel, session);
-                return;
-            }
-            if (curAudit < prevAudit) return;
             const prevTs = Date.parse(String(prev.updated_at || prev.created_at || '')) || 0;
             const curTs = Date.parse(String(session.updated_at || session.created_at || '')) || 0;
-            if (curTs > prevTs || (curTs === prevTs && Number(session.audit_number || 0) > Number(prev.audit_number || 0))) {
-                latestByBranch.set(branchLabel, session);
+            if (curTs > prevTs) {
+                latestByBranchAndNumber.set(key, session);
             }
         });
 
@@ -6699,7 +6717,8 @@ const App: React.FC = () => {
                 .trim()
                 .replace(/\D/g, '')
                 .replace(/^0+/, '');
-        latestByBranch.forEach((session, branchLabel) => {
+        latestByBranchAndNumber.forEach((session) => {
+            const branchLabel = normalizeBranchLabel(session.branch);
             const parsedData = parseJsonValue<any>(session.data) || session.data || {};
             const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
             const partialStarts = Array.isArray(parsedData?.partialStarts)
@@ -7137,7 +7156,11 @@ const App: React.FC = () => {
             const numeric = Number((String(label || '').match(/\d+/)?.[0] || '999999'));
             return Number.isFinite(numeric) ? numeric : 999999;
         };
-        branches.sort((a, b) => getBranchOrder(a.branch) - getBranchOrder(b.branch));
+        branches.sort((a, b) => {
+            const branchOrder = getBranchOrder(a.branch) - getBranchOrder(b.branch);
+            if (branchOrder !== 0) return branchOrder;
+            return a.auditNumber - b.auditNumber;
+        });
 
         const areaMap = new Map<string, {
             area: string;
@@ -7285,28 +7308,23 @@ const App: React.FC = () => {
             }
         });
 
-        const latestByBranch = new Map<string, SupabaseService.DbAuditSession>();
+        const latestByBranchAndNumber = new Map<string, SupabaseService.DbAuditSession>();
         dashboardCompletedAuditSessions.forEach(session => {
             if (completedAuditNumberFilter !== 'all' && String(session.audit_number || 0) !== completedAuditNumberFilter) {
                 return;
             }
             const branchLabel = normalizeBranchLabel(session.branch);
-            const prev = latestByBranch.get(branchLabel);
+            const auditNumber = Number(session.audit_number || 0);
+            const key = `${branchLabel}_${auditNumber}`;
+            const prev = latestByBranchAndNumber.get(key);
             if (!prev) {
-                latestByBranch.set(branchLabel, session);
+                latestByBranchAndNumber.set(key, session);
                 return;
             }
-            const prevAudit = Number(prev.audit_number || 0);
-            const curAudit = Number(session.audit_number || 0);
-            if (curAudit > prevAudit) {
-                latestByBranch.set(branchLabel, session);
-                return;
-            }
-            if (curAudit < prevAudit) return;
             const prevTs = Date.parse(String(prev.updated_at || prev.created_at || '')) || 0;
             const curTs = Date.parse(String(session.updated_at || session.created_at || '')) || 0;
-            if (curTs > prevTs || (curTs === prevTs && Number(session.audit_number || 0) > Number(prev.audit_number || 0))) {
-                latestByBranch.set(branchLabel, session);
+            if (curTs > prevTs) {
+                latestByBranchAndNumber.set(key, session);
             }
         });
 
@@ -7318,7 +7336,8 @@ const App: React.FC = () => {
                 .trim()
                 .replace(/\D/g, '')
                 .replace(/^0+/, '');
-        latestByBranch.forEach((session, branchLabel) => {
+        latestByBranchAndNumber.forEach((session) => {
+            const branchLabel = normalizeBranchLabel(session.branch);
             const parsedData = parseJsonValue<any>(session.data) || session.data || {};
             const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
 
@@ -7747,7 +7766,11 @@ const App: React.FC = () => {
             const numeric = Number((String(label || '').match(/\d+/)?.[0] || '999999'));
             return Number.isFinite(numeric) ? numeric : 999999;
         };
-        branches.sort((a, b) => getBranchOrder(a.branch) - getBranchOrder(b.branch));
+        branches.sort((a, b) => {
+            const branchOrder = getBranchOrder(a.branch) - getBranchOrder(b.branch);
+            if (branchOrder !== 0) return branchOrder;
+            return a.auditNumber - b.auditNumber;
+        });
 
         const areaMap = new Map<string, {
             area: string;
