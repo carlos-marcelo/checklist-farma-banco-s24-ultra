@@ -1174,12 +1174,26 @@ const buildGroupedTermRowsFromItems = (items: any[]) => {
     return Object.values(groupedMap).sort((a: any, b: any) => Number(a.diffCost || 0) - Number(b.diffCost || 0));
 };
 
+const getTermScopesFromDraftKey = (draftKey: string) => {
+    if (draftKey.startsWith('custom|')) {
+        const meta = parseCustomDraftKeyMeta(draftKey);
+        return parseCustomTermScopeEntries(meta?.scopesPart || '');
+    }
+
+    const [type, groupId, deptId, catId] = draftKey.split('|');
+    if (!['group', 'department', 'category'].includes(type) || !groupId) return [];
+    return [{
+        groupId,
+        deptId: type === 'department' || type === 'category' ? deptId : undefined,
+        catId: type === 'category' ? catId : undefined
+    }];
+};
+
 const sanitizeTermMetricsForDraftScope = (sourceData: any, draftKey: string, metrics: any) => {
     const normalized = normalizeTermMetricsToOfficial(metrics);
-    if (!normalized || !draftKey.startsWith('custom|')) return normalized;
+    if (!normalized) return normalized;
 
-    const meta = parseCustomDraftKeyMeta(draftKey);
-    const scopes = parseCustomTermScopeEntries(meta?.scopesPart || '');
+    const scopes = getTermScopesFromDraftKey(draftKey);
     if (scopes.length === 0) return normalized;
 
     const scopeEntries = buildTermScopeEntries(sourceData, scopes);
@@ -1623,10 +1637,12 @@ const getAuthoritativeTermMetrics = (
         .filter(([, metrics]) => !!metrics);
     if (metricEntries.length === 0) return null;
 
-    const selectedMetricEntries = selectNonOverlappingTermMetricEntries(sourceData, metricEntries);
-    const globalUnifiedEntries = selectedMetricEntries.filter(([draftKey]) =>
+    const globalUnifiedEntries = metricEntries.filter(([draftKey]) =>
         draftKey.startsWith('custom|') && draftKey.includes(GLOBAL_UNIFIED_TERM_BATCH_ID)
     );
+    const selectedMetricEntries = globalUnifiedEntries.length > 0
+        ? globalUnifiedEntries
+        : metricEntries;
     const pools = selectedMetricEntries.map(([, metrics]) => metrics);
     const merged = mergeExcelMetricsPools(pools);
     if (!merged) return null;
@@ -2028,6 +2044,48 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         activeFilialRef.current = selectedFilial || '';
     }, [selectedFilial]);
 
+    const isAuditDataForBranch = useCallback((auditData: AuditData | null | undefined, branch: string | number | null | undefined) => {
+        const targetBranch = toAuditBranchValue(branch);
+        if (!targetBranch) return true;
+        const dataBranch = toAuditBranchValue((auditData as any)?.filial);
+        return !dataBranch || dataBranch === targetBranch;
+    }, []);
+
+    const withAuditDataBranch = useCallback((auditData: AuditData, branch: string | number | null | undefined): AuditData => {
+        const targetBranch = toAuditBranchValue(branch);
+        if (!targetBranch) return auditData;
+        return { ...auditData, filial: targetBranch };
+    }, []);
+
+    const isAuditSessionForBranch = useCallback((session: DbAuditSession | null | undefined, branch: string | number | null | undefined) => {
+        if (!session) return false;
+        const targetBranch = toAuditBranchValue(branch);
+        if (!targetBranch) return true;
+        const sessionBranch = toAuditBranchValue(session.branch);
+        if (sessionBranch && sessionBranch !== targetBranch) return false;
+        return isAuditDataForBranch((session.data as AuditData) || null, targetBranch);
+    }, [isAuditDataForBranch]);
+
+    const guardAuditSessionForBranch = useCallback((
+        session: DbAuditSession | null | undefined,
+        branch: string | number | null | undefined,
+        source: string
+    ): DbAuditSession | null => {
+        if (!session) return null;
+        if (isAuditSessionForBranch(session, branch)) return session;
+        console.warn(
+            `[AuditFlow] Sessão ignorada por divergência de filial (${source}).`,
+            {
+                expected: toAuditBranchValue(branch),
+                sessionBranch: toAuditBranchValue(session.branch),
+                dataFilial: toAuditBranchValue((session.data as any)?.filial),
+                auditNumber: session.audit_number,
+                sessionId: session.id
+            }
+        );
+        return null;
+    }, [isAuditSessionForBranch]);
+
     const normalizeRemoteAuditSnapshot = useCallback((snapshot: AuditData): AuditData => {
         const nextData = { ...((snapshot || {}) as any) } as AuditData;
         if ((nextData as any).partialStart && !(nextData as any).partialStarts) {
@@ -2063,13 +2121,35 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         return (normalized.data || reconciled) as AuditData;
     }, []);
 
+    const normalizeRemoteAuditSnapshotForBranch = useCallback((
+        snapshot: AuditData,
+        branch: string | number | null | undefined
+    ): AuditData | null => {
+        if (!isAuditDataForBranch(snapshot, branch)) {
+            console.warn('[AuditFlow] Snapshot ignorado antes da normalização por divergência de filial.', {
+                expected: toAuditBranchValue(branch),
+                dataFilial: toAuditBranchValue((snapshot as any)?.filial)
+            });
+            return null;
+        }
+        const normalized = normalizeRemoteAuditSnapshot(snapshot);
+        if (!isAuditDataForBranch(normalized, branch)) {
+            console.warn('[AuditFlow] Snapshot ignorado após normalização por divergência de filial.', {
+                expected: toAuditBranchValue(branch),
+                dataFilial: toAuditBranchValue((normalized as any)?.filial)
+            });
+            return null;
+        }
+        return withAuditDataBranch(normalized, branch);
+    }, [isAuditDataForBranch, normalizeRemoteAuditSnapshot, withAuditDataBranch]);
+
     const fetchFreshOpenAuditSnapshot = useCallback(async (): Promise<{
         session: DbAuditSession;
         data: AuditData;
         drafts: Record<string, TermForm>;
     } | null> => {
         if (!selectedFilial) return null;
-        const latest = await fetchLatestAudit(selectedFilial);
+        const latest = guardAuditSessionForBranch(await fetchLatestAudit(selectedFilial), selectedFilial, 'fresh-open');
         if (!latest?.data || latest.status === 'completed') return null;
         const sameAudit =
             !dbSessionId ||
@@ -2077,7 +2157,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             latest.audit_number === nextAuditNumber;
         if (!sameAudit) return null;
 
-        const normalizedData = normalizeRemoteAuditSnapshot(latest.data as AuditData);
+        const normalizedData = normalizeRemoteAuditSnapshotForBranch(latest.data as AuditData, selectedFilial);
+        if (!normalizedData) return null;
         const remoteDrafts = (((normalizedData as any).termDrafts || {}) as Record<string, TermForm>);
         const mergedDrafts = composeTermDraftsForPersist(remoteDrafts, termDraftsRef.current);
         const nextDataWithDrafts = { ...normalizedData, termDrafts: mergedDrafts } as AuditData;
@@ -2094,7 +2175,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
 
         return { session: latest, data: nextDataWithDrafts, drafts: mergedDrafts };
-    }, [composeTermDraftsForPersist, dbSessionId, nextAuditNumber, normalizeRemoteAuditSnapshot, selectedFilial]);
+    }, [composeTermDraftsForPersist, dbSessionId, guardAuditSessionForBranch, nextAuditNumber, normalizeRemoteAuditSnapshotForBranch, selectedFilial]);
 
     useEffect(() => {
         if (allowedCompanies.length === 0) return;
@@ -2160,31 +2241,38 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (hasPendingSync && typeof navigator !== 'undefined' && navigator.onLine && localData && !silent) {
                 try {
                     setIsSyncing(true);
-                    const localBranch = String(localData.filial || selectedFilial || '').trim();
-                    const localAuditNumber = getAuditNumberFromInventoryLabel((localData as any).inventoryNumber) || nextAuditNumber;
-                    const existingTarget = localBranch
-                        ? await fetchAuditSession(localBranch, localAuditNumber)
-                        : null;
-                    if (!dbSessionId && (!existingTarget || existingTarget.status === 'completed')) {
+                    const localBranch = toAuditBranchValue(localData.filial || selectedFilial || '');
+                    if (localBranch && localBranch !== requestedFilial) {
                         console.warn(
-                            `Sincronização local pendente ignorada: não há inventário aberto Nº ${localAuditNumber} na filial ${localBranch || selectedFilial}.`
+                            `[AuditFlow] Sincronização local pendente ignorada: dados da filial ${localBranch} não pertencem à filial selecionada ${requestedFilial}.`
                         );
-                        await AuditStorage.saveLocalAuditSession(localData, false);
                         setLocalPendingAudit(null);
                     } else {
-                        const synced = await upsertAuditSession({
-                            id: dbSessionId || existingTarget?.id,
-                            branch: localBranch || selectedFilial,
-                            audit_number: localAuditNumber,
-                            status: 'open',
-                            data: localData,
-                            progress: calculateProgress(localData),
-                            user_email: userEmail,
-                            updated_at: lastAuditUpdateRef.current || undefined
-                        });
-                        if (synced) {
+                        const localAuditNumber = getAuditNumberFromInventoryLabel((localData as any).inventoryNumber) || nextAuditNumber;
+                        const existingTarget = localBranch
+                            ? guardAuditSessionForBranch(await fetchAuditSession(localBranch, localAuditNumber), localBranch, 'pending-local-sync')
+                            : null;
+                        if (!dbSessionId && (!existingTarget || existingTarget.status === 'completed')) {
+                            console.warn(
+                                `Sincronização local pendente ignorada: não há inventário aberto Nº ${localAuditNumber} na filial ${localBranch || selectedFilial}.`
+                            );
                             await AuditStorage.saveLocalAuditSession(localData, false);
-                            console.log("Sincronização automática concluída com sucesso.");
+                            setLocalPendingAudit(null);
+                        } else {
+                            const synced = await upsertAuditSession({
+                                id: dbSessionId || existingTarget?.id,
+                                branch: localBranch || selectedFilial,
+                                audit_number: localAuditNumber,
+                                status: 'open',
+                                data: localData,
+                                progress: calculateProgress(localData),
+                                user_email: userEmail,
+                                updated_at: lastAuditUpdateRef.current || undefined
+                            });
+                            if (synced) {
+                                await AuditStorage.saveLocalAuditSession(localData, false);
+                                console.log("Sincronização automática concluída com sucesso.");
+                            }
                         }
                     }
                 } catch (e) {
@@ -2196,15 +2284,22 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             const cacheKey = `audit_session_${selectedFilial}`;
             const backupKey = `audit_session_lastgood_${selectedFilial}`;
-            const latestFromDb = await fetchLatestAudit(selectedFilial);
+            const latestFromDbRaw = await fetchLatestAudit(selectedFilial);
+            const latestFromDb = guardAuditSessionForBranch(latestFromDbRaw, selectedFilial, 'latest-db');
+            if (latestFromDbRaw && !latestFromDb) {
+                await CacheService.remove(cacheKey);
+                await CacheService.remove(backupKey);
+            }
             if (latestFromDb) {
                 await CacheService.set(cacheKey, latestFromDb as any);
                 if (latestFromDb.data && getAuditDataStrength(latestFromDb.data as AuditData) > 0) {
                     await CacheService.set(backupKey, latestFromDb as any);
                 }
             }
-            const cachedCurrent = !silent ? await CacheService.get<DbAuditSession>(cacheKey) : null;
-            const cachedBackup = await CacheService.get<DbAuditSession>(backupKey);
+            const cachedCurrent = !silent
+                ? guardAuditSessionForBranch(await CacheService.get<DbAuditSession>(cacheKey), selectedFilial, 'cache-current')
+                : null;
+            const cachedBackup = guardAuditSessionForBranch(await CacheService.get<DbAuditSession>(backupKey), selectedFilial, 'cache-lastgood');
 
             let latest: DbAuditSession | null = null;
             if (latestFromDb) {
@@ -2267,7 +2362,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 }
                 const reconciled = reconcileAuditStateFromCompletedScopes(latest.data as AuditData);
                 const normalized = normalizeAuditDataStructure(reconciled);
-                const normalizedData = (normalized.data || reconciled) as AuditData;
+                const normalizedData = normalizeRemoteAuditSnapshotForBranch((normalized.data || reconciled) as AuditData, requestedFilial);
+                if (!normalizedData) return;
                 setData(normalizedData);
                 setTermDrafts(current =>
                     composeTermDraftsForPersist(
@@ -2377,9 +2473,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             });
                         });
                     }
-                    const reconciled = reconcileAuditStateFromCompletedScopes(latest.data as AuditData);
-                    const normalized = normalizeAuditDataStructure(reconciled);
-                    const normalizedData = (normalized.data || reconciled) as AuditData;
+                    const normalizedData = normalizeRemoteAuditSnapshotForBranch(latest.data as AuditData, requestedFilial);
+                    if (!normalizedData) return;
                     setData(normalizedData);
                     const draftsFromData = ((normalizedData as any).termDrafts || {}) as Record<string, TermForm>;
                     setTermDrafts(current => composeTermDraftsForPersist(draftsFromData, current));
@@ -2469,7 +2564,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } catch (error) {
             console.error('Error loading audit info:', error);
         }
-    }, [selectedFilial, selectedCompany?.id, dbSessionId, canUseAuditMasterTools, data, isUpdatingStock, isReadOnlyCompletedView, consultingAuditNumber, allowActiveAuditAutoOpen, isAuditSessionConfirmed, markAuditSessionConfirmed]);
+    }, [selectedFilial, selectedCompany?.id, dbSessionId, canUseAuditMasterTools, data, isUpdatingStock, isReadOnlyCompletedView, consultingAuditNumber, allowActiveAuditAutoOpen, isAuditSessionConfirmed, markAuditSessionConfirmed, guardAuditSessionForBranch, normalizeRemoteAuditSnapshotForBranch]);
 
     // Carga Inicial
     useEffect(() => {
@@ -2819,10 +2914,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     useEffect(() => {
         if (data) {
+            if (selectedFilial && !isAuditDataForBranch(data, selectedFilial)) {
+                console.warn('[AuditFlow] Backup local ignorado por divergência de filial.', {
+                    selectedFilial,
+                    dataFilial: toAuditBranchValue((data as any)?.filial)
+                });
+                return;
+            }
             // Preserva a flag de pendingSync se ela já existir no data
-            AuditStorage.saveLocalAuditSession(data, !!data.pendingSync);
+            AuditStorage.saveLocalAuditSession(
+                selectedFilial ? withAuditDataBranch(data, selectedFilial) : data,
+                !!data.pendingSync
+            );
         }
-    }, [data]);
+    }, [data, isAuditDataForBranch, selectedFilial, withAuditDataBranch]);
 
     const handleSelectedFilialChange = useCallback((value: string) => {
         setSelectedFilial(value);
@@ -2835,10 +2940,24 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         session: DbAuditSession,
         options?: { allowProgressRegression?: boolean; allowCreate?: boolean; allowReopen?: boolean }
     ): Promise<DbAuditSession | null> => {
-        const branch = String(session.branch || '');
+        const branch = toAuditBranchValue(session.branch || '');
         if (!branch || !session.audit_number) return null;
 
-        const incomingData = (session.data as AuditData) || null;
+        const rawIncomingData = (session.data as AuditData) || null;
+        if (rawIncomingData && !isAuditDataForBranch(rawIncomingData, branch)) {
+            console.warn('[AuditFlow] Salvamento bloqueado por divergência de filial.', {
+                expected: branch,
+                dataFilial: toAuditBranchValue((rawIncomingData as any)?.filial),
+                auditNumber: session.audit_number
+            });
+            alert(
+                `Bloqueamos o salvamento porque os dados pertencem à filial ${toAuditBranchValue((rawIncomingData as any)?.filial) || 'N/D'} ` +
+                `e o inventário aberto é da filial ${branch}.`
+            );
+            return null;
+        }
+        const incomingData = rawIncomingData ? withAuditDataBranch(rawIncomingData, branch) : null;
+        session = { ...session, branch, data: incomingData as any };
         const incomingStrength = getAuditDataStrength(incomingData);
         const incomingProgress = Number(session.progress || 0);
 
@@ -2860,9 +2979,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const allowCreate = !!options?.allowCreate;
             const allowReopen = !!options?.allowReopen;
 
-            const freshLatest = isSameAudit ? await fetchLatestAudit(branch) : null;
-            const latestSession = freshLatest || (isSameAudit ? null : await fetchLatestAudit(branch));
-            const exactSession = await fetchAuditSession(branch, session.audit_number);
+            const freshLatest = isSameAudit
+                ? guardAuditSessionForBranch(await fetchLatestAudit(branch), branch, 'persist-fresh')
+                : null;
+            const latestSession = freshLatest || (isSameAudit
+                ? null
+                : guardAuditSessionForBranch(await fetchLatestAudit(branch), branch, 'persist-latest'));
+            const exactSession = guardAuditSessionForBranch(
+                await fetchAuditSession(branch, session.audit_number),
+                branch,
+                'persist-exact'
+            );
 
             if (!session.id && exactSession?.id) {
                 session = { ...session, id: exactSession.id };
@@ -3006,10 +3133,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 }
             }
 
-            const normalizedIncoming = normalizeAuditDataStructure((session.data as AuditData) || null);
+            const normalizedIncoming = normalizeAuditDataStructure(incomingData || null);
             const saved = await upsertAuditSession({
                 ...session,
-                data: (normalizedIncoming.data || session.data) as any,
+                data: (normalizedIncoming.data
+                    ? withAuditDataBranch(normalizedIncoming.data as AuditData, branch)
+                    : incomingData) as any,
                 updated_at: baseUpdatedAt || undefined
             });
             
@@ -3275,7 +3404,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
 
         try {
-            const target = await fetchAuditSession(selectedFilial, targetAuditNumber);
+            const target = guardAuditSessionForBranch(
+                await fetchAuditSession(selectedFilial, targetAuditNumber),
+                selectedFilial,
+                'reopen-target'
+            );
             if (!target) {
                 alert(`Inventário Nº ${targetAuditNumber} não encontrado na filial ${selectedFilial}.`);
                 return false;
@@ -3285,7 +3418,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return false;
             }
 
-            const latest = await fetchLatestAudit(selectedFilial);
+            const latest = guardAuditSessionForBranch(
+                await fetchLatestAudit(selectedFilial),
+                selectedFilial,
+                'reopen-latest'
+            );
             if (latest && latest.status !== 'completed' && latest.audit_number !== targetAuditNumber) {
                 alert(
                     `Já existe um inventário em aberto (Nº ${latest.audit_number}) nesta filial.\n\n` +
@@ -3319,7 +3456,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             await CacheService.set(`audit_session_${selectedFilial}`, reopened as any);
             markAuditSessionConfirmed(reopened.id || '');
-            const payload = ((reopened.data || {}) as AuditData);
+            const payload = normalizeRemoteAuditSnapshotForBranch((reopened.data || {}) as AuditData, selectedFilial);
+            if (!payload) {
+                alert("Reabertura bloqueada: os dados retornados não pertencem à filial selecionada.");
+                return false;
+            }
             if (payload.groups) {
                 payload.groups.forEach((g: any) => {
                     g.departments?.forEach((d: any) => {
@@ -3334,7 +3475,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     });
                 });
             }
-            const reconciled = reconcileAuditStateFromCompletedScopes(payload);
+            const reconciled = withAuditDataBranch(reconcileAuditStateFromCompletedScopes(payload), selectedFilial);
             completedAuditConsultationRef.current = false;
             setAllowActiveAuditAutoOpen(true);
             setConsultingAuditNumber(null);
@@ -3396,7 +3537,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         try {
             setIsProcessing(true);
-            const target = await fetchAuditSession(selectedFilial, targetAuditNumber);
+            const target = guardAuditSessionForBranch(
+                await fetchAuditSession(selectedFilial, targetAuditNumber),
+                selectedFilial,
+                'completed-target'
+            );
             if (!target) {
                 alert(`Inventário Nº ${targetAuditNumber} não encontrado na filial ${selectedFilial}.`);
                 return false;
@@ -3406,7 +3551,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return false;
             }
 
-            const payload = (target.data || {}) as AuditData;
+            const payload = normalizeRemoteAuditSnapshotForBranch((target.data || {}) as AuditData, selectedFilial);
+            if (!payload) {
+                alert("Abertura bloqueada: os dados retornados não pertencem à filial selecionada.");
+                return false;
+            }
             completedAuditConsultationRef.current = true;
             if (payload.groups) {
                 payload.groups.forEach((g: any) => {
@@ -3417,7 +3566,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     });
                 });
             }
-            const reconciled = reconcileAuditStateFromCompletedScopes(payload);
+            const reconciled = withAuditDataBranch(reconcileAuditStateFromCompletedScopes(payload), selectedFilial);
             setIsReadOnlyCompletedView(true);
             setConsultingAuditNumber(target.audit_number);
             setNextAuditNumber(target.audit_number);
@@ -3456,7 +3605,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         try {
             setIsProcessing(true);
-            const target = await fetchAuditSession(selectedFilial, targetAuditNumber);
+            const target = guardAuditSessionForBranch(
+                await fetchAuditSession(selectedFilial, targetAuditNumber),
+                selectedFilial,
+                'resume-open'
+            );
             if (!target) {
                 alert(`Inventário Nº ${targetAuditNumber} não encontrado na filial ${selectedFilial}.`);
                 return;
@@ -3466,7 +3619,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return;
             }
 
-            const payload = (target.data || {}) as AuditData;
+            const payload = normalizeRemoteAuditSnapshotForBranch((target.data || {}) as AuditData, selectedFilial);
+            if (!payload) {
+                alert("Retomada bloqueada: os dados retornados não pertencem à filial selecionada.");
+                return;
+            }
             if (payload.groups) {
                 payload.groups.forEach((g: any) => {
                     g.departments?.forEach((d: any) => {
@@ -3481,7 +3638,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     });
                 });
             }
-            const reconciled = reconcileAuditStateFromCompletedScopes(payload);
+            const reconciled = withAuditDataBranch(reconcileAuditStateFromCompletedScopes(payload), selectedFilial);
             completedAuditConsultationRef.current = false;
             setData(reconciled);
             setTermDrafts(((reconciled as any)?.termDrafts || {}) as Record<string, TermForm>);
@@ -5330,9 +5487,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const getScopedMetrics = useCallback((scope: { type: 'group' | 'department' | 'category', groupId: string, deptId?: string, catId?: string }) => {
         const tk = buildTermKey(scope as any);
         const directDraft = termDrafts[tk];
-        const backupMetrics = (((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>)[tk];
+        const metricsStore = (((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>);
+        const backupMetrics = metricsStore[tk];
         if (directDraft?.excelMetricsRemovedAt && !directDraft?.excelMetrics) return null;
-        const draftMetrics = pickPreferredTermMetrics(directDraft?.excelMetrics, backupMetrics);
+        const draftMetrics = sanitizeTermMetricsForDraftScope(
+            data,
+            tk,
+            pickPreferredTermMetrics(directDraft?.excelMetrics, backupMetrics)
+        );
         const group = data?.groups?.find(g => normalizeScopeId(g.id) === normalizeScopeId(scope.groupId));
         if (!group) return null;
         const gName = normalizeText(group.name);
@@ -5457,25 +5619,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
             return next;
         };
-        // Se houver draft direto, filtra pelo escopo para evitar contaminação entre grupos.
-        // Se não houver nenhum match (dados legados), mantém total bruto para não apagar.
-        if (draftMetrics) {
-            if (scope.type === 'group') {
-                return getWholeTermMetricsTotals(draftMetrics);
-            }
-            const directItems = (draftMetrics.items || []).filter((it: any) => matchScopeRecord(it));
-            const directGrouped = (draftMetrics.groupedDifferences || []).filter((d: any) => matchScopeRecord(d));
-            const source = directItems.length > 0
-                ? directItems
-                : (directGrouped.length > 0 ? directGrouped : null);
-            if (source) {
-                const allSourceRows = directItems.length > 0
-                    ? (draftMetrics.items || []).filter((it: any) => !isTermMetadataRow(it))
-                    : (draftMetrics.groupedDifferences || []);
-                return applyOfficialTermScale(summarizeScopedRows(source), allSourceRows, draftMetrics);
-            }
-            return null;
-        }
         const makeScopeCatKeys = (s: { groupId?: string; deptId?: string; catId?: string }) =>
             new Set(
                 getScopeCategories(s.groupId, s.deptId, s.catId)
@@ -5511,22 +5654,39 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
             return false;
         };
-        const scopedEntries = Object.entries(termDrafts || {})
-            .filter(([draftKey, draft]) => {
-                if (!draft?.excelMetrics || draft?.excelMetricsRemovedAt) return false;
-                if (!draftTouchesScope(draftKey)) return false;
-                return true;
-            })
-            .map(([draftKey, draft]) => ({ draftKey, draft: draft! }));
-        const selectedScopedEntries = selectNonOverlappingTermMetricEntries(
-            data,
-            scopedEntries.map(({ draftKey, draft }) => [draftKey, draft.excelMetrics] as [string, any])
-        ).map(([draftKey, metrics]) => ({
-            draftKey,
-            draft: { excelMetrics: metrics } as TermForm
-        }));
+        const scopedEntriesByKey = new Map<string, { draftKey: string; metrics: any }>();
+        Object.entries(metricsStore || {}).forEach(([draftKey, metrics]) => {
+            if (!metrics || !draftTouchesScope(draftKey)) return;
+            if (!isTermDraftBatchActive(data, draftKey)) return;
+            scopedEntriesByKey.set(draftKey, {
+                draftKey,
+                metrics: sanitizeTermMetricsForDraftScope(data, draftKey, metrics)
+            });
+        });
+        Object.entries(termDrafts || {}).forEach(([draftKey, draft]) => {
+            if (draft?.excelMetricsRemovedAt && !draft?.excelMetrics) {
+                scopedEntriesByKey.delete(draftKey);
+                return;
+            }
+            if (!draft?.excelMetrics || !draftTouchesScope(draftKey)) return;
+            if (!isTermDraftBatchActive(data, draftKey)) return;
+            const current = scopedEntriesByKey.get(draftKey);
+            const preferred = pickPreferredTermMetrics(draft.excelMetrics, current?.metrics);
+            if (!preferred) return;
+            scopedEntriesByKey.set(draftKey, {
+                draftKey,
+                metrics: sanitizeTermMetricsForDraftScope(data, draftKey, preferred)
+            });
+        });
+        const scopedEntries = Array.from(scopedEntriesByKey.values()).filter(entry => !!entry.metrics);
+        const globalUnifiedScopedEntries = scopedEntries.filter(({ draftKey }) =>
+            draftKey.startsWith('custom|') && draftKey.includes(GLOBAL_UNIFIED_TERM_BATCH_ID)
+        );
+        const selectedScopedEntries = globalUnifiedScopedEntries.length > 0
+            ? globalUnifiedScopedEntries
+            : scopedEntries;
         const scopedPools = selectedScopedEntries
-            .map(({ draft }) => draft.excelMetrics)
+            .map(({ metrics }) => metrics)
             .filter(Boolean);
         if (scope.type === 'group' && selectedScopedEntries.length > 0) {
             const targetGroup = normalizeScopeId(scope.groupId);
@@ -5554,8 +5714,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return getWholeTermMetricsTotals(mergeExcelMetricsPools(scopedPools as any[]));
             }
         }
-        // Prioridade: Rascunho do próprio termo > Soma dos termos do mesmo grupo
-        const base = draftMetrics || mergeExcelMetricsPools(scopedPools as any[]);
+        // Para os cards, a fonte final é a soma dos termos ativos que tocam o escopo.
+        // O rascunho direto fica só como fallback quando não há pool encontrado.
+        const base = mergeExcelMetricsPools(scopedPools as any[]) || draftMetrics;
 
         if (!base || !base.groupedDifferences) return null;
 
@@ -5852,6 +6013,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         metrics: any | null,
         scope: { groupId?: string; deptId?: string; catId?: string }
     ) => {
+        if (metrics && metricsContainsPostAuditAdjustments(metrics)) return metrics;
         const adjustments = getPostAuditAdjustmentTotalsForTermScope(scope);
         if (!metrics) {
             if (Math.abs(adjustments.quantity) <= 0.01 && Math.abs(adjustments.cost) <= 0.01) return null;
@@ -5871,7 +6033,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             diffQty: Number(metrics.diffQty || 0) + Number(adjustments.quantity || 0),
             diffCost: roundAuditMoney(Number(metrics.diffCost || 0) + Number(adjustments.cost || 0))
         };
-    }, [getPostAuditAdjustmentTotalsForTermScope]);
+    }, [getPostAuditAdjustmentTotalsForTermScope, metricsContainsPostAuditAdjustments]);
 
     const getAdjustedAuditedCostForScope = useCallback((
         rawAuditedCost: number,
