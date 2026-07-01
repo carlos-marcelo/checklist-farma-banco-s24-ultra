@@ -287,6 +287,143 @@ const normalizeAuditCategoryStatus = (status: unknown): 'done' | 'in_progress' |
     return 'todo';
 };
 
+const normalizeAuditScopeValue = (value: unknown) =>
+    String(value ?? '').trim().toLowerCase();
+
+const normalizeAuditScopeDigits = (value: unknown) =>
+    String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
+
+const auditScopeInputMatches = (input: string | undefined, values: unknown[]) => {
+    const rawInput = normalizeAuditScopeValue(input);
+    if (!rawInput) return true;
+    const digitInput = normalizeAuditScopeDigits(input);
+    return values.some(value => {
+        const rawValue = normalizeAuditScopeValue(value);
+        const digitValue = normalizeAuditScopeDigits(value);
+        return (!!rawValue && rawValue === rawInput) || (!!digitInput && !!digitValue && digitValue === digitInput);
+    });
+};
+
+const auditPartialScopeKey = (scope: { groupId?: unknown; deptId?: unknown; catId?: unknown }) =>
+    [
+        normalizeAuditScopeValue(scope.groupId),
+        normalizeAuditScopeValue(scope.deptId),
+        normalizeAuditScopeValue(scope.catId)
+    ].join('|');
+
+const getAuditDataScopeCategories = (
+    auditData: any,
+    scope: { groupId?: string; deptId?: string; catId?: string }
+) => {
+    const out: Array<{ group: any; dept: any; cat: any; key: string }> = [];
+    const groups = Array.isArray(auditData?.groups) ? auditData.groups : [];
+    groups.forEach((group: any) => {
+        if (!auditScopeInputMatches(scope.groupId, [group?.id, group?.numericId])) return;
+        (group?.departments || []).forEach((dept: any) => {
+            if (!auditScopeInputMatches(scope.deptId, [dept?.id, dept?.numericId])) return;
+            (dept?.categories || []).forEach((cat: any) => {
+                if (!auditScopeInputMatches(scope.catId, [cat?.id, cat?.numericId])) return;
+                out.push({
+                    group,
+                    dept,
+                    cat,
+                    key: auditPartialScopeKey({ groupId: group?.id, deptId: dept?.id, catId: cat?.id })
+                });
+            });
+        });
+    });
+    return out;
+};
+
+const calculateAuditDataProgress = (auditData: any) => {
+    let totalSkus = 0;
+    let doneSkus = 0;
+    (Array.isArray(auditData?.groups) ? auditData.groups : []).forEach((group: any) => {
+        (group?.departments || []).forEach((dept: any) => {
+            (dept?.categories || []).forEach((cat: any) => {
+                const itemsCount = Number(cat?.itemsCount || 0);
+                totalSkus += itemsCount;
+                if (normalizeAuditCategoryStatus(cat?.status) === 'done') {
+                    doneSkus += itemsCount;
+                }
+            });
+        });
+    });
+    return totalSkus > 0 ? (doneSkus / totalSkus) * 100 : 0;
+};
+
+const addAreaPartialScopeToAuditData = (
+    auditData: any,
+    scope: { groupId?: string; deptId?: string; catId?: string },
+    startedAt: string
+) => {
+    const targetEntries = getAuditDataScopeCategories(auditData, scope)
+        .filter(({ cat }) => normalizeAuditCategoryStatus(cat?.status) !== 'done');
+    if (targetEntries.length === 0) {
+        return { data: auditData, matchedCategories: 0, addedCategories: 0 };
+    }
+
+    const targetKeys = new Set(targetEntries.map(entry => entry.key));
+    const existingStarts = Array.isArray(auditData?.partialStarts)
+        ? auditData.partialStarts
+        : (auditData?.partialStart ? [auditData.partialStart] : []);
+    const partialMap = new Map<string, { startedAt: string; groupId: string; deptId: string; catId: string }>();
+
+    existingStarts.forEach((partial: any) => {
+        const expanded = getAuditDataScopeCategories(auditData, {
+            groupId: partial?.groupId,
+            deptId: partial?.deptId,
+            catId: partial?.catId
+        }).filter(({ cat }) => normalizeAuditCategoryStatus(cat?.status) !== 'done');
+        expanded.forEach(({ group, dept, cat, key }) => {
+            if (partialMap.has(key)) return;
+            partialMap.set(key, {
+                startedAt: String(partial?.startedAt || startedAt),
+                groupId: normalizeAuditScopeValue(group?.id),
+                deptId: normalizeAuditScopeValue(dept?.id),
+                catId: normalizeAuditScopeValue(cat?.id)
+            });
+        });
+    });
+
+    const previousSize = partialMap.size;
+    targetEntries.forEach(({ group, dept, cat, key }) => {
+        partialMap.set(key, {
+            startedAt,
+            groupId: normalizeAuditScopeValue(group?.id),
+            deptId: normalizeAuditScopeValue(dept?.id),
+            catId: normalizeAuditScopeValue(cat?.id)
+        });
+    });
+
+    const baseData = { ...(auditData || {}) };
+    delete (baseData as any).partialStart;
+    const nextPartials = Array.from(partialMap.values());
+    const nextData = {
+        ...baseData,
+        partialStarts: nextPartials,
+        partialCompleted: Array.isArray(auditData?.partialCompleted) ? auditData.partialCompleted : [],
+        groups: (Array.isArray(auditData?.groups) ? auditData.groups : []).map((group: any) => ({
+            ...group,
+            departments: (group?.departments || []).map((dept: any) => ({
+                ...dept,
+                categories: (dept?.categories || []).map((cat: any) => {
+                    const key = auditPartialScopeKey({ groupId: group?.id, deptId: dept?.id, catId: cat?.id });
+                    if (!targetKeys.has(key) && !partialMap.has(key)) return cat;
+                    if (normalizeAuditCategoryStatus(cat?.status) === 'done') return { ...cat, status: 'concluido' };
+                    return { ...cat, status: 'iniciado' };
+                })
+            }))
+        }))
+    };
+
+    return {
+        data: nextData,
+        matchedCategories: targetEntries.length,
+        addedCategories: Math.max(0, partialMap.size - previousSize)
+    };
+};
+
 const formatBranchFilterLabel = (value: string) => {
     const canonical = canonicalizeFilterLabel(value);
     return canonical.replace(/\d+/g, digits => digits.padStart(2, '0')).toUpperCase();
@@ -2149,6 +2286,7 @@ const App: React.FC = () => {
     const [completedDashboardAuditsFetchedAt, setCompletedDashboardAuditsFetchedAt] = useState<string | null>(null);
     const [completedAuditNumberFilter, setCompletedAuditNumberFilter] = useState<string>('all');
     const [dashboardClockMinute, setDashboardClockMinute] = useState(() => Date.now());
+    const [areaPartialActionLoading, setAreaPartialActionLoading] = useState<string | null>(null);
     const [auditJumpFilial, setAuditJumpFilial] = useState<string>('');
     const [auditManualBranchSelectionRequired, setAuditManualBranchSelectionRequired] = useState(() =>
         typeof window !== 'undefined' && window.sessionStorage.getItem(AUDIT_MANUAL_BRANCH_SELECTION_KEY) === '1'
@@ -8250,6 +8388,177 @@ const App: React.FC = () => {
     }, [dashboardCompletedAuditSessions, scopedCompanies, scopedUsers, completedAuditNumberFilter]);
 
 
+    const handleOpenAreaPartialFromDashboard = useCallback(async (areaName: string) => {
+        if (!currentUser || areaPartialActionLoading) return;
+        const cleanAreaName = String(areaName || '').trim();
+        if (!cleanAreaName) return;
+
+        const groupInput = window.prompt(
+            `Abrir contagem parcial na ${cleanAreaName}.\n\nDigite o número do GRUPO.\nDeixe em branco para abrir a área inteira.`
+        );
+        if (groupInput === null) return;
+        const deptInput = window.prompt(
+            'Digite o número do DEPARTAMENTO.\nDeixe em branco para puxar todos os departamentos do grupo/área.'
+        );
+        if (deptInput === null) return;
+        const catInput = window.prompt(
+            'Digite o número da CATEGORIA.\nDeixe em branco para puxar todas as categorias abaixo do escopo informado.'
+        );
+        if (catInput === null) return;
+
+        const scope = {
+            groupId: String(groupInput || '').trim() || undefined,
+            deptId: String(deptInput || '').trim() || undefined,
+            catId: String(catInput || '').trim() || undefined
+        };
+        const scopeLabel = [
+            scope.groupId ? `Grupo ${scope.groupId}` : 'Área inteira',
+            scope.deptId ? `Departamento ${scope.deptId}` : null,
+            scope.catId ? `Categoria ${scope.catId}` : null
+        ].filter(Boolean).join(' / ');
+
+        const areaBranches = dashboardAuditOverview.branches.filter(branch => branch.area === cleanAreaName);
+        if (areaBranches.length === 0) {
+            alert('Não há auditorias abertas nessa área.');
+            return;
+        }
+
+        const eligibleCount = areaBranches.filter(branch => !branch.hasOpenPartial).length;
+        if (eligibleCount === 0) {
+            alert('Todas as filiais dessa área já têm contagem parcial aberta. Nenhuma nova parcial foi criada.');
+            return;
+        }
+
+        const confirmMessage = [
+            `Abrir parcial em ${eligibleCount} filial(is) da ${cleanAreaName}?`,
+            `Escopo: ${scopeLabel}.`,
+            'Filiais que já possuem parcial aberta serão ignoradas.'
+        ].join('\n');
+        if (!window.confirm(confirmMessage)) return;
+
+        setAreaPartialActionLoading(cleanAreaName);
+        const startedAt = new Date().toISOString();
+        const updatedSessions: SupabaseService.DbAuditSession[] = [];
+        const skippedWithPartial: string[] = [];
+        const skippedNoScope: string[] = [];
+        const failedBranches: string[] = [];
+
+        try {
+            for (const branchMetric of areaBranches) {
+                const branchLabel = normalizeBranchLabel(branchMetric.branch);
+                const auditNumber = Number(branchMetric.auditNumber || 0);
+                const session = dashboardAuditSessions.find(row =>
+                    normalizeBranchLabel(row.branch) === branchLabel &&
+                    Number(row.audit_number || 0) === auditNumber &&
+                    row.status === 'open'
+                );
+
+                if (!session) {
+                    failedBranches.push(`${branchLabel} (sessão não encontrada)`);
+                    continue;
+                }
+
+                const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+                const activePartials = Array.isArray(parsedData?.partialStarts)
+                    ? parsedData.partialStarts
+                    : (parsedData?.partialStart ? [parsedData.partialStart] : []);
+                if (branchMetric.hasOpenPartial || activePartials.filter(Boolean).length > 0) {
+                    skippedWithPartial.push(branchLabel);
+                    continue;
+                }
+
+                const result = addAreaPartialScopeToAuditData(parsedData, scope, startedAt);
+                if (result.matchedCategories === 0 || result.addedCategories === 0) {
+                    skippedNoScope.push(branchLabel);
+                    continue;
+                }
+
+                const nextData = {
+                    ...result.data,
+                    filial: session.branch
+                };
+                const saved = await SupabaseService.upsertAuditSession({
+                    ...session,
+                    status: 'open',
+                    data: nextData,
+                    progress: calculateAuditDataProgress(nextData),
+                    user_email: currentUser.email || session.user_email
+                });
+
+                if (!saved) {
+                    failedBranches.push(branchLabel);
+                    continue;
+                }
+
+                updatedSessions.push(saved);
+                await Promise.all(buildBranchQueryVariants(session.branch).map(variant =>
+                    CacheService.remove(`audit_session_${variant}`)
+                ));
+            }
+
+            if (updatedSessions.length > 0) {
+                const updatedByKey = new Map(updatedSessions.map(session => [
+                    `${normalizeBranchLabel(session.branch)}_${Number(session.audit_number || 0)}`,
+                    session
+                ]));
+                setDashboardAuditSessions(prev => prev.map(session => {
+                    const key = `${normalizeBranchLabel(session.branch)}_${Number(session.audit_number || 0)}`;
+                    return updatedByKey.get(key) || session;
+                }));
+
+                const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates)).filter(Boolean);
+                const dashboardCacheKey = buildAuditDashboardCacheKey('open', queryBranches);
+                await Promise.all([
+                    CacheService.remove(dashboardCacheKey),
+                    CacheService.remove(`${dashboardCacheKey}_meta`)
+                ]);
+                setDashboardAuditsFetchedAt(new Date().toISOString());
+            }
+
+            SupabaseService.insertAppEventLog({
+                company_id: currentUser.company_id || null,
+                branch: null,
+                area: cleanAreaName,
+                user_email: currentUser.email,
+                user_name: currentUser.name || null,
+                app: 'auditoria',
+                event_type: 'audit_partial_start',
+                entity_type: 'area_partial_scope',
+                entity_id: cleanAreaName,
+                status: failedBranches.length > 0 ? 'partial' : 'success',
+                success: failedBranches.length === 0,
+                source: 'web',
+                event_meta: {
+                    scope,
+                    applied_branches: updatedSessions.map(session => normalizeBranchLabel(session.branch)),
+                    skipped_with_partial: skippedWithPartial,
+                    skipped_no_scope: skippedNoScope,
+                    failed_branches: failedBranches
+                }
+            }).catch(() => { });
+
+            const summaryLines = [
+                `Parcial aberta em ${updatedSessions.length} filial(is).`,
+                skippedWithPartial.length > 0 ? `Ignoradas com parcial aberta: ${skippedWithPartial.join(', ')}.` : null,
+                skippedNoScope.length > 0 ? `Sem itens no escopo informado: ${skippedNoScope.join(', ')}.` : null,
+                failedBranches.length > 0 ? `Falha ao salvar: ${failedBranches.join(', ')}.` : null
+            ].filter(Boolean);
+            alert(summaryLines.join('\n'));
+        } catch (error) {
+            console.error('Erro ao abrir parcial por área:', error);
+            alert('Erro ao abrir parcial por área. Nenhuma filial com falha foi alterada.');
+        } finally {
+            setAreaPartialActionLoading(null);
+        }
+    }, [
+        currentUser,
+        areaPartialActionLoading,
+        dashboardAuditOverview.branches,
+        dashboardAuditSessions,
+        dashboardAuditBranchCandidates,
+        buildAuditDashboardCacheKey
+    ]);
+
     const handleOpenAuditFromDashboardBranch = useCallback((branchLabel: string) => {
         const raw = String(branchLabel || '').trim();
         if (!raw) return;
@@ -12264,14 +12573,22 @@ const App: React.FC = () => {
                                                             : area.partialOpenAudits > 0
                                                                 ? (area.partialOpenAudits === 1 ? '1 parcial aberta' : `${area.partialOpenAudits} parciais abertas`)
                                                                 : 'Sem parcial aberta';
+                                                        const isAreaActionBusy = areaPartialActionLoading === area.area;
                                                         return (
-                                                            <div key={area.area} className={`rounded-xl border px-3 py-2 transition-colors ${areaStatusClass}`}>
+                                                            <button
+                                                                key={area.area}
+                                                                type="button"
+                                                                onClick={() => void handleOpenAreaPartialFromDashboard(area.area)}
+                                                                disabled={!!areaPartialActionLoading}
+                                                                className={`w-full text-left rounded-xl border px-3 py-2 transition-colors cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/50 disabled:cursor-wait disabled:opacity-70 ${areaStatusClass}`}
+                                                                title={`Abrir contagem parcial para ${area.area}`}
+                                                            >
                                                                 <div className="flex items-center justify-between">
                                                                     <p className="text-sm font-black text-gray-800">{area.area}</p>
                                                                     <div className="text-right">
                                                                         <p className="text-[11px] font-bold text-gray-500">{area.branches} filial(is)</p>
                                                                         <p className={`text-[9px] font-black uppercase tracking-widest ${area.partialOverdueAudits > 0 ? 'text-red-700' : area.partialOpenAudits > 0 ? 'text-blue-700' : 'text-slate-400'}`}>
-                                                                            {areaStatusLabel}
+                                                                            {isAreaActionBusy ? 'Abrindo parciais...' : areaStatusLabel}
                                                                         </p>
                                                                     </div>
                                                                 </div>
@@ -12295,7 +12612,7 @@ const App: React.FC = () => {
                                                                 <p className="mt-1 text-[10px] font-black text-indigo-500 uppercase tracking-widest text-right">
                                                                     {(pct === 100 ? "100" : pct.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}%
                                                                 </p>
-                                                            </div>
+                                                            </button>
                                                         );
                                                     })
                                                 )}
