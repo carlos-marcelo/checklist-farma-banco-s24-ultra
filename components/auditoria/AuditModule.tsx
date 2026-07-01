@@ -89,9 +89,29 @@ const FILIAIS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18];
 const normalizeAreaName = (value?: string | null) =>
     String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('pt-BR');
 
+const normalizeAuditBranchDigits = (digits: string) => digits.replace(/^0+(?=\d)/, '');
+
+const extractAuditBranchNumber = (value?: string | number | null) => {
+    const raw = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return '';
+    if (/^\d+$/.test(raw)) return normalizeAuditBranchDigits(raw);
+
+    const explicitBranch = raw.match(/\b(?:filial|unidade|loja|f)\s*\.?\s*(\d+)\b/i);
+    if (explicitBranch?.[1]) return normalizeAuditBranchDigits(explicitBranch[1]);
+
+    const numbers = raw.match(/\d+/g) || [];
+    if (numbers.length === 0) return '';
+
+    const selected = numbers.length > 1 && /\b(?:area|área)\b/i.test(raw)
+        ? numbers[numbers.length - 1]
+        : numbers[0];
+
+    return normalizeAuditBranchDigits(selected);
+};
+
 const toAuditBranchValue = (value?: string | number | null) => {
     const raw = String(value || '').trim();
-    const digits = raw.match(/\d+/g)?.join('') || '';
+    const digits = extractAuditBranchNumber(raw);
     return digits || raw;
 };
 
@@ -1242,6 +1262,14 @@ const getStockFileSignature = (meta: any): string => {
     return (id || uploadedAt || updatedAt) ? `${moduleKey}|${id}|${uploadedAt || updatedAt}` : '';
 };
 
+const getStockFileContentSignature = (meta: any): string => {
+    if (!meta) return '';
+    const fileName = String(meta.file_name || meta.fileName || meta.name || '').trim().toLowerCase();
+    const fileSizeRaw = meta.file_size ?? meta.fileSize ?? meta.size;
+    const fileSize = Number.isFinite(Number(fileSizeRaw)) ? String(Number(fileSizeRaw)) : '';
+    return fileName || fileSize ? `${fileName}|${fileSize}` : '';
+};
+
 const getAppliedStockSignature = (sourceFiles: any): string => {
     const explicit = String(
         sourceFiles?.globalStockSignature ||
@@ -1279,11 +1307,15 @@ const isGlobalStockDifferentFromApplied = (sourceFiles: any, globalStockMeta: an
     const globalTs = globalRaw ? new Date(globalRaw).getTime() : NaN;
     const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
     if (!Number.isFinite(globalTs)) return false;
-    if (Number.isFinite(appliedTs) && globalTs <= appliedTs + 1000) return false;
+    if (Number.isFinite(appliedTs) && globalTs <= appliedTs + 60_000) return false;
 
     const globalSignature = getStockFileSignature(globalStockMeta);
     const appliedSignature = getAppliedStockSignature(sourceFiles);
     if (globalSignature && appliedSignature && globalSignature === appliedSignature) return false;
+
+    const globalContentSignature = getStockFileContentSignature(globalStockMeta);
+    const appliedContentSignature = getStockFileContentSignature(sourceFiles?.stock);
+    if (globalContentSignature && appliedContentSignature && globalContentSignature === appliedContentSignature) return false;
 
     return true;
 };
@@ -1844,12 +1876,15 @@ interface AuditModuleProps {
     userFilial?: string | null;
     companies: any[];
     initialFilial?: string;
+    initialArea?: string;
+    initialCompanyId?: string | null;
+    initialCompanyName?: string | null;
     forceManualFilialSelection?: boolean;
     onAuditExited?: () => void;
     onFilialSelected?: () => void;
 }
 
-const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, userCompanyId, userArea, userFilial, companies, initialFilial, forceManualFilialSelection = false, onAuditExited, onFilialSelected }) => {
+const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, userCompanyId, userArea, userFilial, companies, initialFilial, initialArea, initialCompanyId, initialCompanyName, forceManualFilialSelection = false, onAuditExited, onFilialSelected }) => {
     const isMaster = userRole === 'MASTER';
     const isAdmin = userRole === 'ADMINISTRATIVO';
     const canUseAuditMasterTools = isMaster || isAdmin;
@@ -1933,7 +1968,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const postAdjustmentCodeInputRef = useRef<HTMLInputElement | null>(null);
     const postAdjustmentQtyInputRef = useRef<HTMLInputElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
-    const [selectedEmpresa, setSelectedEmpresa] = useState("Drogaria Cidade");
+    const [selectedEmpresa, setSelectedEmpresa] = useState(() => String(initialCompanyName || "Drogaria Cidade"));
     const [selectedFilial, setSelectedFilial] = useState(() => {
         const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
         if (forceManualFilialSelection && !forcedInitialFilial) return '';
@@ -1946,10 +1981,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, [companies, isMaster, userCompanyId]);
     const selectedCompany = useMemo(() => allowedCompanies.find(c => c.name === selectedEmpresa) || allowedCompanies[0], [allowedCompanies, selectedEmpresa]);
     const allowedAuditBranches = useMemo(() => {
-        if (isMaster) return FILIAIS.map(f => String(f));
-
         const allowed = new Set<string>();
-        const normalizedUserArea = normalizeAreaName(userArea);
+        const normalizedUserArea = isMaster ? '' : normalizeAreaName(userArea);
         (selectedCompany?.areas || []).forEach((area: any) => {
             if (normalizedUserArea && normalizeAreaName(area?.name) !== normalizedUserArea) return;
             (area?.branches || []).forEach((branch: string) => {
@@ -1959,10 +1992,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         });
 
         const userBranch = toAuditBranchValue(userFilial || '');
-        if (!normalizedUserArea && userBranch) allowed.add(userBranch);
+        if (!isMaster && !normalizedUserArea && userBranch) allowed.add(userBranch);
+
+        const forcedInitialBranch = toAuditBranchValue(initialFilial || '');
+        if (isMaster && forcedInitialBranch) allowed.add(forcedInitialBranch);
+
+        if (isMaster && allowed.size === 0) {
+            FILIAIS.forEach(f => allowed.add(String(f)));
+        }
 
         return Array.from(allowed).sort(compareAuditBranchValues);
-    }, [isMaster, selectedCompany?.areas, userArea, userFilial]);
+    }, [isMaster, selectedCompany?.areas, initialFilial, userArea, userFilial]);
     const allowedAuditBranchSet = useMemo(() => new Set(allowedAuditBranches), [allowedAuditBranches]);
     const [branchAuditsHistory, setBranchAuditsHistory] = useState<DbAuditSession[]>([]);
     const [isLoadingBranchAudits, setIsLoadingBranchAudits] = useState(false);
@@ -2032,7 +2072,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const stockTsLabel = options.stockTsRaw
                 ? new Date(options.stockTsRaw).toLocaleString('pt-BR')
                 : 'nao informada';
+            const alertBranch = selectedFilial;
+            const alertSyncKey = syncKey;
             window.setTimeout(() => {
+                if (alertBranch && activeFilialRef.current !== alertBranch) return;
+                if (alertSyncKey && lastAutoStockSyncKeyRef.current !== alertSyncKey) return;
                 window.alert(
                     `Novo estoque detectado no Cadastro Base (${stockTsLabel}).\n\nVocê foi direcionado para a tela de atualização dos estoques.\nA reclassificação só será executada ao clicar no botão de atualização.`
                 );
@@ -2179,20 +2223,33 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     useEffect(() => {
         if (allowedCompanies.length === 0) return;
+        const requestedCompany = allowedCompanies.find(c =>
+            (!!initialCompanyId && String(c?.id || '') === String(initialCompanyId)) ||
+            (!!initialCompanyName && String(c?.name || '') === String(initialCompanyName))
+        );
+        if (requestedCompany) {
+            const requestedName = String(requestedCompany.name || '');
+            if (requestedName && selectedEmpresa !== requestedName) {
+                setSelectedEmpresa(requestedName);
+            }
+            return;
+        }
         if (allowedCompanies.some(c => c.name === selectedEmpresa)) return;
         setSelectedEmpresa(String(allowedCompanies[0]?.name || ''));
-    }, [allowedCompanies, selectedEmpresa]);
+    }, [allowedCompanies, selectedEmpresa, initialCompanyId, initialCompanyName]);
 
     useEffect(() => {
         const normalized = toAuditBranchValue(initialFilial || '');
         if (!normalized) return;
         if (!isMaster && allowedAuditBranches.length > 0 && !allowedAuditBranchSet.has(normalized)) return;
+        activeFilialRef.current = normalized;
         setSelectedFilial(prev => (prev === normalized ? prev : normalized));
-    }, [initialFilial, isMaster, allowedAuditBranches.length, allowedAuditBranchSet]);
+    }, [initialFilial, initialArea, isMaster, allowedAuditBranches.length, allowedAuditBranchSet]);
 
     useEffect(() => {
         const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
         if (!forceManualFilialSelection || forcedInitialFilial) return;
+        activeFilialRef.current = '';
         setSelectedFilial('');
         setData(null);
         setDbSessionId(undefined);
@@ -2205,6 +2262,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     useEffect(() => {
         if (isMaster || !selectedFilial || allowedAuditBranches.length === 0) return;
         if (allowedAuditBranchSet.has(toAuditBranchValue(selectedFilial))) return;
+        activeFilialRef.current = '';
         setSelectedFilial('');
         setData(null);
         setDbSessionId(undefined);
@@ -2594,13 +2652,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setShowCompletedAuditsModal(false);
             return;
         }
+        const requestedFilial = toAuditBranchValue(selectedFilial);
         let cancelled = false;
+        setBranchAuditsHistory([]);
+        setShowCompletedAuditsModal(false);
         const loadBranchHistory = async () => {
             setIsLoadingBranchAudits(true);
             try {
-                const history = await fetchAuditsHistory(selectedFilial);
-                if (cancelled) return;
-                const sorted = [...history].sort((a, b) => {
+                const history = await fetchAuditsHistory(requestedFilial);
+                if (cancelled || activeFilialRef.current !== requestedFilial) return;
+                const filtered = history.filter(item => isAuditSessionForBranch(item, requestedFilial));
+                const sorted = [...filtered].sort((a, b) => {
                     if (a.audit_number !== b.audit_number) return b.audit_number - a.audit_number;
                     const at = new Date(a.updated_at || a.created_at || 0).getTime();
                     const bt = new Date(b.updated_at || b.created_at || 0).getTime();
@@ -2611,20 +2673,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 console.error("Erro ao carregar histórico de auditorias da filial:", error);
                 if (!cancelled) setBranchAuditsHistory([]);
             } finally {
-                if (!cancelled) setIsLoadingBranchAudits(false);
+                if (!cancelled && activeFilialRef.current === requestedFilial) setIsLoadingBranchAudits(false);
             }
         };
         void loadBranchHistory();
         return () => { cancelled = true; };
-    }, [selectedFilial, dbSessionId, nextAuditNumber]);
+    }, [selectedFilial, dbSessionId, nextAuditNumber, isAuditSessionForBranch]);
 
     const latestOpenAudit = useMemo(
-        () => branchAuditsHistory.find(item => item.status !== 'completed') || null,
-        [branchAuditsHistory]
+        () => {
+            if (!selectedFilial) return null;
+            return branchAuditsHistory.find(item =>
+                item.status !== 'completed' &&
+                isAuditSessionForBranch(item, selectedFilial)
+            ) || null;
+        },
+        [branchAuditsHistory, isAuditSessionForBranch, selectedFilial]
     );
     const completedAudits = useMemo(
-        () => branchAuditsHistory.filter(item => item.status === 'completed'),
-        [branchAuditsHistory]
+        () => {
+            if (!selectedFilial) return [];
+            return branchAuditsHistory.filter(item =>
+                item.status === 'completed' &&
+                isAuditSessionForBranch(item, selectedFilial)
+            );
+        },
+        [branchAuditsHistory, isAuditSessionForBranch, selectedFilial]
     );
     // Polling de sincronização entre usuários
     useEffect(() => {
@@ -2905,7 +2979,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 // Restoration of basic settings - but let loadAuditNum fetch full fresh context usually.
                 // However, we can use savedData if Supabase fails.
                 const forcedInitialFilial = String(initialFilial || '').trim();
-                if (!forceManualFilialSelection && !forcedInitialFilial && savedData.filial) setSelectedFilial(savedData.filial);
+                const savedBranch = toAuditBranchValue(savedData.filial || '');
+                if (!forceManualFilialSelection && !forcedInitialFilial && savedBranch && !activeFilialRef.current) {
+                    activeFilialRef.current = savedBranch;
+                    setSelectedFilial(savedBranch);
+                }
                 if (savedData.inventoryNumber) setInventoryNumber(savedData.inventoryNumber);
             }
         };
@@ -2930,8 +3008,23 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, [data, isAuditDataForBranch, selectedFilial, withAuditDataBranch]);
 
     const handleSelectedFilialChange = useCallback((value: string) => {
-        setSelectedFilial(value);
-        if (value) {
+        const normalized = toAuditBranchValue(value);
+        activeFilialRef.current = normalized;
+        setData(null);
+        setTermDrafts({});
+        setDbSessionId(undefined);
+        setIsUpdatingStock(false);
+        setAllowActiveAuditAutoOpen(false);
+        setIsReadOnlyCompletedView(false);
+        setConsultingAuditNumber(null);
+        setBranchAuditsHistory([]);
+        setShowCompletedAuditsModal(false);
+        activeAuditOpenChoiceRef.current.clear();
+        lastAuditUpdateRef.current = null;
+        lastAutoStockSyncKeyRef.current = '';
+        completedAuditConsultationRef.current = false;
+        setSelectedFilial(normalized);
+        if (normalized) {
             onFilialSelected?.();
         }
     }, [onFilialSelected]);
@@ -3177,10 +3270,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const handleSafeExit = async () => {
         const resetAuditUi = () => {
             sessionStorage.removeItem(CONFIRMED_SESSION_KEY);
+            activeFilialRef.current = '';
             setData(null);
             setDbSessionId(undefined);
             setAllowActiveAuditAutoOpen(false);
             setSelectedFilial("");
+            setBranchAuditsHistory([]);
+            setShowCompletedAuditsModal(false);
+            activeAuditOpenChoiceRef.current.clear();
             setGroupFiles(createInitialGroupFiles());
             setFileStock(null);
             setFileDeptIds(null);
@@ -3530,6 +3627,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             alert("Selecione a filial.");
             return false;
         }
+        const requestedFilial = toAuditBranchValue(selectedFilial);
         if (!Number.isFinite(targetAuditNumber) || targetAuditNumber <= 0) {
             alert("Número de inventário inválido.");
             return false;
@@ -3538,12 +3636,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         try {
             setIsProcessing(true);
             const target = guardAuditSessionForBranch(
-                await fetchAuditSession(selectedFilial, targetAuditNumber),
-                selectedFilial,
+                await fetchAuditSession(requestedFilial, targetAuditNumber),
+                requestedFilial,
                 'completed-target'
             );
+            if (activeFilialRef.current !== requestedFilial) return false;
             if (!target) {
-                alert(`Inventário Nº ${targetAuditNumber} não encontrado na filial ${selectedFilial}.`);
+                alert(`Inventário Nº ${targetAuditNumber} não encontrado na filial ${requestedFilial}.`);
                 return false;
             }
             if (target.status !== 'completed') {
@@ -3551,7 +3650,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return false;
             }
 
-            const payload = normalizeRemoteAuditSnapshotForBranch((target.data || {}) as AuditData, selectedFilial);
+            const payload = normalizeRemoteAuditSnapshotForBranch((target.data || {}) as AuditData, requestedFilial);
             if (!payload) {
                 alert("Abertura bloqueada: os dados retornados não pertencem à filial selecionada.");
                 return false;
@@ -3566,7 +3665,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     });
                 });
             }
-            const reconciled = withAuditDataBranch(reconcileAuditStateFromCompletedScopes(payload), selectedFilial);
+            const reconciled = withAuditDataBranch(reconcileAuditStateFromCompletedScopes(payload), requestedFilial);
+            if (activeFilialRef.current !== requestedFilial) return false;
             setIsReadOnlyCompletedView(true);
             setConsultingAuditNumber(target.audit_number);
             setNextAuditNumber(target.audit_number);
@@ -3597,6 +3697,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             alert("Selecione a filial.");
             return;
         }
+        const requestedFilial = toAuditBranchValue(selectedFilial);
         const targetAuditNumber = latestOpenAudit?.audit_number;
         if (!targetAuditNumber) {
             alert("Não há inventário aberto para retomar nesta filial.");
@@ -3606,12 +3707,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         try {
             setIsProcessing(true);
             const target = guardAuditSessionForBranch(
-                await fetchAuditSession(selectedFilial, targetAuditNumber),
-                selectedFilial,
+                await fetchAuditSession(requestedFilial, targetAuditNumber),
+                requestedFilial,
                 'resume-open'
             );
+            if (activeFilialRef.current !== requestedFilial) return;
             if (!target) {
-                alert(`Inventário Nº ${targetAuditNumber} não encontrado na filial ${selectedFilial}.`);
+                alert(`Inventário Nº ${targetAuditNumber} não encontrado na filial ${requestedFilial}.`);
                 return;
             }
             if (target.status === 'completed') {
@@ -3619,7 +3721,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return;
             }
 
-            const payload = normalizeRemoteAuditSnapshotForBranch((target.data || {}) as AuditData, selectedFilial);
+            const payload = normalizeRemoteAuditSnapshotForBranch((target.data || {}) as AuditData, requestedFilial);
             if (!payload) {
                 alert("Retomada bloqueada: os dados retornados não pertencem à filial selecionada.");
                 return;
@@ -3638,7 +3740,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     });
                 });
             }
-            const reconciled = withAuditDataBranch(reconcileAuditStateFromCompletedScopes(payload), selectedFilial);
+            const reconciled = withAuditDataBranch(reconcileAuditStateFromCompletedScopes(payload), requestedFilial);
+            if (activeFilialRef.current !== requestedFilial) return;
             completedAuditConsultationRef.current = false;
             setData(reconciled);
             setTermDrafts(((reconciled as any)?.termDrafts || {}) as Record<string, TermForm>);
@@ -3646,7 +3749,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setDbSessionId(target.id);
             setAllowActiveAuditAutoOpen(true);
             activeAuditOpenChoiceRef.current.set(
-                `${selectedFilial}|${target.id || 'no_session'}|${target.audit_number}`,
+                `${requestedFilial}|${target.id || 'no_session'}|${target.audit_number}`,
                 'open'
             );
             markAuditSessionConfirmed(target.id);

@@ -264,6 +264,26 @@ const normalizeBranchLabel = (raw: string | null | undefined): string => {
     return s.replace(/\s+/g, ' ');
 };
 
+const normalizeBranchDigits = (digits: string) => digits.replace(/^0+(?=\d)/, '');
+
+const extractAuditBranchValue = (raw: string | null | undefined): string => {
+    const s = String(raw || '').replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+    if (/^\d+$/.test(s)) return normalizeBranchDigits(s);
+
+    const explicitBranch = s.match(/\b(?:filial|unidade|loja|f)\s*\.?\s*(\d+)\b/i);
+    if (explicitBranch?.[1]) return normalizeBranchDigits(explicitBranch[1]);
+
+    const numbers = s.match(/\d+/g) || [];
+    if (numbers.length === 0) return '';
+
+    const selected = numbers.length > 1 && /\b(?:area|área)\b/i.test(s)
+        ? numbers[numbers.length - 1]
+        : numbers[0];
+
+    return normalizeBranchDigits(selected);
+};
+
 const buildBranchQueryVariants = (raw: string | null | undefined): string[] => {
     const base = String(raw || '').trim();
     if (!base) return [];
@@ -2288,6 +2308,9 @@ const App: React.FC = () => {
     const [dashboardClockMinute, setDashboardClockMinute] = useState(() => Date.now());
     const [areaPartialActionLoading, setAreaPartialActionLoading] = useState<string | null>(null);
     const [auditJumpFilial, setAuditJumpFilial] = useState<string>('');
+    const [auditJumpArea, setAuditJumpArea] = useState<string>('');
+    const [auditJumpCompanyId, setAuditJumpCompanyId] = useState<string>('');
+    const [auditJumpCompanyName, setAuditJumpCompanyName] = useState<string>('');
     const [auditManualBranchSelectionRequired, setAuditManualBranchSelectionRequired] = useState(() =>
         typeof window !== 'undefined' && window.sessionStorage.getItem(AUDIT_MANUAL_BRANCH_SELECTION_KEY) === '1'
     );
@@ -7192,16 +7215,30 @@ const App: React.FC = () => {
             openPartialScopes: number;
             hasOpenPartial: boolean;
             isPartialOverdue: boolean;
+            companyId?: string;
+            companyName?: string;
         };
 
         const isAfterPartialCutoff = new Date(dashboardClockMinute).getHours() >= 18;
         const branchToArea = new Map<string, string>();
+        const branchAreaToCompany = new Map<string, { id?: string; name?: string }>();
+        const branchToCompany = new Map<string, { id?: string; name?: string }>();
         scopedCompanies.forEach(c => {
             (c.areas || []).forEach((area: any) => {
                 const areaName = String(area?.name || '').trim() || 'Sem Área';
                 (area.branches || []).forEach((branch: string) => {
                     const normalized = normalizeBranchLabel(branch);
-                    branchToArea.set(normalized, areaName);
+                    if (!branchToArea.has(normalized)) {
+                        branchToArea.set(normalized, areaName);
+                    }
+                    const companyInfo = { id: c?.id, name: c?.name };
+                    const areaKey = `${normalizeFilterKey(areaName)}|${normalized}`;
+                    if (!branchAreaToCompany.has(areaKey)) {
+                        branchAreaToCompany.set(areaKey, companyInfo);
+                    }
+                    if (!branchToCompany.has(normalized)) {
+                        branchToCompany.set(normalized, companyInfo);
+                    }
                 });
             });
         });
@@ -7653,9 +7690,13 @@ const App: React.FC = () => {
             const progressPct = isCompleted ? 100 : calculatedProgress;
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
 
+            const branchArea = branchToArea.get(branchLabel) || 'Sem Área';
+            const companyInfo = branchAreaToCompany.get(`${normalizeFilterKey(branchArea)}|${branchLabel}`) || branchToCompany.get(branchLabel);
             branches.push({
                 branch: branchLabel,
-                area: branchToArea.get(branchLabel) || 'Sem Área',
+                area: branchArea,
+                companyId: companyInfo?.id,
+                companyName: companyInfo?.name,
                 auditNumber: Number(session.audit_number || 0),
                 updatedAt: String(session.updated_at || session.created_at || ''),
                 progressPct,
@@ -7815,15 +7856,29 @@ const App: React.FC = () => {
             countedCost: number;
             divergencePct: number;
             termsWithExcel: number;
+            companyId?: string;
+            companyName?: string;
         };
 
         const branchToArea = new Map<string, string>();
+        const branchAreaToCompany = new Map<string, { id?: string; name?: string }>();
+        const branchToCompany = new Map<string, { id?: string; name?: string }>();
         scopedCompanies.forEach(c => {
             (c.areas || []).forEach((area: any) => {
                 const areaName = String(area?.name || '').trim() || 'Sem Área';
                 (area.branches || []).forEach((branch: string) => {
                     const normalized = normalizeBranchLabel(branch);
-                    branchToArea.set(normalized, areaName);
+                    if (!branchToArea.has(normalized)) {
+                        branchToArea.set(normalized, areaName);
+                    }
+                    const companyInfo = { id: c?.id, name: c?.name };
+                    const areaKey = `${normalizeFilterKey(areaName)}|${normalized}`;
+                    if (!branchAreaToCompany.has(areaKey)) {
+                        branchAreaToCompany.set(areaKey, companyInfo);
+                    }
+                    if (!branchToCompany.has(normalized)) {
+                        branchToCompany.set(normalized, companyInfo);
+                    }
                 });
             });
         });
@@ -8266,9 +8321,13 @@ const App: React.FC = () => {
             const progressPct = isCompleted ? 100 : calculatedProgress;
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
 
+            const branchArea = branchToArea.get(branchLabel) || 'Sem Área';
+            const companyInfo = branchAreaToCompany.get(`${normalizeFilterKey(branchArea)}|${branchLabel}`) || branchToCompany.get(branchLabel);
             branches.push({
                 branch: branchLabel,
-                area: branchToArea.get(branchLabel) || 'Sem Área',
+                area: branchArea,
+                companyId: companyInfo?.id,
+                companyName: companyInfo?.name,
                 auditNumber: Number(session.audit_number || 0),
                 updatedAt: String(session.updated_at || session.created_at || ''),
                 progressPct,
@@ -8559,21 +8618,55 @@ const App: React.FC = () => {
         buildAuditDashboardCacheKey
     ]);
 
-    const handleOpenAuditFromDashboardBranch = useCallback((branchLabel: string) => {
+    const resolveAuditJumpCompany = useCallback((branchLabel: string, areaName?: string, companyId?: string, companyName?: string) => {
+        const normalizedBranch = normalizeBranchLabel(branchLabel);
+        const branchValue = extractAuditBranchValue(branchLabel);
+        const normalizedArea = normalizeFilterKey(String(areaName || ''));
+        const branchMatches = (branch: string) =>
+            normalizeBranchLabel(branch) === normalizedBranch ||
+            (!!branchValue && extractAuditBranchValue(branch) === branchValue);
+        const byExplicit = scopedCompanies.find(company =>
+            (!!companyId && String(company?.id || '') === String(companyId)) ||
+            (!!companyName && String(company?.name || '') === String(companyName))
+        );
+        if (byExplicit) return byExplicit;
+
+        const byAreaAndBranch = scopedCompanies.find(company =>
+            (company?.areas || []).some((area: any) =>
+                (!normalizedArea || normalizeFilterKey(String(area?.name || '')) === normalizedArea) &&
+                (area?.branches || []).some((branch: string) => branchMatches(branch))
+            )
+        );
+        if (byAreaAndBranch) return byAreaAndBranch;
+
+        return scopedCompanies.find(company =>
+            (company?.areas || []).some((area: any) =>
+                (area?.branches || []).some((branch: string) => branchMatches(branch))
+            )
+        ) || null;
+    }, [scopedCompanies]);
+
+    const handleOpenAuditFromDashboardBranch = useCallback((branchLabel: string, areaName?: string, companyId?: string, companyName?: string) => {
         const raw = String(branchLabel || '').trim();
         if (!raw) return;
-        const numeric = raw.match(/\d+/)?.[0] || '';
-        const filial = numeric || raw;
+        const filial = extractAuditBranchValue(raw) || raw;
+        const company = resolveAuditJumpCompany(raw, areaName, companyId, companyName);
         clearAuditManualBranchSelectionRequired();
         setAuditJumpFilial(filial);
+        setAuditJumpArea(String(areaName || ''));
+        setAuditJumpCompanyId(String(company?.id || companyId || ''));
+        setAuditJumpCompanyName(String(company?.name || companyName || ''));
         setCurrentView('audit');
         window.scrollTo(0, 0);
         setIsSidebarOpen(isMobileLayout());
-    }, [clearAuditManualBranchSelectionRequired]);
+    }, [clearAuditManualBranchSelectionRequired, resolveAuditJumpCompany]);
 
     useEffect(() => {
         if (currentView !== 'audit' && auditJumpFilial) {
             setAuditJumpFilial('');
+            setAuditJumpArea('');
+            setAuditJumpCompanyId('');
+            setAuditJumpCompanyName('');
         }
     }, [currentView, auditJumpFilial]);
 
@@ -8836,6 +8929,7 @@ const App: React.FC = () => {
                     {currentView === 'audit' && (
                         <div className="h-full animate-fade-in relative pb-24">
                             <AuditModule
+                                key={`audit-${auditJumpCompanyId || currentUser?.company_id || 'all'}-${auditJumpArea || currentUser?.area || 'all'}-${auditJumpFilial || 'manual'}`}
                                 userEmail={currentUser?.email || ''}
                                 userName={currentUser?.name || ''}
                                 userRole={currentUser?.role || 'USER'}
@@ -8844,6 +8938,9 @@ const App: React.FC = () => {
                                 userFilial={currentUser?.filial || null}
                                 companies={companies}
                                 initialFilial={auditJumpFilial}
+                                initialArea={auditJumpArea}
+                                initialCompanyId={auditJumpCompanyId || null}
+                                initialCompanyName={auditJumpCompanyName || null}
                                 forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
                                 onAuditExited={markAuditManualBranchSelectionRequired}
                                 onFilialSelected={clearAuditManualBranchSelectionRequired}
@@ -12641,7 +12738,7 @@ const App: React.FC = () => {
                                                             <button
                                                                 key={`${branch.branch}_${branch.auditNumber}`}
                                                                 type="button"
-                                                                onClick={() => handleOpenAuditFromDashboardBranch(branch.branch)}
+                                                                onClick={() => handleOpenAuditFromDashboardBranch(branch.branch, branch.area, branch.companyId, branch.companyName)}
                                                                 className={`w-full text-left rounded-xl border px-3 py-2 transition-colors ${branchStatusClass}`}
                                                                 title={`Abrir Auditoria da ${branch.branch}`}
                                                             >
@@ -12821,7 +12918,7 @@ const App: React.FC = () => {
                                                         <button
                                                             key={`${branch.branch}_${branch.auditNumber}`}
                                                             type="button"
-                                                            onClick={() => handleOpenAuditFromDashboardBranch(branch.branch)}
+                                                            onClick={() => handleOpenAuditFromDashboardBranch(branch.branch, branch.area, branch.companyId, branch.companyName)}
                                                             className="w-full text-left rounded-xl border border-gray-100 px-3 py-2 bg-gray-50/50 hover:border-indigo-200 hover:bg-indigo-50/30 transition-colors"
                                                             title={`Abrir Auditoria da ${branch.branch} concluída`}
                                                         >
