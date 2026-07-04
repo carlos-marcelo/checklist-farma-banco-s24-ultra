@@ -2054,6 +2054,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const activeFilialRef = useRef<string>('');
     const completedAuditConsultationRef = useRef(false);
     const activeAuditOpenChoiceRef = useRef<Map<string, 'open' | 'completed'>>(new Map());
+    const activeAuditOpenChoicePendingRef = useRef<Map<string, Promise<'open' | 'completed'>>>(new Map());
     const partialFinalizeInFlightRef = useRef(false);
 
     function enterStockUpdateMode(options?: { stockTsRaw?: string | null; syncKey?: string | null; showAlert?: boolean }) {
@@ -2454,32 +2455,47 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     return;
                 }
                 if (!canAutoOpenActive) {
-                    if (silent) return;
-                    canAutoOpenActive = true;
-                    if (canUseAuditMasterTools) {
-                        try {
-                            const history = await fetchAuditsHistory(requestedFilial);
-                            const completedCount = history.filter(item => item.status === 'completed').length;
-                            const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
-                            const hasNewerGlobalStockAtOpenChoice = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
-                            if (completedCount > 0 && !hasNewerGlobalStockAtOpenChoice) {
-                                canAutoOpenActive = window.confirm(
-                                    `Existe auditoria em aberto (Nº ${latest.audit_number}) e ${completedCount} inventário(s) concluído(s) nesta filial.\n\n` +
-                                    `OK: prosseguir com a auditoria em aberto.\n` +
-                                    `Cancelar: abrir a lista de inventários concluídos.`
-                                );
-                                activeAuditOpenChoiceRef.current.set(openChoiceKey, canAutoOpenActive ? 'open' : 'completed');
-                                if (canAutoOpenActive) {
-                                    setAllowActiveAuditAutoOpen(true);
-                                    markAuditSessionConfirmed(latest.id);
+                    const pendingChoice = activeAuditOpenChoicePendingRef.current.get(openChoiceKey);
+                    if (pendingChoice) {
+                        const resolvedChoice = await pendingChoice;
+                        if (isStaleRequest()) return;
+                        canAutoOpenActive = resolvedChoice === 'open';
+                    } else {
+                        if (silent) return;
+                        const choicePromise = (async (): Promise<'open' | 'completed'> => {
+                            if (!canUseAuditMasterTools) return 'open';
+                            try {
+                                const history = await fetchAuditsHistory(requestedFilial);
+                                const completedCount = history.filter(item => item.status === 'completed').length;
+                                const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
+                                const hasNewerGlobalStockAtOpenChoice = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
+                                if (completedCount > 0 && !hasNewerGlobalStockAtOpenChoice) {
+                                    const openActive = window.confirm(
+                                        `Existe auditoria em aberto (Nº ${latest.audit_number}) e ${completedCount} inventário(s) concluído(s) nesta filial.\n\n` +
+                                        `OK: prosseguir com a auditoria em aberto.\n` +
+                                        `Cancelar: abrir a lista de inventários concluídos.`
+                                    );
+                                    return openActive ? 'open' : 'completed';
                                 }
-                                if (!canAutoOpenActive) {
-                                    setShowCompletedAuditsModal(true);
-                                }
+                            } catch (error) {
+                                console.warn('Falha ao carregar histórico para escolha de abertura:', error);
                             }
-                        } catch (error) {
-                            console.warn('Falha ao carregar histórico para escolha de abertura:', error);
+                            return 'open';
+                        })();
+                        activeAuditOpenChoicePendingRef.current.set(openChoiceKey, choicePromise);
+                        const resolvedChoice = await choicePromise;
+                        if (activeAuditOpenChoicePendingRef.current.get(openChoiceKey) === choicePromise) {
+                            activeAuditOpenChoicePendingRef.current.delete(openChoiceKey);
                         }
+                        if (isStaleRequest()) return;
+                        activeAuditOpenChoiceRef.current.set(openChoiceKey, resolvedChoice);
+                        canAutoOpenActive = resolvedChoice === 'open';
+                    }
+                    if (canAutoOpenActive) {
+                        setAllowActiveAuditAutoOpen(true);
+                        markAuditSessionConfirmed(latest.id);
+                    } else {
+                        setShowCompletedAuditsModal(true);
                     }
                     if (!canAutoOpenActive) {
                         setIsUpdatingStock(false);

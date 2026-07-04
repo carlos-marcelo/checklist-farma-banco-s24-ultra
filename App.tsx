@@ -313,14 +313,109 @@ const normalizeAuditScopeValue = (value: unknown) =>
 const normalizeAuditScopeDigits = (value: unknown) =>
     String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
 
+const parseAuditScopeInputList = (value: unknown) =>
+    String(value ?? '')
+        .split(/[,\n;]+/)
+        .map(part => part.trim())
+        .filter(Boolean);
+
+const buildAuditScopeConfig = (groupInput: unknown, deptInput: unknown, catInput: unknown) => {
+    const groupList = parseAuditScopeInputList(groupInput);
+    const deptList = parseAuditScopeInputList(deptInput);
+    const catList = parseAuditScopeInputList(catInput);
+    const scope: { groupId?: string; deptId?: string; catId?: string } = {
+        groupId: groupList.join(',') || undefined,
+        deptId: deptList.join(',') || undefined,
+        catId: catList.join(',') || undefined
+    };
+    const scopeLabel = [
+        groupList.length > 0 ? `${groupList.length > 1 ? 'Grupos' : 'Grupo'} ${groupList.join(', ')}` : 'Área inteira',
+        deptList.length > 0 ? `${deptList.length > 1 ? 'Departamentos' : 'Departamento'} ${deptList.join(', ')}` : null,
+        catList.length > 0 ? `${catList.length > 1 ? 'Categorias' : 'Categoria'} ${catList.join(', ')}` : null
+    ].filter(Boolean).join(' / ');
+
+    return { groupList, deptList, catList, scope, scopeLabel };
+};
+
+const formatAuditScopeSelectionWithNames = (
+    selected: string[],
+    entries: Array<{ group: any; dept: any; cat: any }>,
+    level: 'group' | 'dept' | 'cat',
+    singular: string,
+    plural: string
+) => {
+    if (selected.length === 0) return '';
+    const resolveNode = (input: string) => entries.find(entry => {
+        const node = level === 'group' ? entry.group : level === 'dept' ? entry.dept : entry.cat;
+        return auditScopeInputMatches(input, [node?.id, node?.numericId]);
+    });
+    const labels = selected.map(input => {
+        const entry = resolveNode(input);
+        const node = entry ? (level === 'group' ? entry.group : level === 'dept' ? entry.dept : entry.cat) : null;
+        const id = String(node?.id || node?.numericId || input).trim();
+        const name = String(node?.name || '').trim();
+        return name ? `${id} - ${name}` : id;
+    });
+
+    return `${selected.length > 1 ? plural : singular} ${labels.join(', ')}`;
+};
+
+const buildAuditScopeLabelWithNames = (
+    config: ReturnType<typeof buildAuditScopeConfig>,
+    entries: Array<{ group: any; dept: any; cat: any }>
+) => {
+    const labels = [
+        config.groupList.length > 0
+            ? formatAuditScopeSelectionWithNames(config.groupList, entries, 'group', 'Grupo', 'Grupos')
+            : 'Área inteira',
+        config.deptList.length > 0
+            ? formatAuditScopeSelectionWithNames(config.deptList, entries, 'dept', 'Departamento', 'Departamentos')
+            : null,
+        config.catList.length > 0
+            ? formatAuditScopeSelectionWithNames(config.catList, entries, 'cat', 'Categoria', 'Categorias')
+            : null
+    ].filter(Boolean);
+
+    return labels.join(' / ');
+};
+
+const buildAuditWhatsappTitle = (
+    config: ReturnType<typeof buildAuditScopeConfig>,
+    entries: Array<{ group: any; dept: any; cat: any }>
+) => {
+    const groupPart = config.groupList.length > 0 ? config.groupList.join(', ') : 'Área inteira';
+    const deptPart = config.deptList.length > 0 ? ` - ${config.deptList.join(', ')}` : '';
+    const catPart = config.catList.length > 0 ? ` - Cat. ${config.catList.join(', ')}` : '';
+    const selectedNames = new Set<string>();
+    const collectNames = (selected: string[], level: 'group' | 'dept' | 'cat') => {
+        selected.forEach(input => {
+            const entry = entries.find(item => {
+                const node = level === 'group' ? item.group : level === 'dept' ? item.dept : item.cat;
+                return auditScopeInputMatches(input, [node?.id, node?.numericId]);
+            });
+            const node = entry ? (level === 'group' ? entry.group : level === 'dept' ? entry.dept : entry.cat) : null;
+            const name = String(node?.name || '').trim().toLowerCase();
+            if (name) selectedNames.add(name);
+        });
+    };
+    collectNames(config.deptList, 'dept');
+    collectNames(config.catList, 'cat');
+    if (selectedNames.size === 0) collectNames(config.groupList, 'group');
+    const namesPart = selectedNames.size > 0 ? ` (${Array.from(selectedNames).join(', ')})` : '';
+    return `Auditoria ${groupPart}${deptPart}${catPart}${namesPart}`;
+};
+
 const auditScopeInputMatches = (input: string | undefined, values: unknown[]) => {
-    const rawInput = normalizeAuditScopeValue(input);
-    if (!rawInput) return true;
-    const digitInput = normalizeAuditScopeDigits(input);
-    return values.some(value => {
-        const rawValue = normalizeAuditScopeValue(value);
-        const digitValue = normalizeAuditScopeDigits(value);
-        return (!!rawValue && rawValue === rawInput) || (!!digitInput && !!digitValue && digitValue === digitInput);
+    const inputs = parseAuditScopeInputList(input);
+    if (inputs.length === 0) return true;
+    return inputs.some(part => {
+        const rawInput = normalizeAuditScopeValue(part);
+        const digitInput = normalizeAuditScopeDigits(part);
+        return values.some(value => {
+            const rawValue = normalizeAuditScopeValue(value);
+            const digitValue = normalizeAuditScopeDigits(value);
+            return (!!rawValue && rawValue === rawInput) || (!!digitInput && !!digitValue && digitValue === digitInput);
+        });
     });
 };
 
@@ -377,10 +472,21 @@ const addAreaPartialScopeToAuditData = (
     scope: { groupId?: string; deptId?: string; catId?: string },
     startedAt: string
 ) => {
-    const targetEntries = getAuditDataScopeCategories(auditData, scope)
-        .filter(({ cat }) => normalizeAuditCategoryStatus(cat?.status) !== 'done');
+    const completedPartials = Array.isArray(auditData?.partialCompleted) ? auditData.partialCompleted : [];
+    const completedKeys = new Set<string>();
+    completedPartials.forEach((partial: any) => {
+        getAuditDataScopeCategories(auditData, {
+            groupId: partial?.groupId,
+            deptId: partial?.deptId,
+            catId: partial?.catId
+        }).forEach(({ key }) => completedKeys.add(key));
+    });
+
+    const matchedEntries = getAuditDataScopeCategories(auditData, scope);
+    const targetEntries = matchedEntries
+        .filter(({ cat, key }) => normalizeAuditCategoryStatus(cat?.status) !== 'done' && !completedKeys.has(key));
     if (targetEntries.length === 0) {
-        return { data: auditData, matchedCategories: 0, addedCategories: 0 };
+        return { data: auditData, matchedCategories: matchedEntries.length, addedCategories: 0 };
     }
 
     const targetKeys = new Set(targetEntries.map(entry => entry.key));
@@ -1652,6 +1758,18 @@ const StockConferenceReportViewer = ({ report, onClose, currentUser }: StockConf
 
 const PROTECTED_MASTER_EMAILS = new Set(['asconavietagestor@gmail.com', 'contato@marcelo.far.br']);
 const AUDIT_MANUAL_BRANCH_SELECTION_KEY = 'APP_AUDIT_MANUAL_BRANCH_SELECTION_REQUIRED';
+const AREA_PARTIAL_WHATSAPP_HISTORY_KEY = 'APP_AUDIT_AREA_PARTIAL_WHATSAPP_HISTORY';
+
+type AreaPartialWhatsappHistoryItem = {
+    id: string;
+    areaName: string;
+    groupInput: string;
+    deptInput: string;
+    catInput: string;
+    openedAt: string;
+    userEmail?: string;
+    userName?: string;
+};
 
 const normalizeUserEmail = (email?: string | null) => String(email || '').trim().toLowerCase();
 
@@ -2307,6 +2425,24 @@ const App: React.FC = () => {
     const [completedAuditNumberFilter, setCompletedAuditNumberFilter] = useState<string>('all');
     const [dashboardClockMinute, setDashboardClockMinute] = useState(() => Date.now());
     const [areaPartialActionLoading, setAreaPartialActionLoading] = useState<string | null>(null);
+    const [areaPartialDialog, setAreaPartialDialog] = useState<{
+        areaName: string;
+        groupInput: string;
+        deptInput: string;
+        catInput: string;
+    } | null>(null);
+    const [showAreaPartialWhatsappPanel, setShowAreaPartialWhatsappPanel] = useState(false);
+    const [areaPartialWhatsappCopyStatus, setAreaPartialWhatsappCopyStatus] = useState<string | null>(null);
+    const [areaPartialWhatsappHistory, setAreaPartialWhatsappHistory] = useState<AreaPartialWhatsappHistoryItem[]>(() => {
+        if (typeof window === 'undefined') return [];
+        try {
+            const raw = window.localStorage.getItem(AREA_PARTIAL_WHATSAPP_HISTORY_KEY);
+            const parsed = raw ? JSON.parse(raw) : [];
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    });
     const [auditJumpFilial, setAuditJumpFilial] = useState<string>('');
     const [auditJumpArea, setAuditJumpArea] = useState<string>('');
     const [auditJumpCompanyId, setAuditJumpCompanyId] = useState<string>('');
@@ -2327,6 +2463,15 @@ const App: React.FC = () => {
             window.sessionStorage.removeItem(AUDIT_MANUAL_BRANCH_SELECTION_KEY);
         }
     }, []);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        try {
+            window.localStorage.setItem(AREA_PARTIAL_WHATSAPP_HISTORY_KEY, JSON.stringify(areaPartialWhatsappHistory.slice(0, 30)));
+        } catch {
+            // localStorage pode estar indisponível em alguns navegadores/modos.
+        }
+    }, [areaPartialWhatsappHistory]);
 
     // Logs & Eventos
     const [appEventLogs, setAppEventLogs] = useState<SupabaseService.DbAppEventLog[]>([]);
@@ -8447,34 +8592,233 @@ const App: React.FC = () => {
     }, [dashboardCompletedAuditSessions, scopedCompanies, scopedUsers, completedAuditNumberFilter]);
 
 
-    const handleOpenAreaPartialFromDashboard = useCallback(async (areaName: string) => {
-        if (!currentUser || areaPartialActionLoading) return;
+    const handleOpenAreaPartialFromDashboard = useCallback((areaName: string) => {
         const cleanAreaName = String(areaName || '').trim();
         if (!cleanAreaName) return;
+        setShowAreaPartialWhatsappPanel(false);
+        setAreaPartialWhatsappCopyStatus(null);
+        setAreaPartialDialog({
+            areaName: cleanAreaName,
+            groupInput: '',
+            deptInput: '',
+            catInput: ''
+        });
+    }, []);
 
-        const groupInput = window.prompt(
-            `Abrir contagem parcial na ${cleanAreaName}.\n\nDigite o número do GRUPO.\nDeixe em branco para abrir a área inteira.`
-        );
-        if (groupInput === null) return;
-        const deptInput = window.prompt(
-            'Digite o número do DEPARTAMENTO.\nDeixe em branco para puxar todos os departamentos do grupo/área.'
-        );
-        if (deptInput === null) return;
-        const catInput = window.prompt(
-            'Digite o número da CATEGORIA.\nDeixe em branco para puxar todas as categorias abaixo do escopo informado.'
-        );
-        if (catInput === null) return;
+    const buildAreaPartialWhatsappPreview = useCallback((config: {
+        areaName: string;
+        groupInput: string;
+        deptInput: string;
+        catInput: string;
+        openedAt?: string;
+    }) => {
+        const cleanAreaName = String(config.areaName || '').trim();
+        const scopeConfig = buildAuditScopeConfig(config.groupInput, config.deptInput, config.catInput);
+        const { scope } = scopeConfig;
+        const areaBranches = dashboardAuditOverview.branches.filter(branch => branch.area === cleanAreaName);
+        const willOpen: Array<{ branch: string; categories: number; mix: number; units: number }> = [];
+        const ignored: Array<{ branch: string; reason: string }> = [];
+        const branchLines: string[] = [];
+        const matchedEntriesForLabels: Array<{ group: any; dept: any; cat: any }> = [];
+        const openedAt = config.openedAt || new Date().toISOString();
+        const openedDate = new Date(openedAt);
+        const openedAtLabel = Number.isNaN(openedDate.getTime())
+            ? new Date().toLocaleString('pt-BR', { hour12: false })
+            : openedDate.toLocaleString('pt-BR', { hour12: false });
 
-        const scope = {
-            groupId: String(groupInput || '').trim() || undefined,
-            deptId: String(deptInput || '').trim() || undefined,
-            catId: String(catInput || '').trim() || undefined
+        const formatInt = (value: number) => Math.round(value || 0).toLocaleString('pt-BR');
+        const formatMoney = (value: number) => Number(value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+        const formatPercent = (value: number) => `${Number(value || 0) > 0 ? '+' : ''}${Number(value || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
+        const categoryKey = (entry: { group: any; dept: any; cat: any }) => auditPartialScopeKey({
+            groupId: entry.group?.id,
+            deptId: entry.dept?.id,
+            catId: entry.cat?.id
+        });
+        const expandPartialKeys = (auditData: any, partials: any[]) => {
+            const keys = new Set<string>();
+            (partials || []).filter(Boolean).forEach(partial => {
+                getAuditDataScopeCategories(auditData, {
+                    groupId: partial?.groupId,
+                    deptId: partial?.deptId,
+                    catId: partial?.catId
+                }).forEach(entry => keys.add(entry.key));
+            });
+            return keys;
         };
-        const scopeLabel = [
-            scope.groupId ? `Grupo ${scope.groupId}` : 'Área inteira',
-            scope.deptId ? `Departamento ${scope.deptId}` : null,
-            scope.catId ? `Categoria ${scope.catId}` : null
-        ].filter(Boolean).join(' / ');
+        const getScopeTotals = (entries: Array<{ group: any; dept: any; cat: any }>) => {
+            const codes = new Set<string>();
+            let fallbackMix = 0;
+            let units = 0;
+            let cost = 0;
+            entries.forEach(({ group, dept, cat }) => {
+                const products = Array.isArray(cat?.products) ? cat.products : [];
+                const categoryUnits = Number(cat?.totalQuantity || 0) || products.reduce((sum: number, p: any) => sum + Number(p?.quantity || 0), 0);
+                const categoryCost = Number(cat?.totalCost || 0) || products.reduce((sum: number, p: any) => sum + Number(p?.quantity || 0) * Number(p?.cost || 0), 0);
+                units += categoryUnits;
+                cost += categoryCost;
+                if (products.length > 0) {
+                    products.forEach((product: any) => {
+                        const code = String(product?.reducedCode || product?.code || '').replace(/\D/g, '').replace(/^0+/, '');
+                        if (code) codes.add(code);
+                    });
+                } else {
+                    fallbackMix += Number(cat?.itemsCount || 0);
+                }
+            });
+            return { mix: codes.size + fallbackMix, units, cost };
+        };
+        const getScopeFinancial = (parsedData: any, entries: Array<{ group: any; dept: any; cat: any }>, scopeCost: number) => {
+            const termMetrics = getAuditTermMetricsFromData(parsedData);
+            const termScopeEntries = buildAuditTermScopeEntries(
+                parsedData,
+                entries.map(({ group, dept, cat }) => ({
+                    groupId: String(group?.id || ''),
+                    deptId: String(dept?.id || ''),
+                    catId: String(cat?.id || '')
+                }))
+            );
+            const rowMatches = (row: any) => termScopeEntries.some(entry => auditRowMatchesTermScopeEntry(row, entry));
+            const sourceRows = [
+                ...(Array.isArray(termMetrics?.items) ? termMetrics.items : []),
+                ...(Array.isArray(termMetrics?.items) && termMetrics.items.length > 0 ? [] : (Array.isArray(termMetrics?.groupedDifferences) ? termMetrics.groupedDifferences : []))
+            ].filter(rowMatches);
+            const summary = sourceRows.length > 0
+                ? summarizeAuditTermRows(sourceRows)
+                : { diffQty: 0, diffCost: 0, countedCost: scopeCost };
+            const baseCost = Number(summary.countedCost || scopeCost || 0);
+            const divergencePct = baseCost > 0 ? (Number(summary.diffCost || 0) / baseCost) * 100 : 0;
+            return {
+                diffCost: roundAuditMoney(Number(summary.diffCost || 0)),
+                divergencePct
+            };
+        };
+
+        areaBranches.forEach(branchMetric => {
+            const branchLabel = normalizeBranchLabel(branchMetric.branch);
+            const branchNumber = extractAuditBranchValue(branchLabel);
+            const shortBranch = branchNumber ? `F${branchNumber}` : branchLabel;
+            const auditNumber = Number(branchMetric.auditNumber || 0);
+            const session = dashboardAuditSessions.find(row =>
+                normalizeBranchLabel(row.branch) === branchLabel &&
+                Number(row.audit_number || 0) === auditNumber &&
+                row.status === 'open'
+            );
+
+            if (!session) {
+                ignored.push({ branch: branchLabel, reason: 'sessão aberta não encontrada' });
+                branchLines.push(`${shortBranch} - ignorada: sessão aberta não encontrada`);
+                return;
+            }
+
+            const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+            const matchedEntries = getAuditDataScopeCategories(parsedData, scope);
+            matchedEntries.forEach(entry => matchedEntriesForLabels.push(entry));
+            if (matchedEntries.length === 0) {
+                ignored.push({ branch: branchLabel, reason: 'sem itens no escopo informado' });
+                branchLines.push(`${shortBranch} - ignorada: sem itens no escopo informado`);
+                return;
+            }
+
+            const activePartials = Array.isArray(parsedData?.partialStarts)
+                ? parsedData.partialStarts
+                : (parsedData?.partialStart ? [parsedData.partialStart] : []);
+            const completedPartials = Array.isArray(parsedData?.partialCompleted) ? parsedData.partialCompleted : [];
+            const activeKeys = expandPartialKeys(parsedData, activePartials);
+            const completedKeys = expandPartialKeys(parsedData, completedPartials);
+            const matchedKeys = matchedEntries.map(categoryKey);
+            const doneCount = matchedEntries.filter((entry, index) =>
+                normalizeAuditCategoryStatus(entry.cat?.status) === 'done' || completedKeys.has(matchedKeys[index])
+            ).length;
+            const openCount = matchedKeys.filter(key => activeKeys.has(key)).length;
+            const totals = getScopeTotals(matchedEntries);
+            const financial = getScopeFinancial(parsedData, matchedEntries, totals.cost);
+            const isCompleted = doneCount === matchedEntries.length && matchedEntries.length > 0;
+            const isOpen = !isCompleted && openCount > 0;
+            const branchBase = `${shortBranch}${isCompleted ? '✅' : ''} - mix ${formatInt(totals.mix)} | itens ${formatInt(totals.units)}`;
+
+            if (isCompleted) {
+                branchLines.push(`${branchBase} | Div. ${formatMoney(financial.diffCost)} (${formatPercent(financial.divergencePct)})`);
+            } else {
+                branchLines.push(`${branchBase}${isOpen ? ' | em andamento' : ''}`);
+            }
+
+            const result = addAreaPartialScopeToAuditData(parsedData, scope, openedAt);
+            if (result.matchedCategories === 0) {
+                ignored.push({ branch: branchLabel, reason: 'sem itens no escopo informado' });
+                return;
+            }
+            if (result.addedCategories === 0) {
+                ignored.push({ branch: branchLabel, reason: isCompleted ? 'escopo já concluído' : 'escopo já aberto' });
+                return;
+            }
+
+            willOpen.push({ branch: branchLabel, categories: result.addedCategories, mix: totals.mix, units: totals.units });
+        });
+
+        const scopeLabel = matchedEntriesForLabels.length > 0
+            ? buildAuditScopeLabelWithNames(scopeConfig, matchedEntriesForLabels)
+            : scopeConfig.scopeLabel;
+        const whatsappTitle = matchedEntriesForLabels.length > 0
+            ? buildAuditWhatsappTitle(scopeConfig, matchedEntriesForLabels)
+            : `Auditoria ${scopeConfig.groupList.join(', ') || 'Área inteira'}`;
+        const whatsappText = [
+            `${whatsappTitle}:`,
+            `Abertura: ${openedAtLabel}`,
+            ...branchLines,
+            '',
+            'Boa auditoria!'
+        ].join('\n');
+
+        return {
+            areaName: cleanAreaName,
+            scope,
+            scopeLabel,
+            whatsappTitle,
+            whatsappText,
+            openedAt,
+            openedAtLabel,
+            totalBranches: areaBranches.length,
+            willOpen,
+            ignored
+        };
+    }, [dashboardAuditOverview.branches, dashboardAuditSessions]);
+
+    const rememberAreaPartialWhatsappHistory = useCallback((config: {
+        areaName: string;
+        groupInput: string;
+        deptInput: string;
+        catInput: string;
+    }, openedAt?: string) => {
+        const cleanAreaName = String(config.areaName || '').trim();
+        if (!cleanAreaName) return;
+        const record: AreaPartialWhatsappHistoryItem = {
+            id: `area_partial_whatsapp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            areaName: cleanAreaName,
+            groupInput: String(config.groupInput || '').trim(),
+            deptInput: String(config.deptInput || '').trim(),
+            catInput: String(config.catInput || '').trim(),
+            openedAt: openedAt || new Date().toISOString(),
+            userEmail: currentUser?.email || undefined,
+            userName: currentUser?.name || undefined
+        };
+        const sameScopeKey = [record.areaName, record.groupInput, record.deptInput, record.catInput, record.openedAt].join('|');
+        setAreaPartialWhatsappHistory(prev => [
+            record,
+            ...prev.filter(item => [item.areaName, item.groupInput, item.deptInput, item.catInput, item.openedAt].join('|') !== sameScopeKey)
+        ].slice(0, 30));
+    }, [currentUser?.email, currentUser?.name]);
+
+    const runAreaPartialFromDashboard = useCallback(async (config: {
+        areaName: string;
+        groupInput: string;
+        deptInput: string;
+        catInput: string;
+    }) => {
+        if (!currentUser || areaPartialActionLoading) return;
+        const cleanAreaName = String(config.areaName || '').trim();
+        if (!cleanAreaName) return;
+
+        const { scope } = buildAuditScopeConfig(config.groupInput, config.deptInput, config.catInput);
 
         const areaBranches = dashboardAuditOverview.branches.filter(branch => branch.area === cleanAreaName);
         if (areaBranches.length === 0) {
@@ -8482,23 +8826,11 @@ const App: React.FC = () => {
             return;
         }
 
-        const eligibleCount = areaBranches.filter(branch => !branch.hasOpenPartial).length;
-        if (eligibleCount === 0) {
-            alert('Todas as filiais dessa área já têm contagem parcial aberta. Nenhuma nova parcial foi criada.');
-            return;
-        }
-
-        const confirmMessage = [
-            `Abrir parcial em ${eligibleCount} filial(is) da ${cleanAreaName}?`,
-            `Escopo: ${scopeLabel}.`,
-            'Filiais que já possuem parcial aberta serão ignoradas.'
-        ].join('\n');
-        if (!window.confirm(confirmMessage)) return;
-
+        setAreaPartialDialog(null);
         setAreaPartialActionLoading(cleanAreaName);
         const startedAt = new Date().toISOString();
         const updatedSessions: SupabaseService.DbAuditSession[] = [];
-        const skippedWithPartial: string[] = [];
+        const skippedAlreadyOpenOrDone: string[] = [];
         const skippedNoScope: string[] = [];
         const failedBranches: string[] = [];
 
@@ -8518,22 +8850,48 @@ const App: React.FC = () => {
                 }
 
                 const parsedData = parseJsonValue<any>(session.data) || session.data || {};
-                const activePartials = Array.isArray(parsedData?.partialStarts)
-                    ? parsedData.partialStarts
-                    : (parsedData?.partialStart ? [parsedData.partialStart] : []);
-                if (branchMetric.hasOpenPartial || activePartials.filter(Boolean).length > 0) {
-                    skippedWithPartial.push(branchLabel);
-                    continue;
-                }
-
                 const result = addAreaPartialScopeToAuditData(parsedData, scope, startedAt);
-                if (result.matchedCategories === 0 || result.addedCategories === 0) {
+                if (result.matchedCategories === 0) {
                     skippedNoScope.push(branchLabel);
                     continue;
                 }
+                if (result.addedCategories === 0) {
+                    skippedAlreadyOpenOrDone.push(branchLabel);
+                    continue;
+                }
 
+                const batchHistoryRecord: AreaPartialWhatsappHistoryItem = {
+                    id: `area_partial_whatsapp_${cleanAreaName}_${startedAt}_${String(config.groupInput || '')}_${String(config.deptInput || '')}_${String(config.catInput || '')}`,
+                    areaName: cleanAreaName,
+                    groupInput: String(config.groupInput || '').trim(),
+                    deptInput: String(config.deptInput || '').trim(),
+                    catInput: String(config.catInput || '').trim(),
+                    openedAt: startedAt,
+                    userEmail: currentUser.email || undefined,
+                    userName: currentUser.name || undefined
+                };
+                const batchHistoryKey = [
+                    batchHistoryRecord.areaName,
+                    batchHistoryRecord.groupInput,
+                    batchHistoryRecord.deptInput,
+                    batchHistoryRecord.catInput,
+                    batchHistoryRecord.openedAt
+                ].join('|');
+                const existingBatchHistory = Array.isArray((result.data as any)?.areaPartialBatches)
+                    ? (result.data as any).areaPartialBatches
+                    : [];
                 const nextData = {
                     ...result.data,
+                    areaPartialBatches: [
+                        ...existingBatchHistory.filter((item: any) => [
+                            String(item?.areaName || '').trim(),
+                            String(item?.groupInput || '').trim(),
+                            String(item?.deptInput || '').trim(),
+                            String(item?.catInput || '').trim(),
+                            String(item?.openedAt || item?.startedAt || '').trim()
+                        ].join('|') !== batchHistoryKey),
+                        batchHistoryRecord
+                    ].slice(-40),
                     filial: session.branch
                 };
                 const saved = await SupabaseService.upsertAuditSession({
@@ -8556,6 +8914,7 @@ const App: React.FC = () => {
             }
 
             if (updatedSessions.length > 0) {
+                rememberAreaPartialWhatsappHistory(config, startedAt);
                 const updatedByKey = new Map(updatedSessions.map(session => [
                     `${normalizeBranchLabel(session.branch)}_${Number(session.audit_number || 0)}`,
                     session
@@ -8590,7 +8949,7 @@ const App: React.FC = () => {
                 event_meta: {
                     scope,
                     applied_branches: updatedSessions.map(session => normalizeBranchLabel(session.branch)),
-                    skipped_with_partial: skippedWithPartial,
+                    skipped_already_open_or_done: skippedAlreadyOpenOrDone,
                     skipped_no_scope: skippedNoScope,
                     failed_branches: failedBranches
                 }
@@ -8598,7 +8957,7 @@ const App: React.FC = () => {
 
             const summaryLines = [
                 `Parcial aberta em ${updatedSessions.length} filial(is).`,
-                skippedWithPartial.length > 0 ? `Ignoradas com parcial aberta: ${skippedWithPartial.join(', ')}.` : null,
+                skippedAlreadyOpenOrDone.length > 0 ? `Ignoradas já abertas/concluídas: ${skippedAlreadyOpenOrDone.join(', ')}.` : null,
                 skippedNoScope.length > 0 ? `Sem itens no escopo informado: ${skippedNoScope.join(', ')}.` : null,
                 failedBranches.length > 0 ? `Falha ao salvar: ${failedBranches.join(', ')}.` : null
             ].filter(Boolean);
@@ -8615,8 +8974,93 @@ const App: React.FC = () => {
         dashboardAuditOverview.branches,
         dashboardAuditSessions,
         dashboardAuditBranchCandidates,
-        buildAuditDashboardCacheKey
+        buildAuditDashboardCacheKey,
+        rememberAreaPartialWhatsappHistory
     ]);
+
+    const areaPartialPreview = useMemo(() => {
+        if (!areaPartialDialog) return null;
+        return buildAreaPartialWhatsappPreview(areaPartialDialog);
+    }, [areaPartialDialog, buildAreaPartialWhatsappPreview]);
+
+    const areaPartialWhatsappSessionHistory = useMemo(() => {
+        const byKey = new Map<string, AreaPartialWhatsappHistoryItem>();
+        dashboardAuditSessions.forEach(session => {
+            const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+            const batches = Array.isArray(parsedData?.areaPartialBatches) ? parsedData.areaPartialBatches : [];
+            batches.forEach((batch: any) => {
+                const item: AreaPartialWhatsappHistoryItem = {
+                    id: String(batch?.id || ''),
+                    areaName: String(batch?.areaName || '').trim(),
+                    groupInput: String(batch?.groupInput || '').trim(),
+                    deptInput: String(batch?.deptInput || '').trim(),
+                    catInput: String(batch?.catInput || '').trim(),
+                    openedAt: String(batch?.openedAt || batch?.startedAt || '').trim(),
+                    userEmail: batch?.userEmail ? String(batch.userEmail) : undefined,
+                    userName: batch?.userName ? String(batch.userName) : undefined
+                };
+                if (!item.areaName || !item.openedAt) return;
+                const key = [item.areaName, item.groupInput, item.deptInput, item.catInput, item.openedAt].join('|');
+                byKey.set(key, {
+                    ...item,
+                    id: item.id || `area_partial_whatsapp_${key}`
+                });
+            });
+        });
+        return Array.from(byKey.values()).sort((a, b) => {
+            const aTime = new Date(a.openedAt).getTime() || 0;
+            const bTime = new Date(b.openedAt).getTime() || 0;
+            return bTime - aTime;
+        });
+    }, [dashboardAuditSessions]);
+
+    const areaPartialWhatsappHistoryItems = useMemo(() => (
+        Array.from([...areaPartialWhatsappSessionHistory, ...areaPartialWhatsappHistory]
+            .reduce((acc, item) => {
+                const key = [item.areaName, item.groupInput, item.deptInput, item.catInput, item.openedAt].join('|');
+                if (!acc.has(key)) acc.set(key, item);
+                return acc;
+            }, new Map<string, AreaPartialWhatsappHistoryItem>())
+            .values()).sort((a, b) => {
+            const aTime = new Date(a.openedAt).getTime() || 0;
+            const bTime = new Date(b.openedAt).getTime() || 0;
+            return bTime - aTime;
+        })
+    ), [areaPartialWhatsappHistory, areaPartialWhatsappSessionHistory]);
+
+    const areaPartialWhatsappHistoryPreviews = useMemo(() => (
+        areaPartialWhatsappHistoryItems.map(item => ({
+            item,
+            preview: buildAreaPartialWhatsappPreview(item)
+        }))
+    ), [areaPartialWhatsappHistoryItems, buildAreaPartialWhatsappPreview]);
+
+    const copyAreaPartialWhatsappText = useCallback(async (text: string, config?: {
+        areaName: string;
+        groupInput: string;
+        deptInput: string;
+        catInput: string;
+        openedAt?: string;
+    }) => {
+        const cleanText = String(text || '').trim();
+        if (!cleanText) return;
+        try {
+            if (navigator?.clipboard?.writeText) {
+                await navigator.clipboard.writeText(cleanText);
+                setAreaPartialWhatsappCopyStatus('Texto copiado para o WhatsApp.');
+            } else {
+                window.prompt('Copie o texto para o WhatsApp:', cleanText);
+                setAreaPartialWhatsappCopyStatus('Texto pronto para copiar.');
+            }
+            if (config) {
+                rememberAreaPartialWhatsappHistory(config, config.openedAt);
+            }
+        } catch {
+            window.prompt('Copie o texto para o WhatsApp:', cleanText);
+            setAreaPartialWhatsappCopyStatus('Texto pronto para copiar.');
+        }
+        window.setTimeout(() => setAreaPartialWhatsappCopyStatus(null), 2500);
+    }, [rememberAreaPartialWhatsappHistory]);
 
     const resolveAuditJumpCompany = useCallback((branchLabel: string, areaName?: string, companyId?: string, companyName?: string) => {
         const normalizedBranch = normalizeBranchLabel(branchLabel);
@@ -13966,6 +14410,216 @@ const App: React.FC = () => {
                                 </div>
                             </div>
                         </div>
+                    )}
+
+                    {areaPartialDialog && currentUser && typeof document !== 'undefined' && createPortal(
+                        <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4">
+                            <div className="absolute inset-0 bg-slate-950/50 backdrop-blur-[2px]" />
+                            <form
+                                className="relative w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-3xl border border-white/30 bg-white shadow-2xl p-6 md:p-7"
+                                onSubmit={(event) => {
+                                    event.preventDefault();
+                                    void runAreaPartialFromDashboard(areaPartialDialog);
+                                }}
+                            >
+                                <div className="flex items-start justify-between gap-4">
+                                    <div>
+                                        <p className="text-[10px] uppercase tracking-widest text-indigo-500 font-black">Contagem parcial por área</p>
+                                        <h3 className="text-xl font-black text-slate-900">Abrir parcial na {areaPartialDialog.areaName}</h3>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setAreaPartialDialog(null)}
+                                        disabled={!!areaPartialActionLoading}
+                                        className="h-9 w-9 rounded-xl border border-slate-200 text-slate-400 hover:text-slate-700 hover:bg-slate-50 transition disabled:opacity-50"
+                                        title="Fechar"
+                                    >
+                                        <X size={18} className="mx-auto" />
+                                    </button>
+                                </div>
+
+                                <div className="mt-5 grid grid-cols-1 gap-4">
+                                    <div>
+                                        <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2">Grupo</label>
+                                        <input
+                                            type="text"
+                                            value={areaPartialDialog.groupInput}
+                                            onChange={(e) => setAreaPartialDialog(prev => prev ? { ...prev, groupInput: e.target.value } : prev)}
+                                            className="w-full rounded-xl border border-slate-200 px-3 py-3 text-sm font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                                            placeholder="Ex: 3000, 4000"
+                                            disabled={!!areaPartialActionLoading}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2">Departamento</label>
+                                        <input
+                                            type="text"
+                                            value={areaPartialDialog.deptInput}
+                                            onChange={(e) => setAreaPartialDialog(prev => prev ? { ...prev, deptInput: e.target.value } : prev)}
+                                            className="w-full rounded-xl border border-slate-200 px-3 py-3 text-sm font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                                            placeholder="Ex: 121, 122"
+                                            disabled={!!areaPartialActionLoading}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2">Categoria</label>
+                                        <input
+                                            type="text"
+                                            value={areaPartialDialog.catInput}
+                                            onChange={(e) => setAreaPartialDialog(prev => prev ? { ...prev, catInput: e.target.value } : prev)}
+                                            className="w-full rounded-xl border border-slate-200 px-3 py-3 text-sm font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                                            placeholder="Ex: 89, 90"
+                                            disabled={!!areaPartialActionLoading}
+                                        />
+                                    </div>
+                                </div>
+
+                                <div className="mt-5 rounded-2xl border border-indigo-100 bg-indigo-50/60 p-4">
+                                    <p className="text-[10px] font-black uppercase tracking-widest text-indigo-500">Prévia da abertura</p>
+                                    <p className="mt-1 text-sm font-black text-slate-900">
+                                        {areaPartialPreview?.scopeLabel || 'Área inteira'}
+                                    </p>
+                                    <div className="mt-3 grid grid-cols-3 gap-2">
+                                        <div className="rounded-xl bg-white border border-indigo-100 px-3 py-2">
+                                            <p className="text-[9px] font-black uppercase tracking-widest text-slate-400">Filiais</p>
+                                            <p className="text-lg font-black text-slate-900">{areaPartialPreview?.totalBranches || 0}</p>
+                                        </div>
+                                        <div className="rounded-xl bg-white border border-emerald-100 px-3 py-2">
+                                            <p className="text-[9px] font-black uppercase tracking-widest text-emerald-500">Vai abrir</p>
+                                            <p className="text-lg font-black text-emerald-600">{areaPartialPreview?.willOpen.length || 0}</p>
+                                        </div>
+                                        <div className="rounded-xl bg-white border border-amber-100 px-3 py-2">
+                                            <p className="text-[9px] font-black uppercase tracking-widest text-amber-500">Ignora</p>
+                                            <p className="text-lg font-black text-amber-600">{areaPartialPreview?.ignored.length || 0}</p>
+                                        </div>
+                                    </div>
+
+                                    {(areaPartialPreview?.willOpen.length || 0) > 0 && (
+                                        <div className="mt-3">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-600">Será aberta</p>
+                                            <div className="mt-1 max-h-24 overflow-y-auto rounded-xl bg-white border border-emerald-100 divide-y divide-emerald-50">
+                                                {areaPartialPreview?.willOpen.map(item => (
+                                                    <div key={item.branch} className="flex items-center justify-between gap-3 px-3 py-2 text-xs font-bold">
+                                                        <span className="text-slate-700">{item.branch}</span>
+                                                        <span className="text-right text-emerald-600">
+                                                            {item.mix.toLocaleString('pt-BR')} mix / {item.units.toLocaleString('pt-BR')} un. / {item.categories} cat.
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {(areaPartialPreview?.ignored.length || 0) > 0 && (
+                                        <div className="mt-3">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-amber-600">Será ignorada</p>
+                                            <div className="mt-1 max-h-28 overflow-y-auto rounded-xl bg-white border border-amber-100 divide-y divide-amber-50">
+                                                {areaPartialPreview?.ignored.map(item => (
+                                                    <div key={`${item.branch}-${item.reason}`} className="px-3 py-2 text-xs font-bold">
+                                                        <span className="text-slate-700">{item.branch}</span>
+                                                        <span className="block text-amber-700">{item.reason}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {showAreaPartialWhatsappPanel && (
+                                    <div className="mt-5 rounded-2xl border border-emerald-100 bg-emerald-50/70 p-4">
+                                        <div className="flex flex-wrap items-center justify-between gap-3">
+                                            <div>
+                                                <p className="text-[10px] font-black uppercase tracking-widest text-emerald-600">Texto para WhatsApp</p>
+                                                <p className="text-xs font-bold text-slate-500">
+                                                    Atualiza os checkmarks e divergências conforme as contagens forem encerradas.
+                                                </p>
+                                            </div>
+                                            <button
+                                                type="button"
+                                                onClick={() => void copyAreaPartialWhatsappText(areaPartialPreview?.whatsappText || '')}
+                                                disabled={!areaPartialPreview?.whatsappText}
+                                                className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-3 py-2 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-emerald-500 disabled:opacity-50"
+                                            >
+                                                <Clipboard size={13} />
+                                                Copiar texto
+                                            </button>
+                                        </div>
+                                        <textarea
+                                            readOnly
+                                            value={areaPartialPreview?.whatsappText || ''}
+                                            className="mt-3 h-40 w-full resize-none rounded-xl border border-emerald-100 bg-white p-3 text-xs font-semibold leading-relaxed text-slate-800 focus:outline-none"
+                                        />
+                                        {areaPartialWhatsappCopyStatus && (
+                                            <p className="mt-2 text-[10px] font-black uppercase tracking-widest text-emerald-700">
+                                                {areaPartialWhatsappCopyStatus}
+                                            </p>
+                                        )}
+
+                                        <div className="mt-4 border-t border-emerald-100 pt-4">
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-600">Histórico</p>
+                                            {areaPartialWhatsappHistoryPreviews.length === 0 ? (
+                                                <div className="mt-2 rounded-xl border border-dashed border-emerald-200 bg-white/70 p-3 text-xs font-bold text-slate-400">
+                                                    Nenhuma abertura por área registrada neste navegador.
+                                                </div>
+                                            ) : (
+                                                <div className="mt-2 max-h-64 space-y-2 overflow-y-auto pr-1">
+                                                    {areaPartialWhatsappHistoryPreviews.slice(0, 8).map(({ item, preview }) => (
+                                                        <div key={item.id} className="rounded-xl border border-emerald-100 bg-white p-3">
+                                                            <div className="flex flex-wrap items-start justify-between gap-2">
+                                                                <div>
+                                                                    <p className="text-xs font-black text-slate-900">{preview.whatsappTitle}</p>
+                                                                    <p className="text-[10px] font-bold text-slate-400">{preview.openedAtLabel}</p>
+                                                                </div>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => void copyAreaPartialWhatsappText(preview.whatsappText)}
+                                                                    className="rounded-lg border border-emerald-100 bg-emerald-50 px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-emerald-700 transition hover:bg-emerald-100"
+                                                                >
+                                                                    Copiar
+                                                                </button>
+                                                            </div>
+                                                            <pre className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-2 text-[10px] font-semibold leading-relaxed text-slate-700">
+                                                                {preview.whatsappText}
+                                                            </pre>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowAreaPartialWhatsappPanel(prev => !prev)}
+                                        className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-emerald-100 bg-emerald-50 text-xs font-black uppercase tracking-widest text-emerald-700 hover:bg-emerald-100 transition"
+                                    >
+                                        <MessageSquareQuote size={14} />
+                                        WhatsApp
+                                    </button>
+                                    <div className="flex flex-wrap justify-end gap-3">
+                                        <button
+                                            type="button"
+                                            onClick={() => setAreaPartialDialog(null)}
+                                            disabled={!!areaPartialActionLoading}
+                                            className="px-4 py-2.5 rounded-xl border border-slate-200 bg-white text-xs font-black uppercase tracking-widest text-slate-600 hover:bg-slate-50 transition disabled:opacity-50"
+                                        >
+                                            Cancelar
+                                        </button>
+                                        <button
+                                            type="submit"
+                                            disabled={!!areaPartialActionLoading || (areaPartialPreview?.willOpen.length || 0) === 0}
+                                            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-indigo-600 text-white text-xs font-black uppercase tracking-widest hover:bg-indigo-500 transition disabled:opacity-50"
+                                        >
+                                            {areaPartialActionLoading ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+                                            Abrir parcial
+                                        </button>
+                                    </div>
+                                </div>
+                            </form>
+                        </div>,
+                        document.body
                     )}
 
                     {showBranchSelectionModal && currentUser && currentUser.role !== 'MASTER' && typeof document !== 'undefined' && createPortal(
