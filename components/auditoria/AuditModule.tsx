@@ -10987,6 +10987,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 if (seenCats.has(catKey)) return;
                 seenCats.add(catKey);
                 skus += cat.itemsCount;
+                units += cat.totalQuantity;
             });
         });
         return { skus, units };
