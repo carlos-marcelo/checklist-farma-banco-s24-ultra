@@ -9049,7 +9049,8 @@ const App: React.FC = () => {
             openedAtLabel,
             totalBranches: areaBranches.length,
             willOpen,
-            ignored
+            ignored,
+            completedBranchLabels
         };
     }, [dashboardAuditOverview.branches, dashboardAuditSessions]);
 
@@ -15066,8 +15067,9 @@ const App: React.FC = () => {
                                                                     <button
                                                                         type="button"
                                                                         onClick={() => void handleUndoAreaPartialBatch(item)}
-                                                                        disabled={!!areaPartialActionLoading}
-                                                                        className="rounded-lg border border-amber-100 bg-amber-50 px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-amber-700 transition hover:bg-amber-100 disabled:opacity-50"
+                                                                        disabled={!!areaPartialActionLoading || preview.completedBranchLabels.length > 0}
+                                                                        title={preview.completedBranchLabels.length > 0 ? "Não é possível desfazer pois já existem filiais que concluíram a contagem" : "Desfazer contagem parcial em andamento"}
+                                                                        className="rounded-lg border border-amber-100 bg-amber-50 px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-amber-700 transition hover:bg-amber-100 disabled:opacity-50 disabled:cursor-not-allowed"
                                                                     >
                                                                         Desfazer Todas
                                                                     </button>
