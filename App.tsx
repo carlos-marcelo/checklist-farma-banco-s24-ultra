@@ -9230,6 +9230,124 @@ const App: React.FC = () => {
         rememberAreaPartialWhatsappHistory
     ]);
 
+    const handleUndoAreaPartialBatch = useCallback(async (item: AreaPartialWhatsappHistoryItem) => {
+        if (!currentUser || areaPartialActionLoading) return;
+        const cleanAreaName = String(item.areaName || '').trim();
+        if (!cleanAreaName) return;
+
+        const { scope } = buildAuditScopeConfig(item.groupInput, item.deptInput, item.catInput);
+
+        const areaBranches = dashboardAuditOverview.branches.filter(branch => branch.area === cleanAreaName);
+        if (areaBranches.length === 0) {
+            alert('Não há auditorias abertas nessa área.');
+            return;
+        }
+
+        if (!window.confirm(`Deseja realmente desfazer a contagem parcial (excluir) para as filiais da área ${cleanAreaName}?`)) return;
+
+        setAreaPartialActionLoading(cleanAreaName);
+        const updatedSessions: SupabaseService.DbAuditSession[] = [];
+        const failedBranches: string[] = [];
+
+        try {
+            for (const branchMetric of areaBranches) {
+                const branchLabel = normalizeBranchLabel(branchMetric.branch);
+                const auditNumber = Number(branchMetric.auditNumber || 0);
+                const session = dashboardAuditSessions.find(row =>
+                    normalizeBranchLabel(row.branch) === branchLabel &&
+                    Number(row.audit_number || 0) === auditNumber &&
+                    row.status === 'open'
+                );
+
+                if (!session) continue;
+
+                const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+                const activePartials = Array.isArray(parsedData?.partialStarts)
+                    ? parsedData.partialStarts
+                    : (parsedData?.partialStart ? [parsedData.partialStart] : []);
+                
+                if (activePartials.length === 0) continue;
+
+                const toUndo = activePartials.filter((p: any) => isPartialScopeMatch(p, scope.groupId, scope.deptId, scope.catId));
+                if (toUndo.length === 0) continue;
+
+                const remaining = activePartials.filter((p: any) => !isPartialScopeMatch(p, scope.groupId, scope.deptId, scope.catId));
+
+                const nextData = {
+                    ...parsedData,
+                    partialStarts: remaining
+                };
+
+                const saved = await SupabaseService.upsertAuditSession({
+                    ...session,
+                    data: nextData,
+                    progress: calculateAuditDataProgress(nextData),
+                    user_email: currentUser.email || session.user_email
+                });
+
+                if (!saved) {
+                    failedBranches.push(branchLabel);
+                    continue;
+                }
+
+                updatedSessions.push(saved);
+                await Promise.all(buildBranchQueryVariants(session.branch).map(variant =>
+                    CacheService.remove(`audit_session_${variant}`)
+                ));
+            }
+
+            if (updatedSessions.length > 0) {
+                const updatedByKey = new Map(updatedSessions.map(session => [
+                    `${normalizeBranchLabel(session.branch)}_${Number(session.audit_number || 0)}`,
+                    session
+                ]));
+                setDashboardAuditSessions(prev => prev.map(session => {
+                    const key = `${normalizeBranchLabel(session.branch)}_${Number(session.audit_number || 0)}`;
+                    return updatedByKey.get(key) || session;
+                }));
+
+                const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates)).filter(Boolean);
+                const dashboardCacheKey = buildAuditDashboardCacheKey('open', queryBranches);
+                CacheService.remove(dashboardCacheKey);
+            }
+
+            SupabaseService.logAuditEvent({
+                action: 'AREA_PARTIAL_UNDO_BATCH',
+                entity: 'audit_session',
+                area: cleanAreaName,
+                user_email: currentUser.email,
+                user_name: currentUser.name || null,
+                target_user_email: null,
+                target_user_name: null,
+                entity_id: cleanAreaName,
+                status: failedBranches.length > 0 ? 'partial' : 'success',
+                success: failedBranches.length === 0,
+                source: 'web',
+                event_meta: {
+                    scope,
+                    applied_branches: updatedSessions.map(session => normalizeBranchLabel(session.branch)),
+                    failed_branches: failedBranches
+                }
+            }).catch(() => { });
+
+            alert(failedBranches.length > 0 
+                ? `Parcial desfeita em ${updatedSessions.length} filial(is). Falha ao salvar: ${failedBranches.join(', ')}.`
+                : `Parcial desfeita com sucesso em ${updatedSessions.length} filial(is).`);
+        } catch (error) {
+            console.error('Erro ao desfazer parcial por área:', error);
+            alert('Erro ao desfazer parcial por área. Nenhuma filial com falha foi alterada.');
+        } finally {
+            setAreaPartialActionLoading(null);
+        }
+    }, [
+        currentUser,
+        areaPartialActionLoading,
+        dashboardAuditOverview.branches,
+        dashboardAuditSessions,
+        dashboardAuditBranchCandidates,
+        buildAuditDashboardCacheKey
+    ]);
+
     const areaPartialPreview = useMemo(() => {
         if (!areaPartialDialog) return null;
         return buildAreaPartialWhatsappPreview(areaPartialDialog);
@@ -9258,13 +9376,79 @@ const App: React.FC = () => {
                     id: item.id || `area_partial_whatsapp_${key}`
                 });
             });
+
+            if (session.status !== 'open') return;
+            const branchInfo = dashboardAuditOverview.branches.find(b => normalizeBranchLabel(b.branch) === normalizeBranchLabel(session.branch));
+            if (!branchInfo || !branchInfo.area) return;
+
+            const activePartials = Array.isArray(parsedData?.partialStarts)
+                ? parsedData.partialStarts
+                : (parsedData?.partialStart ? [parsedData.partialStart] : []);
+            
+            const buckets = new Map<string, { groupIds: Set<string>, deptIds: Set<string>, catIds: Set<string>, openedAt: string }>();
+
+            activePartials.forEach((partial: any) => {
+                if (!partial.startedAt) return;
+                const groupInput = normalizeAuditScopeValue(partial.groupId);
+                const deptInput = normalizeAuditScopeValue(partial.deptId);
+                const catInput = normalizeAuditScopeValue(partial.catId);
+                const openedAt = String(partial.startedAt).trim();
+                
+                const startedAtTime = new Date(openedAt).getTime();
+                if (Number.isNaN(startedAtTime)) return;
+                const timeBucket = Math.floor(startedAtTime / (5 * 60 * 1000));
+                const dynamicKey = [branchInfo.area, `t_${timeBucket}`].join('|');
+                
+                if (!buckets.has(dynamicKey)) {
+                    buckets.set(dynamicKey, { groupIds: new Set(), deptIds: new Set(), catIds: new Set(), openedAt });
+                }
+                const bucket = buckets.get(dynamicKey)!;
+                if (groupInput) bucket.groupIds.add(groupInput);
+                if (deptInput) bucket.deptIds.add(deptInput);
+                if (catInput) bucket.catIds.add(catInput);
+            });
+
+            buckets.forEach((bucket, dynamicKey) => {
+                const groupInput = Array.from(bucket.groupIds).filter(Boolean).join(', ');
+                const deptInput = Array.from(bucket.deptIds).filter(Boolean).join(', ');
+                const catInput = Array.from(bucket.catIds).filter(Boolean).join(', ');
+
+                if (!byKey.has(dynamicKey)) {
+                    byKey.set(dynamicKey, {
+                        id: `reconstructed_${dynamicKey}`,
+                        areaName: branchInfo.area,
+                        groupInput,
+                        deptInput,
+                        catInput,
+                        openedAt: bucket.openedAt,
+                        userEmail: session.user_email || undefined
+                    });
+                }
+            });
         });
-        return Array.from(byKey.values()).sort((a, b) => {
-            const aTime = new Date(a.openedAt).getTime() || 0;
-            const bTime = new Date(b.openedAt).getTime() || 0;
-            return bTime - aTime;
-        });
-    }, [dashboardAuditSessions]);
+
+        const finalItems: AreaPartialWhatsappHistoryItem[] = [];
+        Array.from(byKey.values())
+            .sort((a, b) => {
+                const aTime = new Date(a.openedAt).getTime() || 0;
+                const bTime = new Date(b.openedAt).getTime() || 0;
+                return bTime - aTime;
+            })
+            .forEach(item => {
+                const itemTime = new Date(item.openedAt).getTime();
+                const isDuplicate = finalItems.some(existing => {
+                    const existingTime = new Date(existing.openedAt).getTime();
+                    return item.areaName === existing.areaName &&
+                        item.groupInput === existing.groupInput &&
+                        item.deptInput === existing.deptInput &&
+                        item.catInput === existing.catInput &&
+                        Math.abs(existingTime - itemTime) < 5 * 60 * 1000;
+                });
+                if (!isDuplicate) finalItems.push(item);
+            });
+
+        return finalItems;
+    }, [dashboardAuditSessions, dashboardAuditOverview.branches]);
 
     const areaPartialWhatsappHistoryItems = useMemo(() => (
         Array.from([...areaPartialWhatsappSessionHistory, ...areaPartialWhatsappHistory]
@@ -14702,9 +14886,16 @@ const App: React.FC = () => {
                                     <div>
                                         <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2">Grupo</label>
                                         <input
+                                            id="area-partial-group-input"
                                             type="text"
                                             value={areaPartialDialog.groupInput}
                                             onChange={(e) => setAreaPartialDialog(prev => prev ? { ...prev, groupInput: e.target.value } : prev)}
+                                            onKeyDown={(e) => {
+                                                if (e.key === 'Enter') {
+                                                    e.preventDefault();
+                                                    document.getElementById('area-partial-dept-input')?.focus();
+                                                }
+                                            }}
                                             className="w-full rounded-xl border border-slate-200 px-3 py-3 text-sm font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                                             placeholder="Ex: 3000, 4000"
                                             disabled={!!areaPartialActionLoading}
@@ -14713,9 +14904,16 @@ const App: React.FC = () => {
                                     <div>
                                         <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2">Departamento</label>
                                         <input
+                                            id="area-partial-dept-input"
                                             type="text"
                                             value={areaPartialDialog.deptInput}
                                             onChange={(e) => setAreaPartialDialog(prev => prev ? { ...prev, deptInput: e.target.value } : prev)}
+                                            onKeyDown={(e) => {
+                                                if (e.key === 'Enter') {
+                                                    e.preventDefault();
+                                                    document.getElementById('area-partial-cat-input')?.focus();
+                                                }
+                                            }}
                                             className="w-full rounded-xl border border-slate-200 px-3 py-3 text-sm font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                                             placeholder="Ex: 121, 122"
                                             disabled={!!areaPartialActionLoading}
@@ -14724,9 +14922,15 @@ const App: React.FC = () => {
                                     <div>
                                         <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2">Categoria</label>
                                         <input
+                                            id="area-partial-cat-input"
                                             type="text"
                                             value={areaPartialDialog.catInput}
                                             onChange={(e) => setAreaPartialDialog(prev => prev ? { ...prev, catInput: e.target.value } : prev)}
+                                            onKeyDown={(e) => {
+                                                if (e.key === 'Enter') {
+                                                    e.preventDefault();
+                                                }
+                                            }}
                                             className="w-full rounded-xl border border-slate-200 px-3 py-3 text-sm font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                                             placeholder="Ex: 89, 90"
                                             disabled={!!areaPartialActionLoading}
@@ -14830,15 +15034,25 @@ const App: React.FC = () => {
                                                                     <p className="text-xs font-black text-slate-900">{preview.whatsappTitle}</p>
                                                                     <p className="text-[10px] font-bold text-slate-400">{preview.openedAtLabel}</p>
                                                                 </div>
-                                                                <button
-                                                                    type="button"
-                                                                    onClick={() => void copyAreaPartialWhatsappText(preview.whatsappText)}
-                                                                    className="rounded-lg border border-emerald-100 bg-emerald-50 px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-emerald-700 transition hover:bg-emerald-100"
-                                                                >
-                                                                    Copiar
-                                                                </button>
+                                                                <div className="flex items-center gap-2">
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => void handleUndoAreaPartialBatch(item)}
+                                                                        disabled={!!areaPartialActionLoading}
+                                                                        className="rounded-lg border border-amber-100 bg-amber-50 px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-amber-700 transition hover:bg-amber-100 disabled:opacity-50"
+                                                                    >
+                                                                        Desfazer Todas
+                                                                    </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => void copyAreaPartialWhatsappText(preview.whatsappText)}
+                                                                        className="rounded-lg border border-emerald-100 bg-emerald-50 px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-emerald-700 transition hover:bg-emerald-100"
+                                                                    >
+                                                                        Copiar
+                                                                    </button>
+                                                                </div>
                                                             </div>
-                                                            <pre className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-2 text-[10px] font-semibold leading-relaxed text-slate-700">
+                                                            <pre className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-2 text-[10px] font-semibold leading-relaxed text-slate-700">
                                                                 {preview.whatsappText}
                                                             </pre>
                                                         </div>
