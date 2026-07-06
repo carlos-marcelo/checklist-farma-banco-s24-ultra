@@ -891,7 +891,6 @@ const compactPartialScopesForAuditData = (
     (Array.isArray(auditData?.groups) ? auditData!.groups : []).forEach(group => {
         const groupOpenKeys = (group.departments || []).flatMap(dept =>
             (dept.categories || [])
-                .filter(cat => !isDoneStatus(cat.status))
                 .map(cat => categoryKey(group, dept, cat))
         );
         if (groupOpenKeys.length > 0 && groupOpenKeys.every(key => selected.has(key))) {
@@ -905,7 +904,6 @@ const compactPartialScopesForAuditData = (
 
         (group.departments || []).forEach(dept => {
             const deptOpenKeys = (dept.categories || [])
-                .filter(cat => !isDoneStatus(cat.status))
                 .map(cat => categoryKey(group, dept, cat));
             if (deptOpenKeys.length > 0 && deptOpenKeys.every(key => selected.has(key))) {
                 compacted.push({
@@ -10957,7 +10955,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         data.partialStarts.forEach(scope => {
             const startedAt = scope.startedAt || new Date().toISOString();
             const expanded = getScopeCategories(scope.groupId, scope.deptId, scope.catId);
-            expanded.forEach(({ group, dept, cat }) => addCat(group, dept, cat, startedAt));
+            expanded.forEach(({ group, dept, cat }) => {
+                if (isDoneStatus(cat.status)) return;
+                addCat(group, dept, cat, startedAt);
+            });
         });
 
         return Array.from(bucket.values()).map(entry => ({
@@ -10981,11 +10982,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         data.partialStarts.forEach(scope => {
             const expanded = getScopeCategories(scope.groupId, scope.deptId, scope.catId);
             expanded.forEach(({ group, dept, cat }) => {
+                if (isDoneStatus(cat.status)) return;
                 const catKey = partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id });
                 if (seenCats.has(catKey)) return;
                 seenCats.add(catKey);
                 skus += cat.itemsCount;
-                units += cat.totalQuantity;
             });
         });
         return { skus, units };

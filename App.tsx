@@ -510,7 +510,6 @@ const compactAuditPartialScopesForData = (
     (Array.isArray(auditData?.groups) ? auditData.groups : []).forEach((group: any) => {
         const groupOpenKeys = (group?.departments || []).flatMap((dept: any) =>
             (dept?.categories || [])
-                .filter((cat: any) => normalizeAuditCategoryStatus(cat?.status) !== 'done')
                 .map((cat: any) => auditPartialScopeKey({ groupId: group?.id, deptId: dept?.id, catId: cat?.id }))
         );
         if (groupOpenKeys.length > 0 && groupOpenKeys.every((key: string) => selected.has(key))) {
@@ -524,7 +523,6 @@ const compactAuditPartialScopesForData = (
 
         (group?.departments || []).forEach((dept: any) => {
             const deptOpenKeys = (dept?.categories || [])
-                .filter((cat: any) => normalizeAuditCategoryStatus(cat?.status) !== 'done')
                 .map((cat: any) => auditPartialScopeKey({ groupId: group?.id, deptId: dept?.id, catId: cat?.id }));
             if (deptOpenKeys.length > 0 && deptOpenKeys.every((key: string) => selected.has(key))) {
                 compacted.push({
