@@ -394,7 +394,8 @@ const buildAuditWhatsappTitle = (
 ) => {
     const groupPart = config.groupList.length > 0 ? config.groupList.join(', ') : 'Área inteira';
     const deptPart = config.deptList.length > 0 ? ` - ${config.deptList.join(', ')}` : '';
-    const catPart = config.catList.length > 0 ? ` - Cat. ${config.catList.join(', ')}` : '';
+    const showCat = config.catList.length > 0 && config.deptList.length === 0;
+    const catPart = showCat ? ` - Cat. ${config.catList.join(', ')}` : '';
     const selectedNames = new Set<string>();
     const collectNames = (selected: string[], level: 'group' | 'dept' | 'cat') => {
         selected.forEach(input => {
@@ -408,7 +409,9 @@ const buildAuditWhatsappTitle = (
         });
     };
     collectNames(config.deptList, 'dept');
-    collectNames(config.catList, 'cat');
+    if (showCat) {
+        collectNames(config.catList, 'cat');
+    }
     if (selectedNames.size === 0) collectNames(config.groupList, 'group');
     const namesPart = selectedNames.size > 0 ? ` (${Array.from(selectedNames).join(', ')})` : '';
     return `Auditoria ${groupPart}${deptPart}${catPart}${namesPart}`;
@@ -8749,6 +8752,7 @@ const App: React.FC = () => {
         const completedBranchLabels: string[] = [];
         const pendingBranchLabels: string[] = [];
         const matchedEntriesForLabels: Array<{ group: any; dept: any; cat: any }> = [];
+        const allEntriesForLabels: Array<{ group: any; dept: any; cat: any }> = [];
         const openedAt = config.openedAt || new Date().toISOString();
         const openedDate = new Date(openedAt);
         const openedAtLabel = Number.isNaN(openedDate.getTime())
@@ -8757,7 +8761,18 @@ const App: React.FC = () => {
 
         const formatInt = (value: number) => Math.round(value || 0).toLocaleString('pt-BR');
         const formatMoney = (value: number) => Number(value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-        const formatRepresentativityPercent = (value: number) => `${Math.abs(Number(value || 0)).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
+        const formatDivergence = (diffCost: number, pct: number) => {
+            const absPct = Math.abs(Number(pct || 0));
+            const pctStr = `${absPct.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
+            let rating = '😭🔴';
+            if (absPct <= 0.10) rating = '🤩🟢';
+            else if (absPct <= 0.30) rating = '🙂🟡';
+            else if (absPct <= 0.70) rating = '😟🟠';
+            
+            const diffValue = Number(diffCost || 0);
+            const typeLabel = diffValue > 0 ? 'Sobra' : (diffValue < 0 ? 'Falta' : 'Div.');
+            return `${typeLabel} ${formatMoney(diffCost)} (${pctStr} - ${rating})`;
+        };
         const categoryKey = (entry: { group: any; dept: any; cat: any }) => auditPartialScopeKey({
             groupId: entry.group?.id,
             deptId: entry.dept?.id,
@@ -8951,6 +8966,9 @@ const App: React.FC = () => {
             const parsedData = parseJsonValue<any>(session.data) || session.data || {};
             const matchedEntries = getAuditDataScopeCategories(parsedData, scope);
             matchedEntries.forEach(entry => matchedEntriesForLabels.push(entry));
+            if (allEntriesForLabels.length === 0) {
+                getAuditDataScopeCategories(parsedData, {}).forEach(entry => allEntriesForLabels.push(entry));
+            }
             if (matchedEntries.length === 0) {
                 ignored.push({ branch: branchLabel, reason: 'sem itens no escopo informado' });
                 pendingBranchLabels.push(shortBranch);
@@ -8981,7 +8999,7 @@ const App: React.FC = () => {
 
             if (isCompleted) {
                 completedBranchLabels.push(shortBranch);
-                branchLines.push(`${branchBase} | Div. ${formatMoney(financial.diffCost)} (${formatRepresentativityPercent(financial.divergencePct)})`);
+                branchLines.push(`${branchBase} | ${formatDivergence(financial.diffCost, financial.divergencePct)}`);
             } else {
                 pendingBranchLabels.push(shortBranch);
                 branchLines.push(`${branchBase}${isOpen ? ' | em andamento' : ''}`);
@@ -9001,10 +9019,10 @@ const App: React.FC = () => {
         });
 
         const scopeLabel = matchedEntriesForLabels.length > 0
-            ? buildAuditScopeLabelWithNames(scopeConfig, matchedEntriesForLabels)
+            ? buildAuditScopeLabelWithNames(scopeConfig, allEntriesForLabels)
             : scopeConfig.scopeLabel;
         const whatsappTitle = matchedEntriesForLabels.length > 0
-            ? buildAuditWhatsappTitle(scopeConfig, matchedEntriesForLabels)
+            ? buildAuditWhatsappTitle(scopeConfig, allEntriesForLabels)
             : `Auditoria ${scopeConfig.groupList.join(', ') || 'Área inteira'}`;
         const whatsappText = (includeCompletionSummary ? [
             `${whatsappTitle}:`,
@@ -9355,7 +9373,12 @@ const App: React.FC = () => {
 
     const areaPartialWhatsappSessionHistory = useMemo(() => {
         const byKey = new Map<string, AreaPartialWhatsappHistoryItem>();
-        dashboardAuditSessions.forEach(session => {
+        let filteredSessions = dashboardAuditSessions;
+        if (openAuditNumberFilter !== 'all') {
+            const tgtNum = Number(openAuditNumberFilter);
+            filteredSessions = filteredSessions.filter(s => Number(s.audit_number || 0) === tgtNum);
+        }
+        filteredSessions.forEach(session => {
             const parsedData = parseJsonValue<any>(session.data) || session.data || {};
             const batches = Array.isArray(parsedData?.areaPartialBatches) ? parsedData.areaPartialBatches : [];
             batches.forEach((batch: any) => {
@@ -9385,9 +9408,12 @@ const App: React.FC = () => {
                 ? parsedData.partialStarts
                 : (parsedData?.partialStart ? [parsedData.partialStart] : []);
             
-            const buckets = new Map<string, { groupIds: Set<string>, deptIds: Set<string>, catIds: Set<string>, openedAt: string }>();
+            const completedPartials = Array.isArray(parsedData?.partialCompleted) ? parsedData.partialCompleted : [];
+            const allPartials = [...activePartials, ...completedPartials];
+            
+            const buckets = new Map<string, { groupIds: Set<string>, deptIds: Set<string>, catIds: Set<string>, openedAt: string, hasActive: boolean }>();
 
-            activePartials.forEach((partial: any) => {
+            allPartials.forEach((partial: any) => {
                 if (!partial.startedAt) return;
                 const groupInput = normalizeAuditScopeValue(partial.groupId);
                 const deptInput = normalizeAuditScopeValue(partial.deptId);
@@ -9400,15 +9426,19 @@ const App: React.FC = () => {
                 const dynamicKey = [branchInfo.area, `t_${timeBucket}`].join('|');
                 
                 if (!buckets.has(dynamicKey)) {
-                    buckets.set(dynamicKey, { groupIds: new Set(), deptIds: new Set(), catIds: new Set(), openedAt });
+                    buckets.set(dynamicKey, { groupIds: new Set(), deptIds: new Set(), catIds: new Set(), openedAt, hasActive: false });
                 }
                 const bucket = buckets.get(dynamicKey)!;
                 if (groupInput) bucket.groupIds.add(groupInput);
                 if (deptInput) bucket.deptIds.add(deptInput);
                 if (catInput) bucket.catIds.add(catInput);
+                if (activePartials.includes(partial)) {
+                    bucket.hasActive = true;
+                }
             });
 
             buckets.forEach((bucket, dynamicKey) => {
+                if (!bucket.hasActive) return;
                 const groupInput = Array.from(bucket.groupIds).filter(Boolean).join(', ');
                 const deptInput = Array.from(bucket.deptIds).filter(Boolean).join(', ');
                 const catInput = Array.from(bucket.catIds).filter(Boolean).join(', ');
@@ -9435,20 +9465,18 @@ const App: React.FC = () => {
                 return bTime - aTime;
             })
             .forEach(item => {
-                const itemTime = new Date(item.openedAt).getTime();
+                const normalizeListStr = (val: string) => parseAuditScopeInputList(val).sort().join(',');
                 const isDuplicate = finalItems.some(existing => {
-                    const existingTime = new Date(existing.openedAt).getTime();
                     return item.areaName === existing.areaName &&
-                        item.groupInput === existing.groupInput &&
-                        item.deptInput === existing.deptInput &&
-                        item.catInput === existing.catInput &&
-                        Math.abs(existingTime - itemTime) < 5 * 60 * 1000;
+                        normalizeListStr(item.groupInput) === normalizeListStr(existing.groupInput) &&
+                        normalizeListStr(item.deptInput) === normalizeListStr(existing.deptInput) &&
+                        normalizeListStr(item.catInput) === normalizeListStr(existing.catInput);
                 });
                 if (!isDuplicate) finalItems.push(item);
             });
 
         return finalItems;
-    }, [dashboardAuditSessions, dashboardAuditOverview.branches]);
+    }, [dashboardAuditSessions, dashboardAuditOverview.branches, openAuditNumberFilter]);
 
     const areaPartialWhatsappHistoryItems = useMemo(() => (
         Array.from([...areaPartialWhatsappSessionHistory, ...areaPartialWhatsappHistory]
