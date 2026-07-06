@@ -313,6 +313,15 @@ const normalizeAuditScopeValue = (value: unknown) =>
 const normalizeAuditScopeDigits = (value: unknown) =>
     String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
 
+const normalizeAuditScopeLastToken = (value: unknown) => {
+    const parts = String(value ?? '').trim().split(/[^0-9A-Za-z]+/).filter(Boolean);
+    const last = parts[parts.length - 1] || '';
+    return {
+        raw: last.toLowerCase(),
+        digits: last.replace(/\D/g, '').replace(/^0+/, '')
+    };
+};
+
 const parseAuditScopeInputList = (value: unknown) =>
     String(value ?? '')
         .split(/[,\n;]+/)
@@ -411,10 +420,17 @@ const auditScopeInputMatches = (input: string | undefined, values: unknown[]) =>
     return inputs.some(part => {
         const rawInput = normalizeAuditScopeValue(part);
         const digitInput = normalizeAuditScopeDigits(part);
+        const lastInput = normalizeAuditScopeLastToken(part);
         return values.some(value => {
             const rawValue = normalizeAuditScopeValue(value);
             const digitValue = normalizeAuditScopeDigits(value);
-            return (!!rawValue && rawValue === rawInput) || (!!digitInput && !!digitValue && digitValue === digitInput);
+            const lastValue = normalizeAuditScopeLastToken(value);
+            return (
+                (!!rawValue && rawValue === rawInput) ||
+                (!!digitInput && !!digitValue && digitValue === digitInput) ||
+                (!!lastInput.raw && !!lastValue.raw && lastValue.raw === lastInput.raw) ||
+                (!!lastInput.digits && !!lastValue.digits && lastValue.digits === lastInput.digits)
+            );
         });
     });
 };
@@ -448,6 +464,89 @@ const getAuditDataScopeCategories = (
         });
     });
     return out;
+};
+
+const compactAuditPartialScopesForData = (
+    auditData: any,
+    partials: Array<{ startedAt?: string; groupId?: unknown; deptId?: unknown; catId?: unknown }>
+) => {
+    const selected = new Map<string, { startedAt: string; groupId: string; deptId: string; catId: string }>();
+    const putSelected = (entry: { group: any; dept: any; cat: any; key: string }, startedAt?: string) => {
+        if (normalizeAuditCategoryStatus(entry.cat?.status) === 'done') return;
+        const nextStartedAt = startedAt || new Date().toISOString();
+        const existing = selected.get(entry.key);
+        if (!existing || new Date(nextStartedAt).getTime() < new Date(existing.startedAt || 0).getTime()) {
+            selected.set(entry.key, {
+                startedAt: nextStartedAt,
+                groupId: normalizeAuditScopeValue(entry.group?.id),
+                deptId: normalizeAuditScopeValue(entry.dept?.id),
+                catId: normalizeAuditScopeValue(entry.cat?.id)
+            });
+        }
+    };
+
+    (partials || []).forEach(partial => {
+        getAuditDataScopeCategories(auditData, {
+            groupId: String(partial?.groupId ?? ''),
+            deptId: String(partial?.deptId ?? ''),
+            catId: String(partial?.catId ?? '')
+        }).forEach(entry => putSelected(entry, String(partial?.startedAt || '')));
+    });
+
+    if (selected.size === 0) return [];
+
+    const consumed = new Set<string>();
+    const compacted: Array<{ startedAt: string; groupId: string; deptId?: string; catId?: string }> = [];
+    const selectedStartedAt = (keys: string[]) => {
+        let best = '';
+        keys.forEach(key => {
+            const startedAt = selected.get(key)?.startedAt || '';
+            if (!startedAt) return;
+            if (!best || new Date(startedAt).getTime() < new Date(best).getTime()) best = startedAt;
+        });
+        return best || new Date().toISOString();
+    };
+
+    (Array.isArray(auditData?.groups) ? auditData.groups : []).forEach((group: any) => {
+        const groupOpenKeys = (group?.departments || []).flatMap((dept: any) =>
+            (dept?.categories || [])
+                .filter((cat: any) => normalizeAuditCategoryStatus(cat?.status) !== 'done')
+                .map((cat: any) => auditPartialScopeKey({ groupId: group?.id, deptId: dept?.id, catId: cat?.id }))
+        );
+        if (groupOpenKeys.length > 0 && groupOpenKeys.every((key: string) => selected.has(key))) {
+            compacted.push({
+                startedAt: selectedStartedAt(groupOpenKeys),
+                groupId: normalizeAuditScopeValue(group?.id)
+            });
+            groupOpenKeys.forEach((key: string) => consumed.add(key));
+            return;
+        }
+
+        (group?.departments || []).forEach((dept: any) => {
+            const deptOpenKeys = (dept?.categories || [])
+                .filter((cat: any) => normalizeAuditCategoryStatus(cat?.status) !== 'done')
+                .map((cat: any) => auditPartialScopeKey({ groupId: group?.id, deptId: dept?.id, catId: cat?.id }));
+            if (deptOpenKeys.length > 0 && deptOpenKeys.every((key: string) => selected.has(key))) {
+                compacted.push({
+                    startedAt: selectedStartedAt(deptOpenKeys),
+                    groupId: normalizeAuditScopeValue(group?.id),
+                    deptId: normalizeAuditScopeValue(dept?.id)
+                });
+                deptOpenKeys.forEach((key: string) => consumed.add(key));
+                return;
+            }
+
+            (dept?.categories || []).forEach((cat: any) => {
+                const key = auditPartialScopeKey({ groupId: group?.id, deptId: dept?.id, catId: cat?.id });
+                const entry = selected.get(key);
+                if (!entry || consumed.has(key)) return;
+                compacted.push(entry);
+                consumed.add(key);
+            });
+        });
+    });
+
+    return compacted;
 };
 
 const calculateAuditDataProgress = (auditData: any) => {
@@ -524,7 +623,7 @@ const addAreaPartialScopeToAuditData = (
 
     const baseData = { ...(auditData || {}) };
     delete (baseData as any).partialStart;
-    const nextPartials = Array.from(partialMap.values());
+    const nextPartials = compactAuditPartialScopesForData(auditData, Array.from(partialMap.values()));
     const nextData = {
         ...baseData,
         partialStarts: nextPartials,
@@ -4166,14 +4265,23 @@ const App: React.FC = () => {
 
         performHeartbeat();
         const interval = setInterval(performHeartbeat, 20000);
+        let wakeHeartbeatTimer: number | null = null;
         const handleWakeHeartbeat = () => {
-            if (!document.hidden) performHeartbeat();
+            if (document.hidden) return;
+            if (wakeHeartbeatTimer !== null) window.clearTimeout(wakeHeartbeatTimer);
+            wakeHeartbeatTimer = window.setTimeout(() => {
+                wakeHeartbeatTimer = null;
+                scheduleBackgroundTask(() => {
+                    if (!document.hidden) void performHeartbeat();
+                }, 1500);
+            }, 500);
         };
         document.addEventListener('visibilitychange', handleWakeHeartbeat);
         window.addEventListener('focus', handleWakeHeartbeat);
 
         return () => {
             clearInterval(interval);
+            if (wakeHeartbeatTimer !== null) window.clearTimeout(wakeHeartbeatTimer);
             document.removeEventListener('visibilitychange', handleWakeHeartbeat);
             window.removeEventListener('focus', handleWakeHeartbeat);
             SupabaseService.deleteActiveSession(clientIdRef.current).catch(() => { });
@@ -4221,14 +4329,23 @@ const App: React.FC = () => {
 
         checkSessionCommand();
         const commandInterval = setInterval(checkSessionCommand, SESSION_COMMAND_POLL_MS);
+        let wakeCommandTimer: number | null = null;
         const handleWakeCommandCheck = () => {
-            if (!document.hidden) checkSessionCommand();
+            if (document.hidden) return;
+            if (wakeCommandTimer !== null) window.clearTimeout(wakeCommandTimer);
+            wakeCommandTimer = window.setTimeout(() => {
+                wakeCommandTimer = null;
+                scheduleBackgroundTask(() => {
+                    if (!document.hidden) void checkSessionCommand();
+                }, 1500);
+            }, 500);
         };
         document.addEventListener('visibilitychange', handleWakeCommandCheck);
         window.addEventListener('focus', handleWakeCommandCheck);
 
         return () => {
             clearInterval(commandInterval);
+            if (wakeCommandTimer !== null) window.clearTimeout(wakeCommandTimer);
             document.removeEventListener('visibilitychange', handleWakeCommandCheck);
             window.removeEventListener('focus', handleWakeCommandCheck);
         };
@@ -4259,8 +4376,16 @@ const App: React.FC = () => {
 
         refreshUsers();
         const interval = setInterval(refreshUsers, USER_APPROVAL_POLL_MS);
+        let wakeUsersTimer: number | null = null;
         const handleWake = () => {
-            if (!document.hidden) refreshUsers();
+            if (document.hidden) return;
+            if (wakeUsersTimer !== null) window.clearTimeout(wakeUsersTimer);
+            wakeUsersTimer = window.setTimeout(() => {
+                wakeUsersTimer = null;
+                scheduleBackgroundTask(() => {
+                    if (!document.hidden) void refreshUsers();
+                }, 1500);
+            }, 500);
         };
         document.addEventListener('visibilitychange', handleWake);
         window.addEventListener('focus', handleWake);
@@ -4268,6 +4393,7 @@ const App: React.FC = () => {
         return () => {
             cancelled = true;
             clearInterval(interval);
+            if (wakeUsersTimer !== null) window.clearTimeout(wakeUsersTimer);
             document.removeEventListener('visibilitychange', handleWake);
             window.removeEventListener('focus', handleWake);
         };
@@ -8611,14 +8737,19 @@ const App: React.FC = () => {
         deptInput: string;
         catInput: string;
         openedAt?: string;
+    }, options?: {
+        includeCompletionSummary?: boolean;
     }) => {
         const cleanAreaName = String(config.areaName || '').trim();
+        const includeCompletionSummary = options?.includeCompletionSummary === true;
         const scopeConfig = buildAuditScopeConfig(config.groupInput, config.deptInput, config.catInput);
         const { scope } = scopeConfig;
         const areaBranches = dashboardAuditOverview.branches.filter(branch => branch.area === cleanAreaName);
         const willOpen: Array<{ branch: string; categories: number; mix: number; units: number }> = [];
         const ignored: Array<{ branch: string; reason: string }> = [];
         const branchLines: string[] = [];
+        const completedBranchLabels: string[] = [];
+        const pendingBranchLabels: string[] = [];
         const matchedEntriesForLabels: Array<{ group: any; dept: any; cat: any }> = [];
         const openedAt = config.openedAt || new Date().toISOString();
         const openedDate = new Date(openedAt);
@@ -8628,12 +8759,53 @@ const App: React.FC = () => {
 
         const formatInt = (value: number) => Math.round(value || 0).toLocaleString('pt-BR');
         const formatMoney = (value: number) => Number(value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-        const formatPercent = (value: number) => `${Number(value || 0) > 0 ? '+' : ''}${Number(value || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
+        const formatRepresentativityPercent = (value: number) => `${Math.abs(Number(value || 0)).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
         const categoryKey = (entry: { group: any; dept: any; cat: any }) => auditPartialScopeKey({
             groupId: entry.group?.id,
             deptId: entry.dept?.id,
             catId: entry.cat?.id
         });
+        const completedBatchId = (entry: any) => String(entry?.batchId || auditPartialScopeKey(entry)).trim();
+        const sameStartedAt = (value: unknown) => {
+            const raw = String(value || '').trim();
+            if (!raw) return false;
+            if (raw === openedAt) return true;
+            const target = new Date(openedAt).getTime();
+            const current = new Date(raw).getTime();
+            return Number.isFinite(target) && Number.isFinite(current) && Math.abs(target - current) <= 2000;
+        };
+        const getEntriesFromCompletedBatch = (
+            auditData: any,
+            completedPartials: any[],
+            fallbackEntries: Array<{ group: any; dept: any; cat: any }>
+        ) => {
+            const fallbackKeys = new Set(fallbackEntries.map(categoryKey));
+            const startedInScope = (completedPartials || []).filter(partial => {
+                if (!sameStartedAt(partial?.startedAt)) return false;
+                return getAuditDataScopeCategories(auditData, {
+                    groupId: partial?.groupId,
+                    deptId: partial?.deptId,
+                    catId: partial?.catId
+                }).some(entry => fallbackKeys.has(entry.key));
+            });
+            const batchIds = new Set(startedInScope.map(completedBatchId).filter(Boolean));
+            if (batchIds.size === 0) return { entries: fallbackEntries, batchId: undefined as string | undefined };
+
+            const batchPartials = (completedPartials || []).filter(partial => batchIds.has(completedBatchId(partial)));
+            const entriesByKey = new Map<string, { group: any; dept: any; cat: any; key: string }>();
+            batchPartials.forEach(partial => {
+                getAuditDataScopeCategories(auditData, {
+                    groupId: partial?.groupId,
+                    deptId: partial?.deptId,
+                    catId: partial?.catId
+                }).forEach(entry => entriesByKey.set(entry.key, entry));
+            });
+
+            return {
+                entries: entriesByKey.size > 0 ? Array.from(entriesByKey.values()) : fallbackEntries,
+                batchId: Array.from(batchIds)[0]
+            };
+        };
         const expandPartialKeys = (auditData: any, partials: any[]) => {
             const keys = new Set<string>();
             (partials || []).filter(Boolean).forEach(partial => {
@@ -8652,8 +8824,10 @@ const App: React.FC = () => {
             let cost = 0;
             entries.forEach(({ group, dept, cat }) => {
                 const products = Array.isArray(cat?.products) ? cat.products : [];
-                const categoryUnits = Number(cat?.totalQuantity || 0) || products.reduce((sum: number, p: any) => sum + Number(p?.quantity || 0), 0);
-                const categoryCost = Number(cat?.totalCost || 0) || products.reduce((sum: number, p: any) => sum + Number(p?.quantity || 0) * Number(p?.cost || 0), 0);
+                const productUnits = products.reduce((sum: number, p: any) => sum + Number(p?.quantity || 0), 0);
+                const productCost = products.reduce((sum: number, p: any) => sum + Number(p?.quantity || 0) * Number(p?.cost || 0), 0);
+                const categoryUnits = products.length > 0 ? productUnits : Number(cat?.totalQuantity || 0);
+                const categoryCost = products.length > 0 ? productCost : Number(cat?.totalCost || 0);
                 units += categoryUnits;
                 cost += categoryCost;
                 if (products.length > 0) {
@@ -8665,10 +8839,41 @@ const App: React.FC = () => {
                     fallbackMix += Number(cat?.itemsCount || 0);
                 }
             });
-            return { mix: codes.size + fallbackMix, units, cost };
+            return { mix: codes.size + fallbackMix, units, cost: roundAuditMoney(cost) };
         };
-        const getScopeFinancial = (parsedData: any, entries: Array<{ group: any; dept: any; cat: any }>, scopeCost: number) => {
-            const termMetrics = getAuditTermMetricsFromData(parsedData);
+        const getExactCustomTermMetrics = (
+            parsedData: any,
+            entries: Array<{ group: any; dept: any; cat: any }>,
+            batchId?: string
+        ) => {
+            if (!batchId || entries.length === 0) return null;
+            const customKey = entries
+                .map(({ group, dept, cat }) => auditPartialScopeKey({ groupId: group?.id, deptId: dept?.id, catId: cat?.id }))
+                .filter(Boolean)
+                .sort()
+                .join(',');
+            if (!customKey) return null;
+            const key = `custom|${batchId}|${customKey}`;
+            const legacyKey = `custom|${customKey}`;
+            const drafts = ((parsedData?.termDrafts || {}) as Record<string, any>);
+            const metricsStore = ((parsedData?.termExcelMetricsByKey || {}) as Record<string, any>);
+            const directMetrics = pickPreferredAuditTermMetrics(
+                drafts[key]?.excelMetrics,
+                metricsStore[key],
+                drafts[legacyKey]?.excelMetrics,
+                metricsStore[legacyKey]
+            );
+            if (!directMetrics) return null;
+            return sanitizeAuditTermMetricsForDraftScope(parsedData, key, directMetrics);
+        };
+        const getScopeFinancial = (
+            parsedData: any,
+            entries: Array<{ group: any; dept: any; cat: any }>,
+            scopeCost: number,
+            batchId?: string
+        ) => {
+            const exactMetrics = getExactCustomTermMetrics(parsedData, entries, batchId);
+            const termMetrics = exactMetrics || getAuditTermMetricsFromData(parsedData);
             const termScopeEntries = buildAuditTermScopeEntries(
                 parsedData,
                 entries.map(({ group, dept, cat }) => ({
@@ -8684,11 +8889,45 @@ const App: React.FC = () => {
             ].filter(rowMatches);
             const summary = sourceRows.length > 0
                 ? summarizeAuditTermRows(sourceRows)
-                : { diffQty: 0, diffCost: 0, countedCost: scopeCost };
-            const baseCost = Number(summary.countedCost || scopeCost || 0);
-            const divergencePct = baseCost > 0 ? (Number(summary.diffCost || 0) / baseCost) * 100 : 0;
+                : (exactMetrics
+                    ? {
+                        diffQty: Number(termMetrics?.diffQty || 0),
+                        diffCost: roundAuditMoney(termMetrics?.diffCost),
+                        countedCost: roundAuditMoney(termMetrics?.countedCost)
+                    }
+                    : { diffQty: 0, diffCost: 0, countedCost: scopeCost });
+            const officialExactDiffCost = exactMetrics ? getOfficialAuditTermDiffCost(termMetrics) : null;
+            const existingAdjustmentTotals = (termMetrics as any)?.postAuditAdjustmentTotals;
+            const computedAdjustmentTotals = !auditMetricsContainsPostAuditAdjustments(termMetrics)
+                ? (Array.isArray(parsedData?.postAuditAdjustments) ? parsedData.postAuditAdjustments : []).reduce((acc: { quantity: number; cost: number }, item: any) => {
+                    const adjustmentRow = {
+                        groupId: item?.groupId,
+                        groupName: item?.groupName,
+                        deptId: item?.deptId,
+                        deptName: item?.deptName,
+                        catId: item?.catId,
+                        catName: item?.catName
+                    };
+                    if (!termScopeEntries.some(entry => auditRowMatchesTermScopeEntry(adjustmentRow, entry))) return acc;
+                    return {
+                        quantity: acc.quantity + Number(item?.quantity || 0),
+                        cost: roundAuditMoney(acc.cost + Number(item?.totalCost ?? (Number(item?.quantity || 0) * Number(item?.unitCost || 0))))
+                    };
+                }, { quantity: 0, cost: 0 })
+                : { quantity: 0, cost: 0 };
+            const adjustmentTotalsForBase = existingAdjustmentTotals || computedAdjustmentTotals;
+            const adjustmentCostForDiff = auditMetricsContainsPostAuditAdjustments(termMetrics)
+                ? 0
+                : Number(computedAdjustmentTotals.cost || 0);
+            const baseDiffCost = officialExactDiffCost !== null ? officialExactDiffCost : Number(summary.diffCost || 0);
+            const diffCost = roundAuditMoney(baseDiffCost + adjustmentCostForDiff);
+            const adjustedScopeCost = roundAuditMoney(Number(scopeCost || 0) + Number(adjustmentTotalsForBase.cost || 0));
+            const summarizedBaseCost = Math.abs(Number(summary.countedCost || 0));
+            const diffAbs = Math.abs(diffCost);
+            const baseCost = Math.abs(adjustedScopeCost) || (summarizedBaseCost >= diffAbs ? summarizedBaseCost : 0);
+            const divergencePct = baseCost > 0 ? (diffAbs / baseCost) * 100 : 0;
             return {
-                diffCost: roundAuditMoney(Number(summary.diffCost || 0)),
+                diffCost,
                 divergencePct
             };
         };
@@ -8706,6 +8945,7 @@ const App: React.FC = () => {
 
             if (!session) {
                 ignored.push({ branch: branchLabel, reason: 'sessão aberta não encontrada' });
+                pendingBranchLabels.push(shortBranch);
                 branchLines.push(`${shortBranch} - ignorada: sessão aberta não encontrada`);
                 return;
             }
@@ -8715,6 +8955,7 @@ const App: React.FC = () => {
             matchedEntries.forEach(entry => matchedEntriesForLabels.push(entry));
             if (matchedEntries.length === 0) {
                 ignored.push({ branch: branchLabel, reason: 'sem itens no escopo informado' });
+                pendingBranchLabels.push(shortBranch);
                 branchLines.push(`${shortBranch} - ignorada: sem itens no escopo informado`);
                 return;
             }
@@ -8731,14 +8972,20 @@ const App: React.FC = () => {
             ).length;
             const openCount = matchedKeys.filter(key => activeKeys.has(key)).length;
             const totals = getScopeTotals(matchedEntries);
-            const financial = getScopeFinancial(parsedData, matchedEntries, totals.cost);
             const isCompleted = doneCount === matchedEntries.length && matchedEntries.length > 0;
+            const completedTermScope = isCompleted
+                ? getEntriesFromCompletedBatch(parsedData, completedPartials, matchedEntries)
+                : { entries: matchedEntries, batchId: undefined as string | undefined };
+            const financialTotals = getScopeTotals(completedTermScope.entries);
+            const financial = getScopeFinancial(parsedData, completedTermScope.entries, financialTotals.cost, completedTermScope.batchId);
             const isOpen = !isCompleted && openCount > 0;
             const branchBase = `${shortBranch}${isCompleted ? '✅' : ''} - mix ${formatInt(totals.mix)} | itens ${formatInt(totals.units)}`;
 
             if (isCompleted) {
-                branchLines.push(`${branchBase} | Div. ${formatMoney(financial.diffCost)} (${formatPercent(financial.divergencePct)})`);
+                completedBranchLabels.push(shortBranch);
+                branchLines.push(`${branchBase} | Div. ${formatMoney(financial.diffCost)} (${formatRepresentativityPercent(financial.divergencePct)})`);
             } else {
+                pendingBranchLabels.push(shortBranch);
                 branchLines.push(`${branchBase}${isOpen ? ' | em andamento' : ''}`);
             }
 
@@ -8761,13 +9008,20 @@ const App: React.FC = () => {
         const whatsappTitle = matchedEntriesForLabels.length > 0
             ? buildAuditWhatsappTitle(scopeConfig, matchedEntriesForLabels)
             : `Auditoria ${scopeConfig.groupList.join(', ') || 'Área inteira'}`;
-        const whatsappText = [
+        const whatsappText = (includeCompletionSummary ? [
+            `${whatsappTitle}:`,
+            `Abertura: ${openedAtLabel}`,
+            ...branchLines,
+            '',
+            `Finalizadas ✅ ${completedBranchLabels.length > 0 ? completedBranchLabels.join(', ') : '-'}`,
+            `Aguardando ⚠️ ${pendingBranchLabels.length > 0 ? pendingBranchLabels.join(', ') : '-'}`
+        ] : [
             `${whatsappTitle}:`,
             `Abertura: ${openedAtLabel}`,
             ...branchLines,
             '',
             'Boa auditoria!'
-        ].join('\n');
+        ]).join('\n');
 
         return {
             areaName: cleanAreaName,
@@ -9031,7 +9285,7 @@ const App: React.FC = () => {
     const areaPartialWhatsappHistoryPreviews = useMemo(() => (
         areaPartialWhatsappHistoryItems.map(item => ({
             item,
-            preview: buildAreaPartialWhatsappPreview(item)
+            preview: buildAreaPartialWhatsappPreview(item, { includeCompletionSummary: true })
         }))
     ), [areaPartialWhatsappHistoryItems, buildAreaPartialWhatsappPreview]);
 
@@ -9104,6 +9358,14 @@ const App: React.FC = () => {
         window.scrollTo(0, 0);
         setIsSidebarOpen(isMobileLayout());
     }, [clearAuditManualBranchSelectionRequired, resolveAuditJumpCompany]);
+
+    const handleAuditExited = useCallback(() => {
+        markAuditManualBranchSelectionRequired();
+        setAuditJumpFilial('');
+        setAuditJumpArea('');
+        setAuditJumpCompanyId('');
+        setAuditJumpCompanyName('');
+    }, [markAuditManualBranchSelectionRequired]);
 
     useEffect(() => {
         if (currentView !== 'audit' && auditJumpFilial) {
@@ -9386,7 +9648,7 @@ const App: React.FC = () => {
                                 initialCompanyId={auditJumpCompanyId || null}
                                 initialCompanyName={auditJumpCompanyName || null}
                                 forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
-                                onAuditExited={markAuditManualBranchSelectionRequired}
+                                onAuditExited={handleAuditExited}
                                 onFilialSelected={clearAuditManualBranchSelectionRequired}
                             />
                         </div>

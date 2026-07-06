@@ -69,6 +69,16 @@ const GROUP_GLOBAL_BASE_KEYS: Record<GroupUploadId, string> = {
     '67': 'audit_cadastro_67'
 };
 
+const yieldToBrowser = () => new Promise<void>((resolve) => {
+    if (typeof window === 'undefined') {
+        resolve();
+        return;
+    }
+    window.requestAnimationFrame(() => {
+        window.setTimeout(resolve, 0);
+    });
+});
+
 const buildSharedStockModuleKey = (branchRaw: string) => {
     const raw = String(branchRaw || '').trim();
     const digits = raw.match(/\d+/g)?.join('') || '';
@@ -737,6 +747,39 @@ const partialScopeKey = (scope: { groupId?: string | number; deptId?: string | n
     return [normalizeScopeId(scope.groupId), normalizeScopeId(scope.deptId), normalizeScopeId(scope.catId)].join('|');
 };
 
+const scopeAliasSet = (values: Array<unknown>) => {
+    const set = new Set<string>();
+    values.forEach(value => {
+        const raw = String(value ?? '').trim();
+        if (!raw) return;
+        set.add(raw);
+        set.add(raw.toLowerCase());
+
+        const digits = raw.replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) set.add(digits);
+
+        const parts = raw.split(/[^0-9A-Za-z]+/).filter(Boolean);
+        const lastPart = parts[parts.length - 1];
+        if (lastPart) {
+            set.add(lastPart);
+            set.add(lastPart.toLowerCase());
+            const lastDigits = lastPart.replace(/\D/g, '').replace(/^0+/, '');
+            if (lastDigits) set.add(lastDigits);
+        }
+    });
+    return set;
+};
+
+const scopeValueMatches = (source: unknown, targets: Array<unknown>) => {
+    const sourceAliases = scopeAliasSet([source]);
+    if (sourceAliases.size === 0) return false;
+    const targetAliases = scopeAliasSet(targets);
+    for (const alias of sourceAliases) {
+        if (targetAliases.has(alias)) return true;
+    }
+    return false;
+};
+
 const isPartialScopeMatch = (
     partial: { groupId?: string | number; deptId?: string | number; catId?: string | number } | undefined,
     groupId?: string | number,
@@ -750,9 +793,9 @@ const isPartialScopeMatch = (
     const g = normalizeScopeId(groupId);
     const d = normalizeScopeId(deptId);
     const c = normalizeScopeId(catId);
-    if (g && pGroup && pGroup !== g) return false;
-    if (d && pDept && pDept !== d) return false;
-    if (c && pCat && pCat !== c) return false;
+    if (g && pGroup && !scopeValueMatches(pGroup, [g])) return false;
+    if (d && pDept && !scopeValueMatches(pDept, [d])) return false;
+    if (c && pCat && !scopeValueMatches(pCat, [c])) return false;
     return true;
 };
 
@@ -768,11 +811,135 @@ const scopeContainsPartial = (
     const g = normalizeScopeId(groupId);
     const d = normalizeScopeId(deptId);
     const c = normalizeScopeId(catId);
-    if (!g || pGroup !== g) return false;
+    if (!g || !scopeValueMatches(pGroup, [g])) return false;
     if (!d) return true;
-    if (pDept !== d) return false;
+    if (!scopeValueMatches(pDept, [d])) return false;
     if (!c) return true;
-    return pCat === c;
+    return scopeValueMatches(pCat, [c]);
+};
+
+type ActivePartialScope = {
+    startedAt?: string;
+    groupId?: string | number;
+    deptId?: string | number;
+    catId?: string | number;
+};
+
+const getAuditDataScopeCategoriesForPartials = (
+    auditData: Pick<AuditData, 'groups'> | null | undefined,
+    scope?: { groupId?: string | number; deptId?: string | number; catId?: string | number }
+) => {
+    const groups = Array.isArray(auditData?.groups) ? auditData!.groups : [];
+    const hasGroupFilter = String(scope?.groupId ?? '').trim() !== '';
+    const hasDeptFilter = String(scope?.deptId ?? '').trim() !== '';
+    const hasCatFilter = String(scope?.catId ?? '').trim() !== '';
+
+    return groups.flatMap(group => {
+        if (hasGroupFilter && !scopeValueMatches(scope?.groupId, [group.id, (group as any).numericId, group.name])) return [];
+        return (group.departments || []).flatMap(dept => {
+            if (hasDeptFilter && !scopeValueMatches(scope?.deptId, [dept.id, (dept as any).numericId, dept.name])) return [];
+            return (dept.categories || [])
+                .filter(cat => !hasCatFilter || scopeValueMatches(scope?.catId, [cat.id, (cat as any).numericId, cat.name]))
+                .map(cat => ({ group, dept, cat }));
+        });
+    });
+};
+
+const compactPartialScopesForAuditData = (
+    auditData: Pick<AuditData, 'groups'> | null | undefined,
+    partials: ActivePartialScope[]
+): ActivePartialScope[] => {
+    const selected = new Map<string, ActivePartialScope>();
+    const putSelected = (group: Group, dept: Department, cat: Category, startedAt?: string) => {
+        if (isDoneStatus(cat.status)) return;
+        const key = partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id });
+        const existing = selected.get(key);
+        const nextStartedAt = startedAt || existing?.startedAt || new Date().toISOString();
+        if (!existing || new Date(nextStartedAt).getTime() < new Date(existing.startedAt || 0).getTime()) {
+            selected.set(key, {
+                startedAt: nextStartedAt,
+                groupId: normalizeScopeId(group.id),
+                deptId: normalizeScopeId(dept.id),
+                catId: normalizeScopeId(cat.id)
+            });
+        }
+    };
+
+    (partials || []).forEach(partial => {
+        if (!partial) return;
+        getAuditDataScopeCategoriesForPartials(auditData, partial).forEach(({ group, dept, cat }) => {
+            putSelected(group, dept, cat, partial.startedAt);
+        });
+    });
+
+    if (selected.size === 0) return [];
+
+    const consumed = new Set<string>();
+    const compacted: ActivePartialScope[] = [];
+    const startedAtForKeys = (keys: string[]) => {
+        let best = '';
+        keys.forEach(key => {
+            const startedAt = selected.get(key)?.startedAt || '';
+            if (!startedAt) return;
+            if (!best || new Date(startedAt).getTime() < new Date(best).getTime()) best = startedAt;
+        });
+        return best || new Date().toISOString();
+    };
+    const categoryKey = (group: Group, dept: Department, cat: Category) =>
+        partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id });
+
+    (Array.isArray(auditData?.groups) ? auditData!.groups : []).forEach(group => {
+        const groupOpenKeys = (group.departments || []).flatMap(dept =>
+            (dept.categories || [])
+                .filter(cat => !isDoneStatus(cat.status))
+                .map(cat => categoryKey(group, dept, cat))
+        );
+        if (groupOpenKeys.length > 0 && groupOpenKeys.every(key => selected.has(key))) {
+            compacted.push({
+                startedAt: startedAtForKeys(groupOpenKeys),
+                groupId: normalizeScopeId(group.id)
+            });
+            groupOpenKeys.forEach(key => consumed.add(key));
+            return;
+        }
+
+        (group.departments || []).forEach(dept => {
+            const deptOpenKeys = (dept.categories || [])
+                .filter(cat => !isDoneStatus(cat.status))
+                .map(cat => categoryKey(group, dept, cat));
+            if (deptOpenKeys.length > 0 && deptOpenKeys.every(key => selected.has(key))) {
+                compacted.push({
+                    startedAt: startedAtForKeys(deptOpenKeys),
+                    groupId: normalizeScopeId(group.id),
+                    deptId: normalizeScopeId(dept.id)
+                });
+                deptOpenKeys.forEach(key => consumed.add(key));
+                return;
+            }
+
+            (dept.categories || []).forEach(cat => {
+                const key = categoryKey(group, dept, cat);
+                const entry = selected.get(key);
+                if (!entry || consumed.has(key)) return;
+                compacted.push(entry);
+                consumed.add(key);
+            });
+        });
+    });
+
+    return compacted;
+};
+
+const compactAuditDataActivePartials = <T extends AuditData>(auditData: T): T => {
+    const starts = Array.isArray((auditData as any)?.partialStarts)
+        ? ((auditData as any).partialStarts as ActivePartialScope[])
+        : ((auditData as any)?.partialStart ? [(auditData as any).partialStart as ActivePartialScope] : []);
+    if (starts.length === 0) return auditData;
+    return {
+        ...auditData,
+        partialStart: undefined,
+        partialStarts: compactPartialScopesForAuditData(auditData, starts) as any
+    };
 };
 
 type TermScopeType = 'group' | 'department' | 'category' | 'custom';
@@ -1270,6 +1437,18 @@ const getStockFileContentSignature = (meta: any): string => {
     return fileName || fileSize ? `${fileName}|${fileSize}` : '';
 };
 
+const getGlobalBaseMetaVersionKey = (meta: any, moduleKey?: string): string => {
+    if (!meta) return '';
+    const resolvedModuleKey = String(meta.module_key || meta.moduleKey || moduleKey || '').trim().toLowerCase();
+    const id = String(meta.id || '').trim();
+    const fileName = String(meta.file_name || meta.fileName || meta.name || '').trim().toLowerCase();
+    const fileSizeRaw = meta.file_size ?? meta.fileSize ?? meta.size;
+    const fileSize = Number.isFinite(Number(fileSizeRaw)) ? String(Number(fileSizeRaw)) : '';
+    const uploadedAt = String(meta.uploaded_at || meta.uploadedAt || '').trim();
+    const updatedAt = String(meta.updated_at || meta.updatedAt || '').trim();
+    return [resolvedModuleKey, id, fileName, fileSize, uploadedAt, updatedAt].join('|');
+};
+
 const getAppliedStockSignature = (sourceFiles: any): string => {
     const explicit = String(
         sourceFiles?.globalStockSignature ||
@@ -1307,17 +1486,98 @@ const isGlobalStockDifferentFromApplied = (sourceFiles: any, globalStockMeta: an
     const globalTs = globalRaw ? new Date(globalRaw).getTime() : NaN;
     const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
     if (!Number.isFinite(globalTs)) return false;
-    if (Number.isFinite(appliedTs) && globalTs <= appliedTs + 60_000) return false;
 
     const globalSignature = getStockFileSignature(globalStockMeta);
     const appliedSignature = getAppliedStockSignature(sourceFiles);
-    if (globalSignature && appliedSignature && globalSignature === appliedSignature) return false;
 
     const globalContentSignature = getStockFileContentSignature(globalStockMeta);
     const appliedContentSignature = getStockFileContentSignature(sourceFiles?.stock);
+
+    if (Number.isFinite(appliedTs)) {
+        if (globalTs > appliedTs + 1_000) return true;
+        if (
+            (globalSignature && appliedSignature && globalSignature === appliedSignature) ||
+            (globalContentSignature && appliedContentSignature && globalContentSignature === appliedContentSignature)
+        ) {
+            return false;
+        }
+    }
+
+    if (globalSignature && appliedSignature) return globalSignature !== appliedSignature;
+    if (globalContentSignature && appliedContentSignature) return globalContentSignature !== appliedContentSignature;
+
+    return !Number.isFinite(appliedTs);
+};
+
+const getBaseFileTimestampRaw = (meta: any): string | null =>
+    String(
+        meta?.syncedAt ||
+        meta?.uploaded_at ||
+        meta?.uploadedAt ||
+        meta?.updated_at ||
+        meta?.updatedAt ||
+        ''
+    ).trim() || null;
+
+const getBaseFileSignatureForModule = (meta: any, moduleKey: string): string => {
+    if (!meta) return '';
+    return getStockFileSignature({
+        ...(meta || {}),
+        module_key: meta?.module_key || meta?.moduleKey || moduleKey
+    });
+};
+
+const getAppliedBaseFileSignature = (applied: any, moduleKey: string): string => {
+    if (!applied) return '';
+    const explicit = String(applied?.signature || '').trim();
+    if (explicit) return explicit;
+    const fileMeta = applied?.file || applied;
+    return getStockFileSignature({
+        ...(fileMeta || {}),
+        module_key: fileMeta?.module_key || fileMeta?.moduleKey || moduleKey,
+        uploaded_at: applied?.syncedAt || applied?.uploaded_at || applied?.uploadedAt,
+        updated_at: applied?.updated_at || applied?.updatedAt
+    });
+};
+
+const isGlobalBaseFileDifferentFromApplied = (globalMeta: any, applied: any, moduleKey: string): boolean => {
+    if (!globalMeta) return false;
+    if (!applied) return true;
+
+    const globalContentSignature = getStockFileContentSignature(globalMeta);
+    const appliedContentSignature = getStockFileContentSignature(applied?.file || applied);
     if (globalContentSignature && appliedContentSignature && globalContentSignature === appliedContentSignature) return false;
 
+    const globalSignature = getBaseFileSignatureForModule(globalMeta, moduleKey);
+    const appliedSignature = getAppliedBaseFileSignature(applied, moduleKey);
+    if (globalSignature && appliedSignature && globalSignature === appliedSignature) return false;
+
+    const globalRaw = getBaseFileTimestampRaw(globalMeta);
+    const appliedRaw = getBaseFileTimestampRaw(applied);
+    const globalTs = globalRaw ? new Date(globalRaw).getTime() : NaN;
+    const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
+    if (Number.isFinite(globalTs) && Number.isFinite(appliedTs)) {
+        return globalTs > appliedTs + 60_000;
+    }
+
+    if (globalSignature && appliedSignature) return globalSignature !== appliedSignature;
     return true;
+};
+
+const isGlobalAuditStructureDifferentFromApplied = (
+    sourceFiles: any,
+    groupMeta: Record<GroupUploadId, any>,
+    deptMeta: any,
+    catMeta: any
+): boolean => {
+    const appliedGroups = Array.isArray(sourceFiles?.groups) ? sourceFiles.groups : [];
+    for (const groupId of GROUP_UPLOAD_IDS) {
+        const applied = appliedGroups.find((entry: any) => normalizeScopeId(entry?.groupId) === normalizeScopeId(groupId));
+        if (isGlobalBaseFileDifferentFromApplied(groupMeta?.[groupId], applied, GROUP_GLOBAL_BASE_KEYS[groupId])) return true;
+    }
+    if (isGlobalBaseFileDifferentFromApplied(deptMeta, sourceFiles?.deptIds, AUDIT_DEPT_IDS_GLOBAL_KEY)) return true;
+    if (isGlobalBaseFileDifferentFromApplied(catMeta, sourceFiles?.catIds, AUDIT_CAT_IDS_GLOBAL_KEY)) return true;
+    return false;
 };
 
 const getTermMetricsTimestamp = (metrics: any) => {
@@ -1907,6 +2167,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [termTouchedFields, setTermTouchedFields] = useState<Record<string, boolean>>({});
     const [termShakeFields, setTermShakeFields] = useState<Record<string, boolean>>({});
     const [isSavingTerm, setIsSavingTerm] = useState(false);
+    const [isTermExcelProcessing, setIsTermExcelProcessing] = useState(false);
+    const [isTermMetricsPreparing, setIsTermMetricsPreparing] = useState(false);
+    const [partialFinalizeStatus, setPartialFinalizeStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
     const [showSavedFeedback, setShowSavedFeedback] = useState(false);
     const composeTermDraftsForPersist = useCallback((...maps: Array<Record<string, TermForm> | undefined | null>) => {
         return maps.reduce((acc, current) => mergeTermDraftMaps(acc, (current || {}) as Record<string, TermForm>), {} as Record<string, TermForm>);
@@ -1931,13 +2194,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const termFormRef = useRef<TermForm | null>(null);
     const termDraftsRef = useRef<Record<string, TermForm>>({});
     const rawTermMetricsRef = useRef<typeof rawTermComparisonMetrics>(null);
+    const termOpenSeqRef = useRef(0);
     const termShakeTimeoutRef = useRef<number | null>(null);
+    const termExcelUploadSeqRef = useRef(0);
+    const termUniversalRegistryCacheRef = useRef<{ signature: string; entries: Array<[string, any[]]> } | null>(null);
+    const termCadastroRegistryCacheRef = useRef<Map<string, Array<[string, any]>>>(new Map());
+    const partialFinalizeFeedbackTimeoutRef = useRef<number | null>(null);
     useEffect(() => { termFormRef.current = termForm; }, [termForm]);
     useEffect(() => { termDraftsRef.current = termDrafts; }, [termDrafts]);
     useEffect(() => { rawTermMetricsRef.current = rawTermComparisonMetrics; }, [rawTermComparisonMetrics]);
     useEffect(() => () => {
         if (termShakeTimeoutRef.current !== null && typeof window !== 'undefined') {
             window.clearTimeout(termShakeTimeoutRef.current);
+        }
+        if (partialFinalizeFeedbackTimeoutRef.current !== null && typeof window !== 'undefined') {
+            window.clearTimeout(partialFinalizeFeedbackTimeoutRef.current);
         }
     }, []);
 
@@ -1971,7 +2242,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [selectedEmpresa, setSelectedEmpresa] = useState(() => String(initialCompanyName || "Drogaria Cidade"));
     const [selectedFilial, setSelectedFilial] = useState(() => {
         const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
-        if (forceManualFilialSelection && !forcedInitialFilial) return '';
+        const manualSelectionLocked = typeof window !== 'undefined' && window.sessionStorage.getItem('APP_AUDIT_MANUAL_BRANCH_SELECTION_REQUIRED') === '1';
+        if ((forceManualFilialSelection || manualSelectionLocked) && !forcedInitialFilial) return '';
         return toAuditBranchValue(forcedInitialFilial || userFilial || '');
     });
     const allowedCompanies = useMemo(() => {
@@ -2016,6 +2288,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     // Persiste o ID da sessão no sessionStorage para sobreviver a refresh/troca de aba
     const CONFIRMED_SESSION_KEY = 'audit_confirmed_session_id';
     const CONFIRMED_SESSION_SET_KEY = 'audit_confirmed_session_ids';
+    const MANUAL_BRANCH_SELECTION_KEY = 'APP_AUDIT_MANUAL_BRANCH_SELECTION_REQUIRED';
     const [dbSessionId, setDbSessionId] = useState<string | undefined>(
         () => sessionStorage.getItem(CONFIRMED_SESSION_KEY) || undefined
     );
@@ -2056,8 +2329,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const activeAuditOpenChoiceRef = useRef<Map<string, 'open' | 'completed'>>(new Map());
     const activeAuditOpenChoicePendingRef = useRef<Map<string, Promise<'open' | 'completed'>>>(new Map());
     const partialFinalizeInFlightRef = useRef(false);
+    const globalBaseMetaRef = useRef<{
+        stock: DbGlobalBaseFile | null;
+        groups: Record<GroupUploadId, DbGlobalBaseFile | null>;
+        dept: DbGlobalBaseFile | null;
+        cat: DbGlobalBaseFile | null;
+        structureSignature: string;
+    }>({
+        stock: null,
+        groups: createInitialGroupMeta(),
+        dept: null,
+        cat: null,
+        structureSignature: ''
+    });
 
-    function enterStockUpdateMode(options?: { stockTsRaw?: string | null; syncKey?: string | null; showAlert?: boolean }) {
+    function enterStockUpdateMode(options?: { stockTsRaw?: string | null; syncKey?: string | null; showAlert?: boolean; reason?: 'stock' | 'structure' | 'base' }) {
         const syncKey = String(options?.syncKey || '').trim();
         if (syncKey) {
             lastAutoStockSyncKeyRef.current = syncKey;
@@ -2073,13 +2359,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const stockTsLabel = options.stockTsRaw
                 ? new Date(options.stockTsRaw).toLocaleString('pt-BR')
                 : 'nao informada';
+            const changeLabel = options.reason === 'structure'
+                ? 'Nova base de classificação detectada'
+                : 'Nova base detectada';
             const alertBranch = selectedFilial;
             const alertSyncKey = syncKey;
             window.setTimeout(() => {
                 if (alertBranch && activeFilialRef.current !== alertBranch) return;
                 if (alertSyncKey && lastAutoStockSyncKeyRef.current !== alertSyncKey) return;
                 window.alert(
-                    `Novo estoque detectado no Cadastro Base (${stockTsLabel}).\n\nVocê foi direcionado para a tela de atualização dos estoques.\nA reclassificação só será executada ao clicar no botão de atualização.`
+                    `${changeLabel} no Cadastro Base (${stockTsLabel}).\n\nVocê foi direcionado para a tela de atualização dos estoques.\nA reclassificação só será executada ao clicar no botão de atualização.`
                 );
             }, 0);
         }
@@ -2204,9 +2493,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         const normalizedData = normalizeRemoteAuditSnapshotForBranch(latest.data as AuditData, selectedFilial);
         if (!normalizedData) return null;
-        const remoteDrafts = (((normalizedData as any).termDrafts || {}) as Record<string, TermForm>);
+        const normalizedWithPartials = compactAuditDataActivePartials(normalizedData);
+        const remoteDrafts = (((normalizedWithPartials as any).termDrafts || {}) as Record<string, TermForm>);
         const mergedDrafts = composeTermDraftsForPersist(remoteDrafts, termDraftsRef.current);
-        const nextDataWithDrafts = { ...normalizedData, termDrafts: mergedDrafts } as AuditData;
+        const nextDataWithDrafts = { ...normalizedWithPartials, termDrafts: mergedDrafts } as AuditData;
 
         setData(nextDataWithDrafts);
         setTermDrafts(mergedDrafts);
@@ -2423,15 +2713,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const normalized = normalizeAuditDataStructure(reconciled);
                 const normalizedData = normalizeRemoteAuditSnapshotForBranch((normalized.data || reconciled) as AuditData, requestedFilial);
                 if (!normalizedData) return;
-                setData(normalizedData);
+                const normalizedWithPartials = compactAuditDataActivePartials(normalizedData);
+                setData(normalizedWithPartials);
                 setTermDrafts(current =>
                     composeTermDraftsForPersist(
-                        ((normalizedData as any).termDrafts || {}) as Record<string, TermForm>,
+                        ((normalizedWithPartials as any).termDrafts || {}) as Record<string, TermForm>,
                         current
                     )
                 );
-                if (getAuditDataStrength(normalizedData) > 0) {
-                    await CacheService.set(backupKey, { ...latest, data: normalizedData } as any);
+                if (getAuditDataStrength(normalizedWithPartials) > 0) {
+                    await CacheService.set(backupKey, { ...latest, data: normalizedWithPartials } as any);
                 }
                 return;
             }
@@ -2468,8 +2759,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 const history = await fetchAuditsHistory(requestedFilial);
                                 const completedCount = history.filter(item => item.status === 'completed').length;
                                 const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
-                                const hasNewerGlobalStockAtOpenChoice = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
-                                if (completedCount > 0 && !hasNewerGlobalStockAtOpenChoice) {
+                                const baseMeta = globalBaseMetaRef.current;
+                                const hasPendingGlobalBaseAtOpenChoice =
+                                    isGlobalStockDifferentFromApplied(sourceFiles, baseMeta.stock) ||
+                                    isGlobalAuditStructureDifferentFromApplied(sourceFiles, baseMeta.groups, baseMeta.dept, baseMeta.cat);
+                                if (completedCount > 0 && !hasPendingGlobalBaseAtOpenChoice) {
                                     const openActive = window.confirm(
                                         `Existe auditoria em aberto (Nº ${latest.audit_number}) e ${completedCount} inventário(s) concluído(s) nesta filial.\n\n` +
                                         `OK: prosseguir com a auditoria em aberto.\n` +
@@ -2549,39 +2843,50 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     }
                     const normalizedData = normalizeRemoteAuditSnapshotForBranch(latest.data as AuditData, requestedFilial);
                     if (!normalizedData) return;
-                    setData(normalizedData);
-                    const draftsFromData = ((normalizedData as any).termDrafts || {}) as Record<string, TermForm>;
+                    const normalizedWithPartials = compactAuditDataActivePartials(normalizedData);
+                    setData(normalizedWithPartials);
+                    const draftsFromData = ((normalizedWithPartials as any).termDrafts || {}) as Record<string, TermForm>;
                     setTermDrafts(current => composeTermDraftsForPersist(draftsFromData, current));
                     setDbSessionId(latest.id);
-                    if (getAuditDataStrength(normalizedData) > 0) {
-                        await CacheService.set(backupKey, { ...latest, data: normalizedData } as any);
+                    if (getAuditDataStrength(normalizedWithPartials) > 0) {
+                        await CacheService.set(backupKey, { ...latest, data: normalizedWithPartials } as any);
                     }
 
                     if (!silent) {
                         const isNewSession = dbSessionId !== latest.id;
                         const alreadyConfirmed = isAuditSessionConfirmed(latest.id);
                         const resolveLatestStockTimestampForPrompt = (sessionTsRaw?: string | null) => {
-                            const officialUploadRaw = getGlobalStockTimestampRaw(globalStockMeta);
+                            const baseMeta = globalBaseMetaRef.current;
+                            const officialUploadRaw = getGlobalStockTimestampRaw(baseMeta.stock);
                             const bestRaw = officialUploadRaw || sessionTsRaw || latest.created_at || null;
                             const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
+                            const hasPendingGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, baseMeta.stock);
+                            const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(sourceFiles, baseMeta.groups, baseMeta.dept, baseMeta.cat);
                             return {
                                 latestStockTs: bestRaw,
-                                hasNewerGlobalStock: isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta)
+                                hasPendingGlobalStock,
+                                hasPendingGlobalStructure,
+                                hasPendingGlobalBase: hasPendingGlobalStock || hasPendingGlobalStructure
                             };
                         };
 
                         if (canUseAuditMasterTools) {
-                            const { latestStockTs, hasNewerGlobalStock } = resolveLatestStockTimestampForPrompt(
+                            const { latestStockTs, hasPendingGlobalStock, hasPendingGlobalStructure, hasPendingGlobalBase } = resolveLatestStockTimestampForPrompt(
                                 latest.data?.sourceFiles?.stock?.syncedAt || latest.data?.sourceFiles?.lastStockUpdateAt || latest.created_at
                             );
 
                             // Estoque manual dentro do módulo foi descontinuado.
                             // Sempre que o Cadastro Base estiver mais novo que o estoque processado da auditoria,
                             // a auditoria em aberto deve voltar para a tela de atualização até o saldo ser aplicado.
-                            if (hasNewerGlobalStock) {
+                            if (hasPendingGlobalBase) {
                                 const stockTs = latestStockTs ? new Date(latestStockTs).getTime() : NaN;
-                                const syncKey = `${latest.id || 'no_session'}|${requestedFilial}|${globalStockMeta?.module_key || 'stock'}|${Number.isFinite(stockTs) ? stockTs : latestStockTs || 'pending'}`;
-                                enterStockUpdateMode({ stockTsRaw: latestStockTs, syncKey, showAlert: true });
+                                const syncKey = `${latest.id || 'no_session'}|${requestedFilial}|${baseMeta.stock?.module_key || 'stock'}|${Number.isFinite(stockTs) ? stockTs : latestStockTs || 'pending'}|${baseMeta.structureSignature}`;
+                                enterStockUpdateMode({
+                                    stockTsRaw: latestStockTs,
+                                    syncKey,
+                                    showAlert: true,
+                                    reason: hasPendingGlobalStock ? 'stock' : (hasPendingGlobalStructure ? 'structure' : 'base')
+                                });
                             } else {
                                 setIsUpdatingStock(false);
                             }
@@ -2638,7 +2943,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } catch (error) {
             console.error('Error loading audit info:', error);
         }
-    }, [selectedFilial, selectedCompany?.id, dbSessionId, canUseAuditMasterTools, data, isUpdatingStock, isReadOnlyCompletedView, consultingAuditNumber, allowActiveAuditAutoOpen, isAuditSessionConfirmed, markAuditSessionConfirmed, guardAuditSessionForBranch, normalizeRemoteAuditSnapshotForBranch]);
+    }, [
+        selectedFilial,
+        selectedCompany?.id,
+        dbSessionId,
+        canUseAuditMasterTools,
+        data,
+        isUpdatingStock,
+        isReadOnlyCompletedView,
+        consultingAuditNumber,
+        allowActiveAuditAutoOpen,
+        isAuditSessionConfirmed,
+        markAuditSessionConfirmed,
+        guardAuditSessionForBranch,
+        normalizeRemoteAuditSnapshotForBranch
+    ]);
 
     // Carga Inicial
     useEffect(() => {
@@ -2719,7 +3038,41 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     // Polling de sincronização entre usuários
     useEffect(() => {
         if (!selectedFilial) return;
-        const syncNow = () => loadAuditNum(true);
+        let wakeTimer: number | null = null;
+        let wakeIdleId: number | null = null;
+        let cancelled = false;
+        const syncNow = () => {
+            if (cancelled) return;
+            void loadAuditNum(true);
+        };
+        const cancelWakeSync = () => {
+            if (wakeTimer !== null) {
+                window.clearTimeout(wakeTimer);
+                wakeTimer = null;
+            }
+            const cancelIdleCallback = (window as any).cancelIdleCallback as undefined | ((id: number) => void);
+            if (wakeIdleId !== null && cancelIdleCallback) {
+                cancelIdleCallback(wakeIdleId);
+            }
+            wakeIdleId = null;
+        };
+        const scheduleWakeSync = () => {
+            if (document.hidden) return;
+            cancelWakeSync();
+            wakeTimer = window.setTimeout(() => {
+                wakeTimer = null;
+                const run = () => {
+                    wakeIdleId = null;
+                    if (!cancelled && !document.hidden) syncNow();
+                };
+                const requestIdleCallback = (window as any).requestIdleCallback as undefined | ((cb: () => void, opts?: { timeout?: number }) => number);
+                if (requestIdleCallback) {
+                    wakeIdleId = requestIdleCallback(run, { timeout: 2500 });
+                } else {
+                    run();
+                }
+            }, 900);
+        };
 
         const getIntervalMs = () => (document.hidden ? 12000 : 5000);
         let interval = setInterval(syncNow, getIntervalMs());
@@ -2731,16 +3084,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         const handleVisibilityOrFocus = () => {
             resetInterval();
-            if (!document.hidden) {
-                syncNow();
-            }
+            scheduleWakeSync();
         };
 
         document.addEventListener('visibilitychange', handleVisibilityOrFocus);
         window.addEventListener('focus', handleVisibilityOrFocus);
 
         return () => {
+            cancelled = true;
             clearInterval(interval);
+            cancelWakeSync();
             document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
             window.removeEventListener('focus', handleVisibilityOrFocus);
         };
@@ -2854,6 +3207,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [cadastroBarcodeAliasesByReduced, setCadastroBarcodeAliasesByReduced] = useState<Record<string, string[]>>({});
     const [isLoadingGlobalBases, setIsLoadingGlobalBases] = useState(false);
     const lastAutoStockSyncKeyRef = useRef('');
+    const stockBaseRefreshInFlightRef = useRef(false);
 
     const effectiveGroupFiles = useMemo(
         () =>
@@ -2866,6 +3220,60 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const effectiveDeptIdsFile = globalDeptIdsFile;
     const effectiveCatIdsFile = globalCatIdsFile;
     const effectiveStockFile = globalStockFile;
+
+    const globalStructureBaseSignature = useMemo(() => {
+        const groupPart = GROUP_UPLOAD_IDS
+            .map(groupId => `${groupId}:${getBaseFileSignatureForModule(globalGroupMeta[groupId], GROUP_GLOBAL_BASE_KEYS[groupId]) || getBaseFileTimestampRaw(globalGroupMeta[groupId]) || ''}`)
+            .join('|');
+        const deptPart = getBaseFileSignatureForModule(globalDeptIdsMeta, AUDIT_DEPT_IDS_GLOBAL_KEY) || getBaseFileTimestampRaw(globalDeptIdsMeta) || '';
+        const catPart = getBaseFileSignatureForModule(globalCatIdsMeta, AUDIT_CAT_IDS_GLOBAL_KEY) || getBaseFileTimestampRaw(globalCatIdsMeta) || '';
+        return `${groupPart}|dept:${deptPart}|cat:${catPart}`;
+    }, [globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta]);
+
+    globalBaseMetaRef.current = {
+        stock: globalStockMeta,
+        groups: globalGroupMeta,
+        dept: globalDeptIdsMeta,
+        cat: globalCatIdsMeta,
+        structureSignature: globalStructureBaseSignature
+    };
+
+    const refreshCurrentStockBaseMeta = useCallback(async () => {
+        const companyId = selectedCompany?.id;
+        const branch = selectedFilial;
+        if (!companyId || !branch || stockBaseRefreshInFlightRef.current) return;
+
+        const stockModuleKey = buildSharedStockModuleKey(branch);
+        stockBaseRefreshInFlightRef.current = true;
+        try {
+            const remoteMeta = await fetchGlobalBaseFileMeta(companyId, stockModuleKey);
+            if (activeFilialRef.current !== branch) return;
+
+            const localMeta = globalBaseMetaRef.current.stock;
+            const remoteVersion = getGlobalBaseMetaVersionKey(remoteMeta, stockModuleKey);
+            const localVersion = getGlobalBaseMetaVersionKey(localMeta, stockModuleKey);
+
+            if (!remoteMeta) {
+                if (localMeta) {
+                    setGlobalStockMeta(null);
+                    setGlobalStockFile(null);
+                }
+                return;
+            }
+
+            if (remoteVersion && remoteVersion === localVersion) return;
+
+            const fullRemoteStock = await CadastrosBaseService.getGlobalBaseFileCached(companyId, stockModuleKey, { preferRemote: true });
+            if (activeFilialRef.current !== branch) return;
+
+            setGlobalStockMeta(fullRemoteStock as DbGlobalBaseFile | null);
+            setGlobalStockFile(fullRemoteStock ? decodeGlobalFileToBrowserFile(fullRemoteStock as DbGlobalBaseFile) : null);
+        } catch (error) {
+            console.warn('[AuditFlow] Falha ao verificar estoque atualizado no Cadastro Base:', error);
+        } finally {
+            stockBaseRefreshInFlightRef.current = false;
+        }
+    }, [selectedCompany?.id, selectedFilial]);
 
     const formatGlobalTimestamp = useCallback((value?: string | null) => {
         if (!value) return '';
@@ -2880,7 +3288,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const baseRaw = getGlobalStockTimestampRaw(globalStockMeta);
         const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
         const hasApplied = Number.isFinite(appliedTs);
-        const hasPendingBase = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
+        const hasPendingBase =
+            isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta) ||
+            isGlobalAuditStructureDifferentFromApplied(sourceFiles, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta);
         return {
             appliedLabel: appliedRaw ? formatGlobalTimestamp(appliedRaw) : 'Nao aplicado',
             baseLabel: baseRaw ? formatGlobalTimestamp(baseRaw) : 'Sem data no Cadastro Base',
@@ -2893,7 +3303,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             hasPendingBase,
             hasApplied
         };
-    }, [data, globalStockMeta, globalStockFile, formatGlobalTimestamp]);
+    }, [data, globalStockMeta, globalStockFile, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta, formatGlobalTimestamp]);
 
     useEffect(() => {
         const companyId = selectedCompany?.id;
@@ -2986,6 +3396,46 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
     }, [selectedCompany?.id, selectedFilial]);
 
+    const hasAuditDataLoaded = !!data;
+
+    useEffect(() => {
+        if (
+            !selectedCompany?.id ||
+            !selectedFilial ||
+            !hasAuditDataLoaded ||
+            !canUseAuditMasterTools ||
+            isReadOnlyCompletedView ||
+            consultingAuditNumber !== null
+        ) {
+            return;
+        }
+
+        refreshCurrentStockBaseMeta();
+
+        const checkWhenVisible = () => {
+            if (typeof document !== 'undefined' && document.hidden) return;
+            refreshCurrentStockBaseMeta();
+        };
+
+        const intervalId = window.setInterval(checkWhenVisible, 30_000);
+        window.addEventListener('focus', checkWhenVisible);
+        document.addEventListener('visibilitychange', checkWhenVisible);
+
+        return () => {
+            window.clearInterval(intervalId);
+            window.removeEventListener('focus', checkWhenVisible);
+            document.removeEventListener('visibilitychange', checkWhenVisible);
+        };
+    }, [
+        selectedCompany?.id,
+        selectedFilial,
+        hasAuditDataLoaded,
+        canUseAuditMasterTools,
+        isReadOnlyCompletedView,
+        consultingAuditNumber,
+        refreshCurrentStockBaseMeta
+    ]);
+
     useEffect(() => {
         AuditStorage.cleanupLegacyAuditStorage();
 
@@ -2996,7 +3446,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 // However, we can use savedData if Supabase fails.
                 const forcedInitialFilial = String(initialFilial || '').trim();
                 const savedBranch = toAuditBranchValue(savedData.filial || '');
-                if (!forceManualFilialSelection && !forcedInitialFilial && savedBranch && !activeFilialRef.current) {
+                const manualSelectionLocked = typeof window !== 'undefined' && window.sessionStorage.getItem(MANUAL_BRANCH_SELECTION_KEY) === '1';
+                if (!manualSelectionLocked && !forceManualFilialSelection && !forcedInitialFilial && savedBranch && !activeFilialRef.current) {
                     activeFilialRef.current = savedBranch;
                     setSelectedFilial(savedBranch);
                 }
@@ -3025,6 +3476,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const handleSelectedFilialChange = useCallback((value: string) => {
         const normalized = toAuditBranchValue(value);
+        if (normalized) {
+            sessionStorage.removeItem(MANUAL_BRANCH_SELECTION_KEY);
+        }
         activeFilialRef.current = normalized;
         setData(null);
         setTermDrafts({});
@@ -3285,6 +3739,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const handleSafeExit = async () => {
         const resetAuditUi = () => {
+            sessionStorage.setItem(MANUAL_BRANCH_SELECTION_KEY, '1');
             sessionStorage.removeItem(CONFIRMED_SESSION_KEY);
             activeFilialRef.current = '';
             setData(null);
@@ -4168,7 +4623,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 groupId,
                 source: 'global_base',
                 file: toUploadedFileMeta(file),
-                syncedAt: globalGroupMeta[groupId]?.uploaded_at || globalGroupMeta[groupId]?.updated_at || null
+                syncedAt: globalGroupMeta[groupId]?.uploaded_at || globalGroupMeta[groupId]?.updated_at || null,
+                signature: getBaseFileSignatureForModule(
+                    globalGroupMeta[groupId] || toUploadedFileMeta(file),
+                    GROUP_GLOBAL_BASE_KEYS[groupId]
+                )
             })),
             stock: effectiveStockFile ? {
                 ...toUploadedFileMeta(effectiveStockFile),
@@ -4179,12 +4638,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             deptIds: effectiveDeptIdsFile ? {
                 ...toUploadedFileMeta(effectiveDeptIdsFile),
                 source: globalDeptIdsMeta ? 'global_base' : 'none',
-                syncedAt: globalDeptIdsMeta?.uploaded_at || globalDeptIdsMeta?.updated_at || null
+                syncedAt: globalDeptIdsMeta?.uploaded_at || globalDeptIdsMeta?.updated_at || null,
+                signature: getBaseFileSignatureForModule(
+                    globalDeptIdsMeta || toUploadedFileMeta(effectiveDeptIdsFile),
+                    AUDIT_DEPT_IDS_GLOBAL_KEY
+                )
             } : null,
             catIds: effectiveCatIdsFile ? {
                 ...toUploadedFileMeta(effectiveCatIdsFile),
                 source: globalCatIdsMeta ? 'global_base' : 'none',
-                syncedAt: globalCatIdsMeta?.uploaded_at || globalCatIdsMeta?.updated_at || null
+                syncedAt: globalCatIdsMeta?.uploaded_at || globalCatIdsMeta?.updated_at || null,
+                signature: getBaseFileSignatureForModule(
+                    globalCatIdsMeta || toUploadedFileMeta(effectiveCatIdsFile),
+                    AUDIT_CAT_IDS_GLOBAL_KEY
+                )
             } : null
         };
     };
@@ -4208,7 +4675,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const source = options?.source || 'local_upload';
         const syncedAt = options?.syncedAt || null;
         const shouldNotify = options?.notify !== false;
-        const safePartialStarts = Array.isArray(data?.partialStarts) ? data.partialStarts : [];
+        const safePartialStarts = data
+            ? compactPartialScopesForAuditData(data, Array.isArray(data.partialStarts) ? data.partialStarts : [])
+            : [];
 
         const rowsStock = await readExcel(stockFile);
         const stockAcc: Record<string, { q: number; costAmount: number }> = {};
@@ -4356,10 +4825,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (!Number.isFinite(globalTs)) return;
 
         const sourceFiles = ((data as any).sourceFiles || {}) as any;
-        const hasNewerGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
-        if (!hasNewerGlobalStock) return;
+        const hasPendingGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
+        const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(sourceFiles, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta);
+        const hasPendingGlobalBase = hasPendingGlobalStock || hasPendingGlobalStructure;
+        if (!hasPendingGlobalBase) return;
 
-        const syncKey = `${dbSessionId || 'no_session'}|${selectedFilial}|${globalStockMeta.module_key}|${globalTs}`;
+        const syncKey = `${dbSessionId || 'no_session'}|${selectedFilial}|${globalStockMeta.module_key}|${globalTs}|${globalStructureBaseSignature}`;
         if (lastAutoStockSyncKeyRef.current === syncKey) {
             enterStockUpdateMode({ syncKey, showAlert: false });
             return;
@@ -4367,7 +4838,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         // Ao detectar estoque global novo, manter a tela de atualização aberta.
         // A reclassificação só deve ocorrer no clique do botão (handleStartAudit).
-        enterStockUpdateMode({ stockTsRaw: globalTsRaw, syncKey, showAlert: true });
+        enterStockUpdateMode({
+            stockTsRaw: globalTsRaw,
+            syncKey,
+            showAlert: true,
+            reason: hasPendingGlobalStock ? 'stock' : 'structure'
+        });
     }, [
         selectedFilial,
         data,
@@ -4376,6 +4852,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         canUseAuditMasterTools,
         globalStockFile,
         globalStockMeta,
+        globalGroupMeta,
+        globalDeptIdsMeta,
+        globalCatIdsMeta,
+        globalStructureBaseSignature,
         dbSessionId,
         isReadOnlyCompletedView,
         consultingAuditNumber,
@@ -4400,9 +4880,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const hasOpenStructure = !!(data && data.groups && data.groups.length > 0);
         const shouldMergeStockOnly = hasOpenStructure;
         const sourceFiles = ((data as any)?.sourceFiles || {}) as any;
-        const globalStockSyncedAt = getGlobalStockTimestampRaw(globalStockMeta);
-        const hasNewerGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
-        const shouldReclassifyOpen = hasOpenStructure && hasStructureFiles && hasNewerGlobalStock;
+        const hasPendingGlobalBase =
+            isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta) ||
+            isGlobalAuditStructureDifferentFromApplied(sourceFiles, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta);
+        const shouldReclassifyOpen = hasOpenStructure && hasStructureFiles && hasPendingGlobalBase;
         const mergePreservingDone = (
             baseData: AuditData,
             rebuiltData: AuditData
@@ -4645,7 +5126,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         setIsProcessing(true);
         try {
-            const safePartialStarts = Array.isArray(data?.partialStarts) ? data.partialStarts : [];
+            const safePartialStarts = data
+                ? compactPartialScopesForAuditData(data, Array.isArray(data.partialStarts) ? data.partialStarts : [])
+                : [];
 
             if (shouldMergeStockOnly && data && !shouldReclassifyOpen) {
                 const stockSource = globalStockMeta ? 'global_base' : 'local_upload';
@@ -5455,46 +5938,48 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
     };
 
-    const getDeptById = (group: Group, deptId?: string) => group.departments.find(d => d.id === deptId);
+    const getDeptById = (group: Group, deptId?: string | number) =>
+        group.departments.find(d => scopeValueMatches(deptId, [d.id, (d as any).numericId, d.name]));
 
     const getScopeCategories = (groupId?: string | number, deptId?: string | number, catId?: string | number) => {
         if (!data) return [] as { group: Group; dept: Department; cat: Category }[];
-        const g = data.groups.find(gr => normalizeScopeId(gr.id) === normalizeScopeId(groupId));
-        if (!g) return [];
-        if (catId) {
-            const targetDept = deptId
-                ? g.departments.find(d => normalizeScopeId(d.id) === normalizeScopeId(deptId))
-                : g.departments.find(d => d.categories.some(c => normalizeScopeId(c.id) === normalizeScopeId(catId)));
-            const cat = targetDept?.categories.find(c => normalizeScopeId(c.id) === normalizeScopeId(catId));
-            return targetDept && cat ? [{ group: g, dept: targetDept, cat }] : [];
-        }
-        if (deptId) {
-            const dept = g.departments.find(d => normalizeScopeId(d.id) === normalizeScopeId(deptId));
-            if (!dept) return [];
-            return dept.categories.map(c => ({ group: g, dept, cat: c }));
-        }
-        return g.departments.flatMap(d => d.categories.map(c => ({ group: g, dept: d, cat: c })));
+        const hasGroupFilter = String(groupId ?? '').trim() !== '';
+        const hasDeptFilter = String(deptId ?? '').trim() !== '';
+        const hasCatFilter = String(catId ?? '').trim() !== '';
+        const groups = data.groups.filter(gr =>
+            !hasGroupFilter || scopeValueMatches(groupId, [gr.id, (gr as any).numericId, gr.name])
+        );
+        return groups.flatMap(group =>
+            group.departments.flatMap(dept => {
+                if (hasDeptFilter && !scopeValueMatches(deptId, [dept.id, (dept as any).numericId, dept.name])) return [];
+                return dept.categories
+                    .filter(cat => !hasCatFilter || scopeValueMatches(catId, [cat.id, (cat as any).numericId, cat.name]))
+                    .map(cat => ({ group, dept, cat }));
+            })
+        );
     };
 
     const getPartialPercentForGroup = (group: Group, totalSkus: number) => {
         if (!data?.partialStarts || data.partialStarts.length === 0 || totalSkus <= 0) return 0;
         const catMap = new Map<string, number>();
-        group.departments.forEach(d => d.categories.forEach(c => catMap.set(c.id, c.itemsCount)));
+        group.departments.forEach(d => d.categories.forEach(c => {
+            catMap.set(partialScopeKey({ groupId: group.id, deptId: d.id, catId: c.id }), c.itemsCount);
+        }));
         const selected = new Set<string>();
         data.partialStarts.forEach(p => {
             if (normalizeScopeId(p.groupId) !== normalizeScopeId(group.id)) return;
             if (!p.deptId) {
-                group.departments.forEach(d => d.categories.forEach(c => selected.add(c.id)));
+                group.departments.forEach(d => d.categories.forEach(c => selected.add(partialScopeKey({ groupId: group.id, deptId: d.id, catId: c.id }))));
                 return;
             }
-            const dept = getDeptById(group, normalizeScopeId(p.deptId));
+            const dept = getDeptById(group, p.deptId);
             if (!dept) return;
             if (!p.catId) {
-                dept.categories.forEach(c => selected.add(c.id));
+                dept.categories.forEach(c => selected.add(partialScopeKey({ groupId: group.id, deptId: dept.id, catId: c.id })));
                 return;
             }
-            const cat = dept.categories.find(c => normalizeScopeId(c.id) === normalizeScopeId(p.catId));
-            if (cat) selected.add(cat.id);
+            const cat = dept.categories.find(c => scopeValueMatches(p.catId, [c.id, (c as any).numericId, c.name]));
+            if (cat) selected.add(partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id }));
         });
         let sum = 0;
         selected.forEach(id => { sum += catMap.get(id) || 0; });
@@ -5504,21 +5989,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const getPartialPercentForDept = (group: Group, dept: Department, totalSkus: number) => {
         if (!data?.partialStarts || data.partialStarts.length === 0 || totalSkus <= 0) return 0;
         const catMap = new Map<string, number>();
-        dept.categories.forEach(c => catMap.set(c.id, c.itemsCount));
+        dept.categories.forEach(c => catMap.set(partialScopeKey({ groupId: group.id, deptId: dept.id, catId: c.id }), c.itemsCount));
         const selected = new Set<string>();
         data.partialStarts.forEach(p => {
             if (normalizeScopeId(p.groupId) !== normalizeScopeId(group.id)) return;
             if (!p.deptId) {
-                dept.categories.forEach(c => selected.add(c.id));
+                dept.categories.forEach(c => selected.add(partialScopeKey({ groupId: group.id, deptId: dept.id, catId: c.id })));
                 return;
             }
-            if (normalizeScopeId(p.deptId) !== normalizeScopeId(dept.id)) return;
+            if (!scopeValueMatches(p.deptId, [dept.id, (dept as any).numericId, dept.name])) return;
             if (!p.catId) {
-                dept.categories.forEach(c => selected.add(c.id));
+                dept.categories.forEach(c => selected.add(partialScopeKey({ groupId: group.id, deptId: dept.id, catId: c.id })));
                 return;
             }
-            const cat = dept.categories.find(c => normalizeScopeId(c.id) === normalizeScopeId(p.catId));
-            if (cat) selected.add(cat.id);
+            const cat = dept.categories.find(c => scopeValueMatches(p.catId, [c.id, (c as any).numericId, c.name]));
+            if (cat) selected.add(partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id }));
         });
         let sum = 0;
         selected.forEach(id => { sum += catMap.get(id) || 0; });
@@ -6291,20 +6776,31 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     };
 
     const openTermModal = async (scope: TermScope) => {
+        const openSeq = termOpenSeqRef.current + 1;
+        termOpenSeqRef.current = openSeq;
         let sourceData = data;
         let sourceDrafts = termDraftsRef.current || termDrafts;
-        try {
-            const fresh = await fetchFreshOpenAuditSnapshot();
-            if (fresh) {
-                sourceData = fresh.data;
-                sourceDrafts = fresh.drafts;
+        const refreshFreshSnapshotInBackground = () => {
+            void fetchFreshOpenAuditSnapshot().catch(err => {
+                console.warn("Atualização do termo em segundo plano adiada:", err);
+            });
+        };
+        if (!sourceData) {
+            try {
+                const fresh = await fetchFreshOpenAuditSnapshot();
+                if (fresh) {
+                    sourceData = fresh.data;
+                    sourceDrafts = fresh.drafts;
+                }
+            } catch (err) {
+                console.error("Falha ao buscar atualização antes de abrir termo:", err);
             }
-        } catch (err) {
-            console.error("Falha ao buscar atualização antes de abrir termo:", err);
+        } else {
+            refreshFreshSnapshotInBackground();
         }
         if (!sourceData) return;
 
-        {
+        try {
         const data = sourceData;
         const termDrafts = sourceDrafts;
         const key = buildTermKey(scope);
@@ -6338,6 +6834,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setTermFieldErrors({});
         setTermTouchedFields({});
         setTermShakeFields({});
+        const initialMetrics = normalizeTermMetricsToOfficial(resolvedExcelMetrics);
+        setTermComparisonMetrics(initialMetrics);
+        rawTermMetricsRef.current = initialMetrics;
+        setIsTermMetricsPreparing(true);
+        await yieldToBrowser();
+        if (termOpenSeqRef.current !== openSeq) {
+            setIsTermMetricsPreparing(false);
+            return;
+        }
 
         const scopeGroupIds = getScopeGroupIds(scope);
         const fallbackPools = scope.type === 'custom'
@@ -6402,6 +6907,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             : (isGlobalUnifiedCustomTerm
                 ? mergeExcelMetricsPools(fallbackPools as any[])
                 : (resolvedExcelMetrics || mergeExcelMetricsPools(fallbackPools as any[])));
+        await yieldToBrowser();
+        if (termOpenSeqRef.current !== openSeq) {
+            setIsTermMetricsPreparing(false);
+            return;
+        }
 
         const hasDirectExcelMetrics = !!resolvedExcelMetrics && !isGlobalUnifiedCustomTerm;
         let nextMetrics = hasDirectExcelMetrics ? rawPool : null;
@@ -6491,6 +7001,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (!nextMetrics) {
                 nextMetrics = rawPool;
             }
+        }
+        await yieldToBrowser();
+        if (termOpenSeqRef.current !== openSeq) {
+            setIsTermMetricsPreparing(false);
+            return;
         }
 
         if (( !hasDirectExcelMetrics || shouldNormalizeLegacyIds ) && rawPool?.groupedDifferences && scope.groupId) {
@@ -6856,10 +7371,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
         }
 
-        setTermComparisonMetrics(normalizeTermMetricsToOfficial(nextMetrics));
+        if (termOpenSeqRef.current !== openSeq) {
+            setIsTermMetricsPreparing(false);
+            return;
+        }
+        const normalizedNextMetrics = normalizeTermMetricsToOfficial(nextMetrics);
+        rawTermMetricsRef.current = normalizedNextMetrics;
+        setTermComparisonMetrics(normalizedNextMetrics);
 
         // Persist re-classified metrics & form to termDrafts always (not conditional on reference equality)
-        const normalizedNextMetrics = normalizeTermMetricsToOfficial(nextMetrics);
         const formToSave = normalizedNextMetrics
             ? { ...nextForm, excelMetrics: normalizedNextMetrics }
             : (nextForm?.excelMetrics
@@ -6871,6 +7391,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             termDraftsRef.current = nextDrafts;
             return nextDrafts;
         });
+        setIsTermMetricsPreparing(false);
+        } catch (err) {
+            console.error("Erro ao preparar resumo do termo:", err);
+            if (termOpenSeqRef.current === openSeq) {
+                setIsTermMetricsPreparing(false);
+            }
         }
     };
 
@@ -7072,6 +7598,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
     };
     const closeTermModal = useCallback(() => {
+        termOpenSeqRef.current += 1;
+        setIsTermMetricsPreparing(false);
         const currentScope = termModal;
         const currentForm = termFormRef.current || termForm;
         const currentData = data;
@@ -7214,6 +7742,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setTermComparisonMetrics(null);
             return;
         }
+        const inputEl = e.target;
+        const uploadSeq = termExcelUploadSeqRef.current + 1;
+        termExcelUploadSeqRef.current = uploadSeq;
+        setIsTermExcelProcessing(true);
 
         try {
             const rows = await readExcel(file);
@@ -7239,6 +7771,107 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const singleScopedGroupName = primaryScopeGroupId
                 ? (GROUP_CONFIG_DEFAULTS[primaryScopeGroupId as keyof typeof GROUP_CONFIG_DEFAULTS] || `Grupo ${primaryScopeGroupId}`)
                 : undefined;
+
+            const buildQuickTermPayload = () => {
+                let quickSysQty = 0;
+                let quickSysCost = 0;
+                let quickCountedQty = 0;
+                let quickCountedCost = 0;
+                let quickDiffQty = 0;
+                let quickDiffCost = 0;
+                const quickItems: any[] = [];
+                const firstProductRowIndex = termColumns.headerRowIndex >= 0 ? termColumns.headerRowIndex + 1 : 1;
+                const fallbackGroupId = normalizeScopeId(primaryScopeGroupId);
+                const fallbackGroupName = singleScopedGroupName || (fallbackGroupId ? `Grupo ${fallbackGroupId}` : 'AGUARDANDO CLASSIFICAÇÃO');
+
+                for (let i = firstProductRowIndex; i < rows.length; i++) {
+                    const row = rows[i];
+                    if (!row) continue;
+                    const rowText = row.map(cell => String(cell || '').trim().toLowerCase()).join(' | ');
+                    const codigo = String(row[termColumns.code] || '').trim();
+                    const descricao = String(row[termColumns.description] || '').trim();
+                    if (rowText.includes('total geral')) continue;
+                    const metadataKeywords = [
+                        'filial:', 'grupo de produtos:', 'departamento:', 'categoria:',
+                        'tipo de produto:', 'grupo de preço:', 'início contagem:',
+                        'conferência de estoque', 'código', 'página 1 de', 'produto:'
+                    ];
+                    const isHeader = row.slice(0, 5).some(cell => {
+                        const cellVal = String(cell || '').trim().toLowerCase();
+                        return metadataKeywords.some(keyword => cellVal.startsWith(keyword));
+                    });
+                    const isHyphenRow = (!codigo && !descricao) ||
+                        codigo === '-' ||
+                        descricao === '-' ||
+                        (codigo === '' && descricao === '-');
+                    const sqStr = String(row[termColumns.sysQty] || '').trim();
+                    const cqStr = String(row[termColumns.countedQty] || '').trim();
+                    if (isHeader || isHyphenRow || (sqStr === '' && cqStr === '')) continue;
+
+                    const sq = parseStockNumber(row[termColumns.sysQty]);
+                    const sc = parseStockNumber(row[termColumns.sysCost]);
+                    const cq = parseStockNumber(row[termColumns.countedQty]);
+                    const cc = parseStockNumber(row[termColumns.countedCost]);
+                    const dq = cq - sq;
+                    const directCostDiff = termColumns.diffCost !== undefined && hasNumericCellValue(row[termColumns.diffCost])
+                        ? parseStockNumber(row[termColumns.diffCost])
+                        : null;
+                    const costDiff = directCostDiff ?? (cc - sc);
+
+                    quickSysQty += sq;
+                    quickSysCost += sc;
+                    quickCountedQty += cq;
+                    quickCountedCost += cc;
+                    quickDiffQty += dq;
+                    quickDiffCost += costDiff;
+                    quickItems.push({
+                        code: codigo,
+                        description: descricao,
+                        lab: String(row[termColumns.lab] || '').trim(),
+                        sysQty: sq,
+                        sysCost: sc,
+                        countedQty: cq,
+                        countedCost: cc,
+                        diffQty: dq,
+                        diffCost: costDiff,
+                        groupId: fallbackGroupId || undefined,
+                        groupName: fallbackGroupName,
+                        deptId: undefined,
+                        deptName: 'AGUARDANDO CLASSIFICAÇÃO',
+                        catId: undefined,
+                        catName: 'AGUARDANDO CLASSIFICAÇÃO'
+                    });
+                }
+
+                const officialDiffCost = roundAuditMoney(quickDiffCost);
+                return {
+                    sysQty: quickSysQty,
+                    sysCost: quickSysCost,
+                    countedQty: quickCountedQty,
+                    countedCost: quickCountedCost,
+                    diffQty: quickDiffQty,
+                    diffCost: officialDiffCost,
+                    officialDiffCost,
+                    financialDiffSource: termColumns.diffCost !== undefined ? 'spreadsheet_column_quick_preview' : 'calculated_cost_delta_quick_preview',
+                    financialDiffColumnIndex: termColumns.diffCost,
+                    items: quickItems,
+                    groupedDifferences: [],
+                    sourceRows: rows,
+                    sourceFileName: file.name,
+                    sourceFileSize: file.size,
+                    sourceUploadedAt: new Date().toISOString(),
+                    processingStatus: 'classifying'
+                } as any;
+            };
+
+            const quickPayload = buildQuickTermPayload();
+            if (termExcelUploadSeqRef.current !== uploadSeq) return;
+            setTermComparisonMetrics(quickPayload);
+            rawTermMetricsRef.current = quickPayload as any;
+            setTermForm(prev => (prev ? { ...prev, excelMetrics: quickPayload, excelMetricsRemovedAt: undefined } : prev));
+            await new Promise(resolve => setTimeout(resolve, 0));
+            if (termExcelUploadSeqRef.current !== uploadSeq) return;
+
             const resolveHierarchyByIds = (groupId?: string, deptId?: string, catId?: string) => {
                 const gId = normalizeScopeId(groupId);
                 const dId = normalizeScopeId(deptId);
@@ -7290,6 +7923,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const universalRegistry = new Map<string, TermHierarchyEntry[]>();
 
             const loadUniversalRegistry = async () => {
+                const registrySignature = GROUP_UPLOAD_IDS
+                    .map(groupId => {
+                        const file = globalGroupFiles[groupId];
+                        return `${groupId}:${file?.name || ''}:${file?.size || 0}:${file?.lastModified || 0}`;
+                    })
+                    .join('|');
+                const cachedRegistry = termUniversalRegistryCacheRef.current;
+                if (cachedRegistry?.signature === registrySignature) {
+                    cachedRegistry.entries.forEach(([key, value]) => {
+                        universalRegistry.set(key, (value || []).map(entry => ({ ...entry })));
+                    });
+                    return;
+                }
+
                 for (const groupId of GROUP_UPLOAD_IDS) {
                     const file = globalGroupFiles[groupId];
                     if (!file) continue;
@@ -7325,6 +7972,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         });
                     } catch (err) { }
                 }
+
+                termUniversalRegistryCacheRef.current = {
+                    signature: registrySignature,
+                    entries: Array.from(universalRegistry.entries()).map(([key, value]) => [
+                        key,
+                        value.map(entry => ({ ...entry }))
+                    ])
+                };
             };
 
             // --- Branch history registry: reuse previous finalized/open uploads from this branch ---
@@ -7474,40 +8129,50 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const groupIdKey = primaryScopeGroupId as typeof GROUP_UPLOAD_IDS[number];
                 const cadastroFile = globalGroupFiles[groupIdKey];
                 if (cadastroFile) {
-                    try {
-                        const cadastroRows = await readExcel(cadastroFile);
-                        cadastroRows.forEach((row: any[]) => {
-                            if (!row || row.length < 4) return;
+                    const cadastroSignature = `${primaryScopeGroupId}:${cadastroFile.name}:${cadastroFile.size}:${cadastroFile.lastModified}`;
+                    const cachedCadastro = termCadastroRegistryCacheRef.current.get(cadastroSignature);
+                    if (cachedCadastro) {
+                        cachedCadastro.forEach(([key, value]) => cadastroLookup.set(key, { ...value }));
+                    } else {
+                        try {
+                            const cadastroRows = await readExcel(cadastroFile);
+                            cadastroRows.forEach((row: any[]) => {
+                                if (!row || row.length < 4) return;
 
-                            const deptRaw = String(row[18] ?? '').trim(); // Col S = departamento
-                            const catRaw = String(row[22] ?? '').trim(); // Col W = categoria
+                                const deptRaw = String(row[18] ?? '').trim(); // Col S = departamento
+                                const catRaw = String(row[22] ?? '').trim(); // Col W = categoria
 
-                            // Skip rows where both dept and cat are empty (header/blank rows)
-                            if (!deptRaw && !catRaw) return;
+                                // Skip rows where both dept and cat are empty (header/blank rows)
+                                if (!deptRaw && !catRaw) return;
 
-                            const deptParsed = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
-                            const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
-                            const deptName = deptParsed.name;
-                            const catName = catParsed.name;
+                                const deptParsed = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
+                                const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
+                                const deptName = deptParsed.name;
+                                const catName = catParsed.name;
 
-                            const rowCodes = collectProductCodeCandidates(row, 12);
-                            rowCodes.forEach((codeCandidate) => {
-                                if (!codeCandidate) return;
-                                const candidate = {
-                                    groupId: normalizeScopeId(primaryScopeGroupId),
-                                    groupName: GROUP_CONFIG_DEFAULTS[normalizeScopeId(primaryScopeGroupId)] || `Grupo ${primaryScopeGroupId}`,
-                                    deptId: normalizeScopeId(deptParsed.numericId),
-                                    deptName,
-                                    catId: normalizeScopeId(catParsed.numericId),
-                                    catName
-                                };
-                                const current = cadastroLookup.get(codeCandidate);
-                                const chosen = current ? pickBestHierarchyEntry([current as any, candidate as any], primaryScopeGroupId) as any : candidate;
-                                cadastroLookup.set(codeCandidate, chosen);
+                                const rowCodes = collectProductCodeCandidates(row, 12);
+                                rowCodes.forEach((codeCandidate) => {
+                                    if (!codeCandidate) return;
+                                    const candidate = {
+                                        groupId: normalizeScopeId(primaryScopeGroupId),
+                                        groupName: GROUP_CONFIG_DEFAULTS[normalizeScopeId(primaryScopeGroupId)] || `Grupo ${primaryScopeGroupId}`,
+                                        deptId: normalizeScopeId(deptParsed.numericId),
+                                        deptName,
+                                        catId: normalizeScopeId(catParsed.numericId),
+                                        catName
+                                    };
+                                    const current = cadastroLookup.get(codeCandidate);
+                                    const chosen = current ? pickBestHierarchyEntry([current as any, candidate as any], primaryScopeGroupId) as any : candidate;
+                                    cadastroLookup.set(codeCandidate, chosen);
+                                });
                             });
-                        });
 
-                    } catch (err) { }
+                            termCadastroRegistryCacheRef.current.set(
+                                cadastroSignature,
+                                Array.from(cadastroLookup.entries()).map(([key, value]) => [key, { ...value }])
+                            );
+                        } catch (err) { }
+                    }
                 }
             }
 
@@ -7766,6 +8431,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 sourceUploadedAt: new Date().toISOString()
             };
 
+            if (termExcelUploadSeqRef.current !== uploadSeq) return;
             setTermComparisonMetrics(payload);
             rawTermMetricsRef.current = payload as any;
             setTermForm(prev => (prev ? { ...prev, excelMetrics: payload, excelMetricsRemovedAt: undefined } : prev));
@@ -7864,12 +8530,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 setTermDrafts((((savedData as any)?.termDrafts || nextDrafts || {}) as Record<string, TermForm>));
             }
 
+            if (termExcelUploadSeqRef.current === uploadSeq) {
+                setIsTermExcelProcessing(false);
+            }
         } catch (err) {
             console.error("Erro ao processar Excel do Termo:", err);
-            alert("Erro ao ler/salvar o arquivo Excel.");
-            setTermComparisonMetrics(null);
+            if (termExcelUploadSeqRef.current === uploadSeq) {
+                alert("Erro ao ler/salvar o arquivo Excel.");
+                setTermComparisonMetrics(null);
+                setIsTermExcelProcessing(false);
+            }
 
-            if (termModal && termForm) {
+            if (termExcelUploadSeqRef.current === uploadSeq && termModal && termForm) {
                 const key = buildTermKey(termModal);
                 setTermDrafts(current => {
                     const next = { ...current };
@@ -7880,7 +8552,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
 
         // Reset input value to allow uploading the same file again if needed
-        e.target.value = '';
+        inputEl.value = '';
     };
 
     const downloadTermComparisonExcel = () => {
@@ -8819,15 +9491,19 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, []);
 
     const applyPartialScopes = useCallback((base: AuditData, partials: Array<{ startedAt: string; groupId?: string; deptId?: string; catId?: string }>) => {
+        const partialMatchesNode = (partialValue: unknown, nodeValues: Array<unknown>) => {
+            if (String(partialValue ?? '').trim() === '') return true;
+            return scopeValueMatches(partialValue, nodeValues);
+        };
         const partialMap = new Map<string, { startedAt: string; groupId?: string; deptId?: string; catId?: string }>();
         (partials || []).forEach(p => {
             if (!p?.startedAt) return;
             base.groups.forEach(g => {
-                if (!isPartialScopeMatch(p, g.id)) return;
+                if (!partialMatchesNode(p.groupId, [g.id, (g as any).numericId, g.name])) return;
                 g.departments.forEach(d => {
-                    if (!isPartialScopeMatch(p, g.id, d.id)) return;
+                    if (!partialMatchesNode(p.deptId, [d.id, (d as any).numericId, d.name])) return;
                     d.categories.forEach(c => {
-                        if (!isPartialScopeMatch(p, g.id, d.id, c.id)) return;
+                        if (!partialMatchesNode(p.catId, [c.id, (c as any).numericId, c.name])) return;
                         const current = normalizeAuditStatus(c.status);
                         if (current === AuditStatus.DONE) return;
                         const key = partialScopeKey({ groupId: g.id, deptId: d.id, catId: c.id });
@@ -8844,7 +9520,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 });
             });
         });
-        const normalizedPartials = Array.from(partialMap.values());
+        const normalizedPartials = compactPartialScopesForAuditData(base, Array.from(partialMap.values()));
         return {
             ...base,
             partialStarts: normalizedPartials,
@@ -8856,7 +9532,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     categories: d.categories.map(c => {
                         const current = normalizeAuditStatus(c.status);
                         if (current === AuditStatus.DONE) return { ...c, status: current };
-                        const matched = normalizedPartials.some(p => isPartialScopeMatch(p, g.id, d.id, c.id));
+                        const matched = normalizedPartials.some(p =>
+                            partialMatchesNode(p.groupId, [g.id, (g as any).numericId, g.name]) &&
+                            partialMatchesNode(p.deptId, [d.id, (d as any).numericId, d.name]) &&
+                            partialMatchesNode(p.catId, [c.id, (c as any).numericId, c.name])
+                        );
                         return { ...c, status: matched ? AuditStatus.IN_PROGRESS : AuditStatus.TODO };
                     })
                 }))
@@ -8921,6 +9601,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
     }, [data, dbSessionId, selectedFilial, nextAuditNumber, applyPartialScopes, calculateProgress, isUpdatingStock, PARTIAL_EXPIRED_ALERT_KEY]);
 
+    const showPartialFinalizeFeedback = useCallback((status: 'idle' | 'saving' | 'saved' | 'error') => {
+        if (partialFinalizeFeedbackTimeoutRef.current !== null && typeof window !== 'undefined') {
+            window.clearTimeout(partialFinalizeFeedbackTimeoutRef.current);
+            partialFinalizeFeedbackTimeoutRef.current = null;
+        }
+        setPartialFinalizeStatus(status);
+        if (status === 'saved' || status === 'error') {
+            partialFinalizeFeedbackTimeoutRef.current = window.setTimeout(() => {
+                setPartialFinalizeStatus('idle');
+                partialFinalizeFeedbackTimeoutRef.current = null;
+            }, status === 'saved' ? 2500 : 6000);
+        }
+    }, []);
+
     const finalizeActivePartials = useCallback(async () => {
         if (partialFinalizeInFlightRef.current) return;
         if (isReadOnlyCompletedView) {
@@ -8981,58 +9675,53 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } as any;
         setData(nextDataWithTerms);
         partialFinalizeInFlightRef.current = true;
+        showPartialFinalizeFeedback('saving');
 
-        try {
-            // Persistence consolidated in audit_sessions (data field)
-            const progress = calculateProgress(nextDataWithTerms);
-            const savedSession = await persistAuditSession({
-                id: dbSessionId,
-                branch: selectedFilial,
-                audit_number: nextAuditNumber,
-                status: 'open',
-                data: nextDataWithTerms,
-                progress: progress,
-                user_email: userEmail
-            }, { allowProgressRegression: true });
-            if (!savedSession) throw new Error("Falha ao salvar contagens parciais concluídas.");
-            const savedData = savedSession.data
-                ? reconcileAuditStateFromCompletedScopes(savedSession.data as AuditData)
-                : nextDataWithTerms;
-            const normalizedSaved = (normalizeAuditDataStructure(savedData).data || savedData) as AuditData;
-            setData(normalizedSaved);
-            await AuditStorage.saveLocalAuditSession(normalizedSaved, false);
-            await CacheService.set(`audit_session_${selectedFilial}`, { ...savedSession, data: normalizedSaved } as any);
-            insertAppEventLog({
-                company_id: selectedCompany?.id || null,
-                branch: selectedFilial || null,
-                area: null,
-                user_email: userEmail,
-                user_name: userName || null,
-                app: 'auditoria',
-                event_type: 'audit_partial_finalize',
-                entity_type: 'partial_batch',
-                entity_id: batchId,
-                status: 'success',
-                success: true,
-                source: 'web',
-                event_meta: { total_scopes: toComplete.length }
-            }).catch(() => { });
-            await new Promise<void>(resolve => {
-                if (typeof window === 'undefined' || !window.requestAnimationFrame) {
-                    setTimeout(resolve, 0);
-                    return;
-                }
-                window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
-            });
-            alert("Contagens parciais concluídas.");
-
-        } catch (err) {
-            console.error("Error finalizing partials:", err);
-            alert("Erro ao concluir contagens parciais no Supabase.");
-        } finally {
-            partialFinalizeInFlightRef.current = false;
-        }
-    }, [data, dbSessionId, selectedFilial, nextAuditNumber, applyPartialScopes, calculateProgress, canUseAuditMasterTools, isReadOnlyCompletedView, composeTermDraftsForPersist, termDrafts]);
+        void (async () => {
+            try {
+                // Persistence consolidated in audit_sessions (data field)
+                const progress = calculateProgress(nextDataWithTerms);
+                const savedSession = await persistAuditSession({
+                    id: dbSessionId,
+                    branch: selectedFilial,
+                    audit_number: nextAuditNumber,
+                    status: 'open',
+                    data: nextDataWithTerms,
+                    progress: progress,
+                    user_email: userEmail
+                }, { allowProgressRegression: true });
+                if (!savedSession) throw new Error("Falha ao salvar contagens parciais concluídas.");
+                const savedData = savedSession.data
+                    ? reconcileAuditStateFromCompletedScopes(savedSession.data as AuditData)
+                    : nextDataWithTerms;
+                const normalizedSaved = (normalizeAuditDataStructure(savedData).data || savedData) as AuditData;
+                setData(normalizedSaved);
+                await AuditStorage.saveLocalAuditSession(normalizedSaved, false);
+                await CacheService.set(`audit_session_${selectedFilial}`, { ...savedSession, data: normalizedSaved } as any);
+                insertAppEventLog({
+                    company_id: selectedCompany?.id || null,
+                    branch: selectedFilial || null,
+                    area: null,
+                    user_email: userEmail,
+                    user_name: userName || null,
+                    app: 'auditoria',
+                    event_type: 'audit_partial_finalize',
+                    entity_type: 'partial_batch',
+                    entity_id: batchId,
+                    status: 'success',
+                    success: true,
+                    source: 'web',
+                    event_meta: { total_scopes: toComplete.length }
+                }).catch(() => { });
+                showPartialFinalizeFeedback('saved');
+            } catch (err) {
+                console.error("Error finalizing partials:", err);
+                showPartialFinalizeFeedback('error');
+            } finally {
+                partialFinalizeInFlightRef.current = false;
+            }
+        })();
+    }, [data, dbSessionId, selectedFilial, nextAuditNumber, applyPartialScopes, calculateProgress, canUseAuditMasterTools, isReadOnlyCompletedView, composeTermDraftsForPersist, termDrafts, showPartialFinalizeFeedback]);
 
     const clearActivePartialsShortcut = useCallback(async () => {
         if (isReadOnlyCompletedView) {
@@ -10252,7 +10941,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 units: 0,
                 startedAt
             };
-            const catKey = normalizeScopeId(cat.id);
+            const catKey = partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id });
             if (!entry.catIds.has(catKey)) {
                 entry.catIds.add(catKey);
                 entry.catItems.push(buildCatLabel(cat));
@@ -10291,8 +10980,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         let units = 0;
         data.partialStarts.forEach(scope => {
             const expanded = getScopeCategories(scope.groupId, scope.deptId, scope.catId);
-            expanded.forEach(({ cat }) => {
-                const catKey = normalizeScopeId(cat.id);
+            expanded.forEach(({ group, dept, cat }) => {
+                const catKey = partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id });
                 if (seenCats.has(catKey)) return;
                 seenCats.add(catKey);
                 skus += cat.itemsCount;
@@ -10961,6 +11650,28 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             <div className="flex flex-wrap items-center gap-3 justify-between">
                                 <Activity className="w-4 h-4" />
                                 <span className="text-[10px] font-black uppercase tracking-widest">Contagem Parcial</span>
+                                {partialFinalizeStatus !== 'idle' && (
+                                    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[9px] font-black uppercase tracking-widest ${
+                                        partialFinalizeStatus === 'saving'
+                                            ? 'bg-blue-100 text-blue-700 border border-blue-200'
+                                            : partialFinalizeStatus === 'saved'
+                                                ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                                                : 'bg-red-100 text-red-700 border border-red-200'
+                                    }`}>
+                                        {partialFinalizeStatus === 'saving' ? (
+                                            <Loader2 className="h-3 w-3 animate-spin" />
+                                        ) : partialFinalizeStatus === 'saved' ? (
+                                            <CheckCircle2 className="h-3 w-3" />
+                                        ) : (
+                                            <X className="h-3 w-3" />
+                                        )}
+                                        {partialFinalizeStatus === 'saving'
+                                            ? 'Salvando em segundo plano'
+                                            : partialFinalizeStatus === 'saved'
+                                                ? 'Contagens concluídas'
+                                                : 'Falha ao salvar'}
+                                    </span>
+                                )}
                                 <div className="ml-auto flex items-center gap-2">
                                     <button
                                         onClick={clearActivePartialsShortcut}
@@ -12251,10 +12962,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     />
                                     <div className="flex flex-col items-center gap-2">
                                         <div className={`w-10 h-10 rounded-full flex items-center justify-center ${!canEditTerm ? 'bg-slate-100 text-slate-400' : 'bg-indigo-50 text-indigo-500'}`}>
-                                            <Upload className="w-5 h-5" />
+                                            {(isTermExcelProcessing || isTermMetricsPreparing) ? <Loader2 className="w-5 h-5 animate-spin" /> : <Upload className="w-5 h-5" />}
                                         </div>
-                                        <p className="text-sm font-bold text-slate-700">Carregar Excel de Divergências</p>
-                                        <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">{!canEditTerm ? 'Modo consulta: reabra para editar' : 'Clique ou arraste o arquivo aqui'}</p>
+                                        <p className="text-sm font-bold text-slate-700">
+                                            {isTermExcelProcessing ? 'Classificando e salvando Excel' : (isTermMetricsPreparing ? 'Preparando resumo' : 'Carregar Excel de Divergências')}
+                                        </p>
+                                        <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
+                                            {!canEditTerm ? 'Modo consulta: reabra para editar' : (isTermExcelProcessing ? 'Resumo já exibido; finalizando em segundo plano' : (isTermMetricsPreparing ? 'Abrindo sem bloquear a navegação' : 'Clique ou arraste o arquivo aqui'))}
+                                        </p>
                                     </div>
                                 </div>
 
@@ -12288,6 +13003,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                     <div className="mb-3 flex flex-col gap-2 pr-7 sm:flex-row sm:items-center sm:justify-between">
                                                         <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
                                                             <h5 className="text-[10px] font-black text-indigo-800 uppercase tracking-wide sm:tracking-widest">Resumo Identificado</h5>
+                                                            {(isTermExcelProcessing || isTermMetricsPreparing) && (
+                                                                <span className="inline-flex w-fit items-center gap-1 rounded-full bg-indigo-100 px-2 py-0.5 text-[8px] font-black uppercase tracking-widest text-indigo-700">
+                                                                    <Loader2 className="h-3 w-3 animate-spin" />
+                                                                    {isTermExcelProcessing ? 'Classificando' : 'Preparando resumo'}
+                                                                </span>
+                                                            )}
                                                             {Number(adjustmentTotals.count || 0) > 0 && (
                                                                 <span className={`inline-flex w-fit items-center rounded-full px-2 py-0.5 text-[8px] font-black uppercase tracking-widest ${
                                                                     Number(adjustmentTotals.cost || 0) < 0
