@@ -3041,6 +3041,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         let cancelled = false;
         const syncNow = () => {
             if (cancelled) return;
+            // Suspende polling caso alguma operação de salvamento em segundo plano esteja em andamento,
+            // evitando sobrescrever o estado otimista da UI com dados antigos do banco (ex: Concluir Ativas).
+            if (partialFinalizeInFlightRef.current || isSavingTerm || isSavingPostAdjustment) return;
             void loadAuditNum(true);
         };
         const cancelWakeSync = () => {
