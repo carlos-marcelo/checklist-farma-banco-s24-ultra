@@ -8935,10 +8935,8 @@ const App: React.FC = () => {
             const baseDiffCost = officialExactDiffCost !== null ? officialExactDiffCost : Number(summary.diffCost || 0);
             const diffCost = roundAuditMoney(baseDiffCost + adjustmentCostForDiff);
             const adjustedScopeCost = roundAuditMoney(Number(scopeCost || 0) + Number(adjustmentTotalsForBase.cost || 0));
-            const summarizedBaseCost = Math.abs(Number(summary.countedCost || 0));
-            const diffAbs = Math.abs(diffCost);
-            const baseCost = Math.abs(adjustedScopeCost) || (summarizedBaseCost >= diffAbs ? summarizedBaseCost : 0);
-            const divergencePct = baseCost > 0 ? (diffAbs / baseCost) * 100 : 0;
+            const baseCost = Math.abs(adjustedScopeCost);
+            const divergencePct = baseCost > 0 ? (diffCost / baseCost) * 100 : 0;
             return {
                 diffCost,
                 divergencePct

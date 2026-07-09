@@ -12983,12 +12983,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         {(() => {
                                             const termComparisonMetrics = termDisplayMetrics;
                                             if (!termComparisonMetrics) return null;
-                                            const scopeAuditedCost = (termScopeInfo?.products || []).reduce(
-                                                (sum: number, p: any) => sum + ((p.quantity || 0) * (p.cost || 0)),
+                                            const scopeAuditedCost = Array.from((termScopeInfo?.categories as Map<string, any>)?.values() || []).reduce(
+                                                (sum: number, cat: any) => sum + Number(cat.totalCost || 0),
                                                 0
                                             );
-                                            const scopeAuditedQty = (termScopeInfo?.products || []).reduce(
-                                                (sum: number, p: any) => sum + (p.quantity || 0),
+                                            const scopeAuditedQty = Array.from((termScopeInfo?.categories as Map<string, any>)?.values() || []).reduce(
+                                                (sum: number, cat: any) => sum + Number(cat.totalQuantity || 0),
                                                 0
                                             );
                                             const adjustmentTotals = (termComparisonMetrics as any).postAuditAdjustmentTotals || { count: 0, quantity: 0, cost: 0 };
