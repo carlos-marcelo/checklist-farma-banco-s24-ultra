@@ -612,8 +612,8 @@ const addAreaPartialScopeToAuditData = (
         });
     });
 
-    const previousSize = partialMap.size;
-    targetEntries.forEach(({ group, dept, cat, key }) => {
+    const newlyAddedEntries = targetEntries.filter(({ key }) => !partialMap.has(key));
+    newlyAddedEntries.forEach(({ group, dept, cat, key }) => {
         partialMap.set(key, {
             startedAt,
             groupId: normalizeAuditScopeValue(group?.id),
@@ -646,7 +646,8 @@ const addAreaPartialScopeToAuditData = (
     return {
         data: nextData,
         matchedCategories: targetEntries.length,
-        addedCategories: Math.max(0, partialMap.size - previousSize)
+        addedCategories: newlyAddedEntries.length,
+        addedEntries: newlyAddedEntries
     };
 };
 
@@ -9013,7 +9014,8 @@ const App: React.FC = () => {
                 return;
             }
 
-            willOpen.push({ branch: branchLabel, categories: result.addedCategories, mix: totals.mix, units: totals.units });
+            const addedTotals = getScopeTotals(result.addedEntries);
+            willOpen.push({ branch: branchLabel, categories: result.addedCategories, mix: addedTotals.mix, units: addedTotals.units });
         });
 
         const scopeLabel = matchedEntriesForLabels.length > 0
