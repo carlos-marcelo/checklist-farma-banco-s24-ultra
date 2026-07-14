@@ -40,6 +40,7 @@ export type AuditCrossRow = {
     status: AuditCrossStatus;
     branch: string;
     area: string;
+    city?: string;
     auditNumber: number;
     progressPct: number;
     countedUnits: number;
@@ -65,6 +66,7 @@ type AuditSignalEvent = {
     key: string;
     branch: string;
     area: string;
+    city?: string;
     auditNumber: number;
     status: AuditCrossStatus;
     updatedAt: string;
@@ -104,6 +106,31 @@ type AuditHierarchySignal = {
     absoluteCost: number;
     skus: Set<string>;
     audits: Set<string>;
+};
+
+type AuditTransferMatch = {
+    key: string;
+    reducedCode: string;
+    description: string;
+    groupName: string;
+    deptName: string;
+    catName: string;
+    shortage: AuditSignalEvent;
+    surplus: AuditSignalEvent;
+    matchedQty: number;
+    correlatedCost: number;
+    sameArea: boolean;
+    sameCity: boolean | null;
+};
+
+type AuditFlowSummary = {
+    key: string;
+    label: string;
+    subtitle: string;
+    matchedQty: number;
+    correlatedCost: number;
+    products: Set<string>;
+    matches: AuditTransferMatch[];
 };
 
 const formatCurrency = (value: number) => value.toLocaleString('pt-BR', {
@@ -152,7 +179,8 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     const [search, setSearch] = useState('');
     const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
     const [panelView, setPanelView] = useState<'audits' | 'signals'>('audits');
-    const [signalView, setSignalView] = useState<'reversals' | 'recurrence' | 'hierarchy'>('reversals');
+    const [signalView, setSignalView] = useState<'transfers' | 'reversals' | 'recurrence' | 'hierarchy'>('transfers');
+    const [flowView, setFlowView] = useState<'branch' | 'area' | 'city'>('branch');
     const [expandedSignal, setExpandedSignal] = useState<string | null>(null);
 
     const areas = useMemo(
@@ -257,6 +285,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                     key: row.key,
                     branch: row.branch,
                     area: row.area,
+                    city: row.city,
                     auditNumber: row.auditNumber,
                     status: row.status,
                     updatedAt: row.updatedAt,
@@ -361,6 +390,104 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             .sort((a, b) => b.shortageCount - a.shortageCount || b.absoluteCost - a.absoluteCost);
         const hierarchySignals = Array.from(hierarchy.values())
             .sort((a, b) => b.absoluteCost - a.absoluteCost || b.occurrences - a.occurrences);
+
+        const transferMatches: AuditTransferMatch[] = [];
+        productSignals.forEach(product => {
+            const shortages = product.events.filter(event => event.diffQty < -0.01);
+            const surpluses = product.events.filter(event => event.diffQty > 0.01);
+            if (shortages.length === 0 || surpluses.length === 0) return;
+            const shortageRemaining = new Map(shortages.map(event => [event.key, Math.abs(event.diffQty)]));
+            const surplusRemaining = new Map(surpluses.map(event => [event.key, event.diffQty]));
+            const candidates = shortages.flatMap(shortage => surpluses
+                .filter(surplus => surplus.branch !== shortage.branch)
+                .map(surplus => {
+                    const hoursApart = Math.abs((Date.parse(shortage.updatedAt) || 0) - (Date.parse(surplus.updatedAt) || 0)) / 3_600_000;
+                    const score =
+                        (shortage.auditNumber === surplus.auditNumber ? 0 : 1_000) +
+                        (shortage.area === surplus.area ? 0 : 100) +
+                        Math.min(hoursApart, 10_000);
+                    return { shortage, surplus, score };
+                }))
+                .sort((a, b) => a.score - b.score);
+
+            candidates.forEach(({ shortage, surplus }) => {
+                const shortageQty = shortageRemaining.get(shortage.key) || 0;
+                const surplusQty = surplusRemaining.get(surplus.key) || 0;
+                if (shortageQty <= 0.01 || surplusQty <= 0.01) return;
+                const matchedQty = Math.min(shortageQty, surplusQty);
+                const shortageUnitImpact = Math.abs(shortage.diffCost) / Math.max(Math.abs(shortage.diffQty), 1);
+                const surplusUnitImpact = Math.abs(surplus.diffCost) / Math.max(Math.abs(surplus.diffQty), 1);
+                const validUnitImpacts = [shortageUnitImpact, surplusUnitImpact].filter(value => Number.isFinite(value) && value > 0);
+                const correlatedCost = matchedQty * (validUnitImpacts.length > 0 ? Math.min(...validUnitImpacts) : 0);
+                const shortageCity = String(shortage.city || '').trim();
+                const surplusCity = String(surplus.city || '').trim();
+                transferMatches.push({
+                    key: `${product.reducedCode}|${shortage.key}|${surplus.key}`,
+                    reducedCode: product.reducedCode,
+                    description: product.description,
+                    groupName: product.groupName,
+                    deptName: product.deptName,
+                    catName: product.catName,
+                    shortage,
+                    surplus,
+                    matchedQty,
+                    correlatedCost: Math.round(correlatedCost * 100) / 100,
+                    sameArea: shortage.area === surplus.area,
+                    sameCity: shortageCity && surplusCity ? shortageCity === surplusCity : null
+                });
+                shortageRemaining.set(shortage.key, shortageQty - matchedQty);
+                surplusRemaining.set(surplus.key, surplusQty - matchedQty);
+            });
+        });
+
+        const summarizeFlows = (
+            keyFor: (match: AuditTransferMatch) => string,
+            labelFor: (match: AuditTransferMatch) => string,
+            subtitleFor: (match: AuditTransferMatch) => string
+        ) => {
+            const map = new Map<string, AuditFlowSummary>();
+            transferMatches.forEach(match => {
+                const key = keyFor(match);
+                const current = map.get(key) || {
+                    key,
+                    label: labelFor(match),
+                    subtitle: subtitleFor(match),
+                    matchedQty: 0,
+                    correlatedCost: 0,
+                    products: new Set<string>(),
+                    matches: []
+                };
+                current.matchedQty += match.matchedQty;
+                current.correlatedCost += match.correlatedCost;
+                current.products.add(match.reducedCode);
+                current.matches.push(match);
+                map.set(key, current);
+            });
+            return Array.from(map.values())
+                .map(flow => ({ ...flow, correlatedCost: Math.round(flow.correlatedCost * 100) / 100 }))
+                .sort((a, b) => b.products.size - a.products.size || b.correlatedCost - a.correlatedCost);
+        };
+
+        const branchFlows = summarizeFlows(
+            match => `${match.shortage.branch}|${match.surplus.branch}`,
+            match => `${match.shortage.branch} → ${match.surplus.branch}`,
+            match => `${match.shortage.area} → ${match.surplus.area}`
+        );
+        const areaFlows = summarizeFlows(
+            match => `${match.shortage.area}|${match.surplus.area}`,
+            match => match.sameArea ? `Dentro de ${match.shortage.area}` : `${match.shortage.area} → ${match.surplus.area}`,
+            match => match.sameArea ? 'Possível divergência de transferência ou entrega interna' : 'Possível divergência de distribuição entre áreas'
+        );
+        const cityFlows = summarizeFlows(
+            match => `${match.shortage.city || 'Cidade não informada'}|${match.surplus.city || 'Cidade não informada'}`,
+            match => `${match.shortage.city || 'Cidade não informada'} → ${match.surplus.city || 'Cidade não informada'}`,
+            match => match.sameCity === true
+                ? 'Movimentação dentro da mesma cidade'
+                : match.sameCity === false
+                    ? 'Possível divergência logística entre cidades'
+                    : 'Correlação parcial; cidade ausente em uma ou ambas as filiais'
+        );
+        const rowsWithCity = scopeRows.filter(row => !!String(row.city || '').trim()).length;
         return {
             analyzedSkus: productSignals.length,
             events: productSignals.reduce((sum, item) => sum + item.events.length, 0),
@@ -368,7 +495,12 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             reversals,
             recurrentShortages,
             hierarchy: hierarchySignals,
-            products: productSignals
+            products: productSignals,
+            transferMatches: transferMatches.sort((a, b) => b.correlatedCost - a.correlatedCost),
+            branchFlows,
+            areaFlows,
+            cityFlows,
+            rowsWithCity
         };
     }, [scopeRows]);
 
@@ -432,6 +564,64 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                     </div>
                                 );
                             })}
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    };
+
+    const renderFlowSummary = (flow: AuditFlowSummary, context: 'branch' | 'area' | 'city') => {
+        const flowKey = `flow|${context}|${flow.key}`;
+        const isFlowExpanded = expandedSignal === flowKey;
+        return (
+            <div key={flowKey} className="border border-cyan-400/20 bg-cyan-500/[0.04]">
+                <button
+                    type="button"
+                    onClick={() => setExpandedSignal(current => current === flowKey ? null : flowKey)}
+                    className="w-full p-3 text-left cursor-pointer hover:bg-white/[0.03]"
+                >
+                    <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                            <p className="text-[10px] font-black text-white">{flow.label}</p>
+                            <p className="mt-1 text-[8px] font-bold leading-relaxed text-slate-500">{flow.subtitle}</p>
+                        </div>
+                        <ArrowDownUp className="h-4 w-4 shrink-0 text-cyan-300" />
+                    </div>
+                    <div className="mt-2 grid grid-cols-3 gap-2 border-t border-white/10 pt-2 text-[8px] font-bold">
+                        <span className="text-white">{flow.products.size} SKU(s)</span>
+                        <span className="text-cyan-200">{flow.matchedQty.toLocaleString('pt-BR')} un. correl.</span>
+                        <span className="text-right text-slate-300">{formatCurrency(flow.correlatedCost)}</span>
+                    </div>
+                </button>
+                {isFlowExpanded && (
+                    <div className="border-t border-white/10 px-3 pb-3">
+                        <p className="py-2 text-[8px] font-bold leading-relaxed text-slate-400">
+                            Mesmos reduzidos com falta de um lado e sobra do outro. Verificar transferências, separação, recebimento, devoluções e lançamentos antes de concluir a causa.
+                        </p>
+                        <div className="max-h-[300px] divide-y divide-white/10 overflow-y-auto border-y border-white/10">
+                            {flow.matches.slice(0, 30).map(match => (
+                                <div key={`${flowKey}|${match.key}`} className="py-2">
+                                    <div className="flex items-start justify-between gap-2">
+                                        <div className="min-w-0">
+                                            <p className="truncate text-[9px] font-black text-white">{match.description}</p>
+                                            <p className="mt-0.5 text-[8px] font-bold text-indigo-300">Red. {match.reducedCode}</p>
+                                        </div>
+                                        <span className="shrink-0 text-[8px] font-black text-cyan-200">{match.matchedQty.toLocaleString('pt-BR')} un.</span>
+                                    </div>
+                                    <div className="mt-1 grid grid-cols-2 gap-2 text-[8px] font-black">
+                                        <span className="text-red-300">Falta: {match.shortage.branch} {formatSignedQuantity(match.shortage.diffQty)}</span>
+                                        <span className="text-right text-emerald-300">Sobra: {match.surplus.branch} {formatSignedQuantity(match.surplus.diffQty)}</span>
+                                    </div>
+                                    <p className="mt-1 line-clamp-2 text-[8px] font-bold uppercase leading-relaxed text-slate-600">
+                                        {match.groupName} / {match.deptName} / {match.catName}
+                                    </p>
+                                    <div className="mt-1 flex items-center justify-between gap-2 text-[8px] font-bold text-slate-500">
+                                        <span>{match.sameArea ? `Mesma área: ${match.shortage.area}` : `${match.shortage.area} → ${match.surplus.area}`}</span>
+                                        <span>{formatCurrency(match.correlatedCost)}</span>
+                                    </div>
+                                </div>
+                            ))}
                         </div>
                     </div>
                 )}
@@ -751,10 +941,14 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                 <p className="text-[8px] font-black uppercase text-slate-500">Faltas recorrentes</p>
                                 <p className={`mt-1 text-lg font-black tabular-nums ${auditSignals.recurrentShortages.length > 0 ? 'text-red-300' : 'text-slate-300'}`}>{auditSignals.recurrentShortages.length}</p>
                             </div>
+                            <div className="col-span-2 flex items-center justify-between gap-3 border-t border-white/10 px-3 py-2">
+                                <span className="text-[8px] font-black uppercase text-slate-500">Reduzidos correlacionados entre filiais</span>
+                                <span className={`text-sm font-black tabular-nums ${auditSignals.transferMatches.length > 0 ? 'text-cyan-200' : 'text-slate-300'}`}>{new Set(auditSignals.transferMatches.map(match => match.reducedCode)).size}</span>
+                            </div>
                         </div>
 
-                        <div className="mt-3 grid grid-cols-3 border border-white/10">
-                            {([['reversals', 'Inversões'], ['recurrence', 'Recorrências'], ['hierarchy', 'Hierarquia']] as const).map(([value, label]) => (
+                        <div className="mt-3 grid grid-cols-4 border border-white/10">
+                            {([['transfers', 'Filiais/áreas'], ['reversals', 'Inversões'], ['recurrence', 'Recorrências'], ['hierarchy', 'Hierarquia']] as const).map(([value, label]) => (
                                 <button
                                     key={value}
                                     type="button"
@@ -777,6 +971,36 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                         )}
 
                         <div className="mt-3 max-h-[500px] overflow-y-auto space-y-2 pr-1">
+                            {signalView === 'transfers' && (
+                                <>
+                                    <div className="grid grid-cols-3 border border-white/10">
+                                        {([['branch', 'Por filial'], ['area', 'Por área'], ['city', 'Por cidade']] as const).map(([value, label]) => (
+                                            <button
+                                                key={value}
+                                                type="button"
+                                                onClick={() => {
+                                                    setFlowView(value);
+                                                    setExpandedSignal(null);
+                                                }}
+                                                className={`h-8 px-1 text-[8px] font-black uppercase cursor-pointer ${flowView === value ? 'bg-cyan-500/15 text-cyan-200' : 'text-slate-600 hover:bg-white/5 hover:text-white'}`}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    {flowView === 'city' && (
+                                        <div className={`px-3 py-2 text-[8px] font-bold leading-relaxed ${auditSignals.rowsWithCity < scopeRows.length ? 'border border-amber-400/20 bg-amber-500/5 text-amber-200' : 'border border-emerald-400/20 bg-emerald-500/5 text-emerald-200'}`}>
+                                            Cidade identificada em {auditSignals.rowsWithCity} de {scopeRows.length} auditoria(s). Registros sem cidade permanecem como “Cidade não informada”.
+                                        </div>
+                                    )}
+                                    {(flowView === 'branch' ? auditSignals.branchFlows : flowView === 'area' ? auditSignals.areaFlows : auditSignals.cityFlows).length > 0
+                                        ? (flowView === 'branch' ? auditSignals.branchFlows : flowView === 'area' ? auditSignals.areaFlows : auditSignals.cityFlows)
+                                            .slice(0, 30)
+                                            .map(flow => renderFlowSummary(flow, flowView))
+                                        : <div className="border-y border-white/10 py-8 text-center text-[10px] font-bold text-slate-500">Nenhuma correlação de falta e sobra entre filiais neste recorte.</div>}
+                                </>
+                            )}
+
                             {signalView === 'reversals' && (
                                 auditSignals.reversals.length > 0
                                     ? auditSignals.reversals.slice(0, 30).map(signal => renderProductSignal(signal, 'reversal'))

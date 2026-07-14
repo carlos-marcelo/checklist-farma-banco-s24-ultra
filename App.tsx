@@ -266,6 +266,23 @@ const normalizeBranchLabel = (raw: string | null | undefined): string => {
     return s.replace(/\s+/g, ' ');
 };
 
+const getAuditBranchCity = (parsedData: any, rawBranch?: string | null): string | undefined => {
+    const candidates = [
+        parsedData?.city,
+        parsedData?.cidade,
+        parsedData?.branchCity,
+        parsedData?.filialCity,
+        parsedData?.metadata?.city,
+        parsedData?.metadata?.cidade
+    ];
+    const explicit = candidates.find(value => typeof value === 'string' && value.trim());
+    if (explicit) return String(explicit).trim();
+
+    const label = String(rawBranch || '').replace(/\s+/g, ' ').trim();
+    const suffix = label.match(/(?:filial|loja|unidade)\s*\d+\s*(?:[-–|/])\s*(.+)$/i)?.[1]?.trim();
+    return suffix && /[a-záàâãéèêíïóôõöúçñ]/i.test(suffix) ? suffix : undefined;
+};
+
 const normalizeBranchDigits = (digits: string) => digits.replace(/^0+(?=\d)/, '');
 
 const extractAuditBranchValue = (raw: string | null | undefined): string => {
@@ -7653,6 +7670,7 @@ const App: React.FC = () => {
         type BranchMetric = {
             branch: string;
             area: string;
+            city?: string;
             auditNumber: number;
             updatedAt: string;
             progressPct: number;
@@ -7680,6 +7698,7 @@ const App: React.FC = () => {
 
         const isAfterPartialCutoff = new Date(dashboardClockMinute).getHours() >= 18;
         const branchToArea = new Map<string, string>();
+        const branchToCity = new Map<string, string>();
         const branchAreaToCompany = new Map<string, { id?: string; name?: string }>();
         const branchToCompany = new Map<string, { id?: string; name?: string }>();
         scopedCompanies.forEach(c => {
@@ -7698,6 +7717,8 @@ const App: React.FC = () => {
                     if (!branchToCompany.has(normalized)) {
                         branchToCompany.set(normalized, companyInfo);
                     }
+                    const city = getAuditBranchCity(null, branch);
+                    if (city && !branchToCity.has(normalized)) branchToCity.set(normalized, city);
                 });
             });
         });
@@ -8135,10 +8156,12 @@ const App: React.FC = () => {
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
 
             const branchArea = branchToArea.get(branchLabel) || 'Sem Área';
+            const branchCity = getAuditBranchCity(parsedData, session.branch) || branchToCity.get(branchLabel);
             const companyInfo = branchAreaToCompany.get(`${normalizeFilterKey(branchArea)}|${branchLabel}`) || branchToCompany.get(branchLabel);
             branches.push({
                 branch: branchLabel,
                 area: branchArea,
+                city: branchCity,
                 companyId: companyInfo?.id,
                 companyName: companyInfo?.name,
                 auditNumber: Number(session.audit_number || 0),
@@ -8284,6 +8307,7 @@ const App: React.FC = () => {
         type BranchMetric = {
             branch: string;
             area: string;
+            city?: string;
             auditNumber: number;
             updatedAt: string;
             progressPct: number;
@@ -8307,6 +8331,7 @@ const App: React.FC = () => {
         };
 
         const branchToArea = new Map<string, string>();
+        const branchToCity = new Map<string, string>();
         const branchAreaToCompany = new Map<string, { id?: string; name?: string }>();
         const branchToCompany = new Map<string, { id?: string; name?: string }>();
         scopedCompanies.forEach(c => {
@@ -8325,6 +8350,8 @@ const App: React.FC = () => {
                     if (!branchToCompany.has(normalized)) {
                         branchToCompany.set(normalized, companyInfo);
                     }
+                    const city = getAuditBranchCity(null, branch);
+                    if (city && !branchToCity.has(normalized)) branchToCity.set(normalized, city);
                 });
             });
         });
@@ -8753,10 +8780,12 @@ const App: React.FC = () => {
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
 
             const branchArea = branchToArea.get(branchLabel) || 'Sem Área';
+            const branchCity = getAuditBranchCity(parsedData, session.branch) || branchToCity.get(branchLabel);
             const companyInfo = branchAreaToCompany.get(`${normalizeFilterKey(branchArea)}|${branchLabel}`) || branchToCompany.get(branchLabel);
             branches.push({
                 branch: branchLabel,
                 area: branchArea,
+                city: branchCity,
                 companyId: companyInfo?.id,
                 companyName: companyInfo?.name,
                 auditNumber: Number(session.audit_number || 0),
@@ -8884,6 +8913,7 @@ const App: React.FC = () => {
             status,
             branch: normalizeBranchLabel(branch.branch),
             area: String(branch.area || 'Sem Área').trim() || 'Sem Área',
+            city: branch.city ? String(branch.city).trim() : undefined,
             auditNumber: Number(branch.auditNumber || 0),
             progressPct: Number(branch.progressPct || 0),
             countedUnits: Number(branch.countedUnits || 0),
