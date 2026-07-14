@@ -139,6 +139,8 @@ const formatCurrency = (value: number) => value.toLocaleString('pt-BR', {
     currency: 'BRL'
 });
 
+const formatSignedCurrency = (value: number) => `${value > 0 ? '+' : ''}${formatCurrency(value)}`;
+
 const formatPercent = (value: number) => `${value.toLocaleString('pt-BR', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
@@ -398,6 +400,8 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
         }).sort((a, b) => b.score - a.score || b.absoluteCost - a.absoluteCost);
 
         const reversals = productSignals.filter(item => item.reversalCount > 0);
+        const reversalNetQty = reversals.reduce((sum, item) => sum + item.netQty, 0);
+        const reversalNetCost = Math.round(reversals.reduce((sum, item) => sum + item.netCost, 0) * 100) / 100;
         const recurrentShortages = productSignals
             .filter(item => item.shortageCount >= 2)
             .sort((a, b) => b.shortageCount - a.shortageCount || b.absoluteCost - a.absoluteCost);
@@ -509,6 +513,8 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             events: productSignals.reduce((sum, item) => sum + item.events.length, 0),
             highPriority: productSignals.filter(item => item.priority === 'high').length,
             reversals,
+            reversalNetQty,
+            reversalNetCost,
             recurrentShortages,
             hierarchy: hierarchySignals,
             products: productSignals,
@@ -552,7 +558,10 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                     <div className="mt-2 grid grid-cols-3 gap-2 border-t border-white/10 pt-2 text-[8px] font-bold">
                         <span className="text-red-300">{signal.shortageCount} falta(s)</span>
                         <span className="text-emerald-300">{signal.surplusCount} sobra(s)</span>
-                        <span className="text-right text-slate-300">{formatCurrency(signal.netCost)}</span>
+                        <span className={`text-right ${signal.netCost < 0 ? 'text-red-300' : signal.netCost > 0 ? 'text-emerald-300' : 'text-slate-300'}`}>Saldo {formatSignedCurrency(signal.netCost)}</span>
+                    </div>
+                    <div className={`mt-1 text-right text-[8px] font-black ${signal.netQty < 0 ? 'text-red-300' : signal.netQty > 0 ? 'text-emerald-300' : 'text-slate-400'}`}>
+                        Divergência final: {formatSignedQuantity(signal.netQty)} un.
                     </div>
                 </button>
                 {isSignalExpanded && (
@@ -957,7 +966,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                 <p className={`mt-1 text-lg font-black tabular-nums ${auditSignals.highPriority > 0 ? 'text-red-300' : 'text-slate-300'}`}>{auditSignals.highPriority}</p>
                             </div>
                             <div className="border-t border-white/10 py-3">
-                                <p className="text-[8px] font-black uppercase text-slate-500">Inversões falta/sobra</p>
+                                <p className="text-[8px] font-black uppercase text-slate-500">SKUs (mix) com inversão</p>
                                 <p className={`mt-1 text-lg font-black tabular-nums ${auditSignals.reversals.length > 0 ? 'text-amber-300' : 'text-slate-300'}`}>{auditSignals.reversals.length}</p>
                             </div>
                             <div className="border-l border-t border-white/10 py-3">
@@ -974,6 +983,22 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                     <span className={`text-sm font-black tabular-nums ${auditSignals.crossStatusProducts > 0 ? 'text-cyan-200' : 'text-slate-300'}`}>{auditSignals.crossStatusProducts} reduzido(s)</span>
                                 </div>
                             )}
+                            <div className="col-span-2 border-t border-white/10 px-3 py-2.5">
+                                <div className="flex items-center justify-between gap-3">
+                                    <span className="text-[8px] font-black uppercase text-slate-500">Saldo final dos SKUs com inversão</span>
+                                    <span className={`text-[8px] font-black uppercase ${auditSignals.reversalNetCost < 0 ? 'text-red-300' : auditSignals.reversalNetCost > 0 ? 'text-emerald-300' : 'text-slate-400'}`}>
+                                        {auditSignals.reversalNetCost < 0 ? 'Negativo' : auditSignals.reversalNetCost > 0 ? 'Positivo' : 'Zerado'}
+                                    </span>
+                                </div>
+                                <div className="mt-1 flex items-center justify-between gap-3 text-[11px] font-black tabular-nums">
+                                    <span className={auditSignals.reversalNetQty < 0 ? 'text-red-300' : auditSignals.reversalNetQty > 0 ? 'text-emerald-300' : 'text-slate-300'}>
+                                        {formatSignedQuantity(auditSignals.reversalNetQty)} un.
+                                    </span>
+                                    <span className={auditSignals.reversalNetCost < 0 ? 'text-red-300' : auditSignals.reversalNetCost > 0 ? 'text-emerald-300' : 'text-slate-300'}>
+                                        {formatSignedCurrency(auditSignals.reversalNetCost)}
+                                    </span>
+                                </div>
+                            </div>
                         </div>
 
                         <div className="mt-3 grid grid-cols-4 border border-white/10">
