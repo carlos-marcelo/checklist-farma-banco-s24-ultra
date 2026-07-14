@@ -520,6 +520,9 @@ const normalizePostAuditAdjustments = (value: unknown): PostAuditAdjustment[] =>
             const totalCost = roundPostAuditMoney(item?.totalCost ?? (quantity * unitCost));
             return {
                 id: String(item?.id || `${Date.now()}_${Math.random().toString(36).slice(2)}`),
+                branch: item?.branch ? toAuditBranchValue(item.branch) : undefined,
+                auditNumber: Number.isFinite(Number(item?.auditNumber)) ? Number(item.auditNumber) : undefined,
+                inventoryNumber: item?.inventoryNumber ? String(item.inventoryNumber).trim() : undefined,
                 code: String(item?.code || item?.reducedCode || item?.barcode || '').trim(),
                 barcode: String(item?.barcode || '').trim() || undefined,
                 reducedCode: String(item?.reducedCode || '').trim() || undefined,
@@ -11191,6 +11194,25 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const persistPostAuditAdjustments = useCallback(async (nextAdjustmentsRaw: PostAuditAdjustment[]) => {
         if (!data || isReadOnlyCompletedView) return false;
         const nextAdjustments = normalizePostAuditAdjustments(nextAdjustmentsRaw);
+        const expectedBranch = toAuditBranchValue(selectedFilial);
+        const expectedAuditNumber = Number(nextAuditNumber || 0);
+        const foreignAdjustment = nextAdjustments.find(item => {
+            const itemBranch = item.branch ? toAuditBranchValue(item.branch) : '';
+            const itemAuditNumber = Number(item.auditNumber || 0);
+            return (itemBranch && itemBranch !== expectedBranch) ||
+                (itemAuditNumber > 0 && itemAuditNumber !== expectedAuditNumber);
+        });
+        if (foreignAdjustment) {
+            console.error('[AuditModule] Ajuste de outro contexto bloqueado.', {
+                adjustmentId: foreignAdjustment.id,
+                adjustmentBranch: foreignAdjustment.branch,
+                adjustmentAuditNumber: foreignAdjustment.auditNumber,
+                expectedBranch,
+                expectedAuditNumber
+            });
+            setPostAdjustmentError('Ajuste bloqueado: os dados pertencem a outra filial ou auditoria. Reabra a filial correta antes de salvar.');
+            return false;
+        }
         const nextData = {
             ...data,
             postAuditAdjustments: nextAdjustments,
@@ -11271,6 +11293,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             : `adj_${Date.now()}_${Math.random().toString(36).slice(2)}`;
         const adjustment: PostAuditAdjustment = {
             id,
+            branch: toAuditBranchValue(selectedFilial),
+            auditNumber: nextAuditNumber,
+            inventoryNumber: data?.inventoryNumber || inventoryNumber,
             code: product.reducedCode || product.barcode || postAdjustmentCode.trim(),
             barcode: product.barcode || undefined,
             reducedCode: product.reducedCode || undefined,
@@ -11295,6 +11320,29 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         try {
             const saved = await persistPostAuditAdjustments([...postAuditAdjustments, adjustment]);
             if (saved) {
+                void insertAppEventLog({
+                    company_id: selectedCompany?.id || null,
+                    branch: toAuditBranchValue(selectedFilial) || null,
+                    area: null,
+                    user_email: userEmail,
+                    user_name: userName || null,
+                    app: 'auditoria',
+                    event_type: 'post_audit_adjustment_created',
+                    entity_type: 'audit_adjustment',
+                    entity_id: adjustment.id,
+                    status: 'success',
+                    success: true,
+                    source: 'web',
+                    event_meta: {
+                        auditNumber: nextAuditNumber,
+                        inventoryNumber: adjustment.inventoryNumber,
+                        reducedCode: adjustment.reducedCode || adjustment.code,
+                        quantity: adjustment.quantity,
+                        unitCost: adjustment.unitCost,
+                        totalCost: adjustment.totalCost,
+                        mode: adjustment.mode
+                    }
+                }).catch(() => { });
                 setPostAdjustmentCode('');
                 setPostAdjustmentQty('');
                 setPostAdjustmentNote('');
@@ -11307,19 +11355,46 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } finally {
             setIsSavingPostAdjustment(false);
         }
-    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentQty, postAdjustmentCode, postAdjustmentNote, postAdjustmentMode, postAdjustmentAuditedSnapshot, userEmail, persistPostAuditAdjustments, postAuditAdjustments]);
+    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentQty, postAdjustmentCode, postAdjustmentNote, postAdjustmentMode, postAdjustmentAuditedSnapshot, userEmail, userName, selectedCompany?.id, persistPostAuditAdjustments, postAuditAdjustments, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
 
     const removePostAuditAdjustment = useCallback(async (id: string) => {
         if (isReadOnlyCompletedView) return;
+        const removedAdjustment = postAuditAdjustments.find(item => item.id === id);
         setIsSavingPostAdjustment(true);
         setPostAdjustmentError(null);
         try {
             const saved = await persistPostAuditAdjustments(postAuditAdjustments.filter(item => item.id !== id));
-            if (!saved) setPostAdjustmentError('Não foi possível remover o ajuste.');
+            if (!saved) {
+                setPostAdjustmentError('Não foi possível remover o ajuste.');
+            } else if (removedAdjustment) {
+                void insertAppEventLog({
+                    company_id: selectedCompany?.id || null,
+                    branch: toAuditBranchValue(selectedFilial) || null,
+                    area: null,
+                    user_email: userEmail,
+                    user_name: userName || null,
+                    app: 'auditoria',
+                    event_type: 'post_audit_adjustment_removed',
+                    entity_type: 'audit_adjustment',
+                    entity_id: removedAdjustment.id,
+                    status: 'success',
+                    success: true,
+                    source: 'web',
+                    event_meta: {
+                        auditNumber: nextAuditNumber,
+                        inventoryNumber: removedAdjustment.inventoryNumber || data?.inventoryNumber || inventoryNumber,
+                        reducedCode: removedAdjustment.reducedCode || removedAdjustment.code,
+                        quantity: removedAdjustment.quantity,
+                        unitCost: removedAdjustment.unitCost,
+                        totalCost: removedAdjustment.totalCost,
+                        mode: removedAdjustment.mode
+                    }
+                }).catch(() => { });
+            }
         } finally {
             setIsSavingPostAdjustment(false);
         }
-    }, [isReadOnlyCompletedView, persistPostAuditAdjustments, postAuditAdjustments]);
+    }, [isReadOnlyCompletedView, persistPostAuditAdjustments, postAuditAdjustments, selectedCompany?.id, selectedFilial, userEmail, userName, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
     const termScopeInfo = useMemo(() => (termModal ? buildTermScopeInfo(termModal) : null), [termModal, data]);
     const canEditTerm = canUseAuditMasterTools && !isReadOnlyCompletedView;
     const canFillTermSignatures = !isReadOnlyCompletedView;

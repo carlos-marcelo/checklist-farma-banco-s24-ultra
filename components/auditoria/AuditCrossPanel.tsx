@@ -1,4 +1,4 @@
-import React, { useDeferredValue, useMemo, useState } from 'react';
+import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import {
     AlertTriangle,
     ArrowDownUp,
@@ -136,6 +136,8 @@ type AuditFlowSummary = {
     matches: AuditTransferMatch[];
 };
 
+type AuditSignalView = 'products' | 'transfers' | 'reversals' | 'recurrence' | 'hierarchy';
+
 const formatCurrency = (value: number) => value.toLocaleString('pt-BR', {
     style: 'currency',
     currency: 'BRL'
@@ -171,6 +173,12 @@ const getBranchOrder = (branch: string) => {
     return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
 };
 
+const normalizeFilterText = (value: unknown) => String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLocaleLowerCase('pt-BR');
+
 const EMPTY_AUDIT_CROSS_ROWS: AuditCrossRow[] = [];
 
 const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
@@ -185,17 +193,30 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     );
     const [statusFilter, setStatusFilter] = useState<'all' | AuditCrossStatus>('all');
     const [areaFilter, setAreaFilter] = useState('all');
+    const [cityFilter, setCityFilter] = useState('all');
     const [search, setSearch] = useState('');
     const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
     const [panelView, setPanelView] = useState<'audits' | 'signals'>('audits');
-    const [signalView, setSignalView] = useState<'transfers' | 'reversals' | 'recurrence' | 'hierarchy'>('transfers');
+    const [signalView, setSignalView] = useState<AuditSignalView>('transfers');
+    const [productFilter, setProductFilter] = useState<'all' | 'high'>('all');
     const [reversalFilter, setReversalFilter] = useState<'all' | 'exact'>('all');
+    const [productVisibleLimit, setProductVisibleLimit] = useState(30);
+    const [reversalVisibleLimit, setReversalVisibleLimit] = useState(30);
     const [flowView, setFlowView] = useState<'branch' | 'area' | 'city'>('branch');
     const [expandedSignal, setExpandedSignal] = useState<string | null>(null);
+    const signalResultsRef = useRef<HTMLDivElement>(null);
 
     const areas = useMemo(
         () => Array.from(new Set(rows.map(row => row.area).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'pt-BR')),
         [rows]
+    );
+    const cities = useMemo(
+        () => Array.from(new Set(rows
+            .filter(row => areaFilter === 'all' || row.area === areaFilter)
+            .map(row => String(row.city || '').trim())
+            .filter(Boolean)))
+            .sort((a, b) => a.localeCompare(b, 'pt-BR')),
+        [areaFilter, rows]
     );
     const statusCounts = useMemo(() => ({
         all: rows.length,
@@ -204,13 +225,36 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     }), [rows]);
 
     const filteredRows = useMemo(() => {
-        const normalizedSearch = search.trim().toLocaleLowerCase('pt-BR');
+        const branchNumbers = new Set<string>();
+        const auditNumbers = new Set<string>();
+        const freeTerms: string[] = [];
+        search.split(',').forEach(rawToken => {
+            const token = normalizeFilterText(rawToken);
+            if (!token) return;
+            const branchMatch = token.match(/^(?:f|filial)\s*\.?\s*0*(\d+)$/i);
+            if (branchMatch) {
+                branchNumbers.add(String(Number(branchMatch[1])));
+                return;
+            }
+            const auditMatch = token.match(/^(?:n|inv|inventario)\s*(?:n\s*)?[.º°-]?\s*0*(\d+)$/i);
+            if (auditMatch) {
+                auditNumbers.add(String(Number(auditMatch[1])));
+                return;
+            }
+            freeTerms.push(token);
+        });
+
         return rows
             .filter(row => statusFilter === 'all' || row.status === statusFilter)
             .filter(row => areaFilter === 'all' || row.area === areaFilter)
+            .filter(row => cityFilter === 'all' || row.city === cityFilter)
             .filter(row => {
-                if (!normalizedSearch) return true;
-                return `${row.branch} ${row.area} ${row.auditNumber}`.toLocaleLowerCase('pt-BR').includes(normalizedSearch);
+                const branchNumber = String(getBranchOrder(row.branch));
+                if (branchNumbers.size > 0 && !branchNumbers.has(branchNumber)) return false;
+                if (auditNumbers.size > 0 && !auditNumbers.has(String(Number(row.auditNumber)))) return false;
+                if (freeTerms.length === 0) return true;
+                const haystack = normalizeFilterText(`${row.branch} ${row.area} ${row.city || ''} ${row.auditNumber} N${row.auditNumber}`);
+                return freeTerms.some(term => haystack.includes(term));
             })
             .sort((a, b) => {
                 const areaOrder = a.area.localeCompare(b.area, 'pt-BR');
@@ -220,7 +264,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                 if (a.status !== b.status) return a.status === 'open' ? -1 : 1;
                 return b.auditNumber - a.auditNumber;
             });
-    }, [areaFilter, rows, search, statusFilter]);
+    }, [areaFilter, cityFilter, rows, search, statusFilter]);
 
     const selectedRows = useMemo(() => {
         const selected = new Set(selectedKeys);
@@ -419,7 +463,9 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             } satisfies AuditProductSignal;
         }).sort((a, b) => b.score - a.score || b.absoluteCost - a.absoluteCost);
 
-        const reversals = productSignals.filter(item => item.reversalCount > 0);
+        const reversals = productSignals
+            .filter(item => item.reversalCount > 0)
+            .sort((a, b) => Math.abs(b.netCost) - Math.abs(a.netCost) || b.score - a.score);
         const exactReversals = reversals.filter(item => item.exactReversalCount > 0);
         const reversalNetQty = reversals.reduce((sum, item) => sum + item.netQty, 0);
         const reversalNetCost = Math.round(reversals.reduce((sum, item) => sum + item.netCost, 0) * 100) / 100;
@@ -550,8 +596,37 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
         };
     }, [deferredSignalRows]);
     const displayedReversals = reversalFilter === 'exact' ? auditSignals.exactReversals : auditSignals.reversals;
+    const displayedProducts = productFilter === 'high'
+        ? auditSignals.products.filter(item => item.priority === 'high')
+        : auditSignals.products;
+    const visibleProducts = displayedProducts.slice(0, productVisibleLimit);
+    const visibleReversals = displayedReversals.slice(0, reversalVisibleLimit);
+    const visibleReversalNetCost = Math.round(visibleReversals.reduce((sum, item) => sum + item.netCost, 0) * 100) / 100;
+    const filteredReversalNetCost = Math.round(displayedReversals.reduce((sum, item) => sum + item.netCost, 0) * 100) / 100;
+    const remainingReversalNetCost = Math.round((filteredReversalNetCost - visibleReversalNetCost) * 100) / 100;
 
-    const renderProductSignal = (signal: AuditProductSignal, context: 'reversal' | 'recurrence') => {
+    useEffect(() => {
+        setReversalVisibleLimit(30);
+    }, [deferredSignalRows, reversalFilter]);
+
+    useEffect(() => {
+        setProductVisibleLimit(30);
+    }, [deferredSignalRows, productFilter]);
+
+    const showSignalDetails = (
+        view: AuditSignalView,
+        options?: { product?: 'all' | 'high'; reversal?: 'all' | 'exact' }
+    ) => {
+        if (options?.product) setProductFilter(options.product);
+        if (options?.reversal) setReversalFilter(options.reversal);
+        setSignalView(view);
+        setExpandedSignal(null);
+        window.requestAnimationFrame(() => {
+            signalResultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        });
+    };
+
+    const renderProductSignal = (signal: AuditProductSignal, context: 'product' | 'reversal' | 'recurrence') => {
         const expandedSignalKey = `${context}|${signal.reducedCode}`;
         const isSignalExpanded = expandedSignal === expandedSignalKey;
         const priorityStyle = signal.priority === 'high'
@@ -602,7 +677,9 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                         <div className="py-2 text-[8px] font-bold leading-relaxed text-slate-400">
                             {context === 'reversal'
                                 ? `${signal.reversalCount} inversão(ões) de sinal em ${signal.branchCount} filial(is). ${signal.exactReversalCount > 0 ? `${signal.exactReversalCount} com quantidade exatamente oposta, indicando possível erro de conferência. ` : ''}Conferir sequência de contagem, movimentações e ajustes.`
-                                : `${signal.shortageCount} registros de falta. A repetição indica necessidade de apuração operacional e documental.`}
+                                : context === 'recurrence'
+                                    ? `${signal.shortageCount} registros de falta. A repetição indica necessidade de apuração operacional e documental.`
+                                    : `${signal.events.length} ocorrência(s) em ${signal.branchCount} filial(is), com saldo final de ${formatSignedQuantity(signal.netQty)} un. e ${formatSignedCurrency(signal.netCost)}. Score indicativo: ${signal.score}.`}
                         </div>
                         <div className="divide-y divide-white/10 border-y border-white/10">
                             {signal.events.map(event => {
@@ -694,14 +771,15 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
 
     if (!expanded) {
         return (
-            <aside className="w-full xl:w-14 shrink-0 bg-slate-950 border border-slate-800 xl:min-h-[720px]">
+            <aside className="w-full xl:w-12 shrink-0 self-start">
                 <button
                     type="button"
                     onClick={() => setExpanded(true)}
-                    className="w-full h-14 xl:h-20 inline-flex items-center justify-center text-indigo-300 hover:text-white hover:bg-slate-900 transition-colors cursor-pointer"
+                    className="group h-12 w-full xl:sticky xl:top-3 inline-flex items-center justify-center gap-2 rounded-lg border border-slate-800 bg-slate-950 px-3 text-indigo-300 shadow-sm transition-colors hover:border-indigo-400/50 hover:bg-slate-900 hover:text-white cursor-pointer"
                     title="Abrir cruzamento de auditorias"
                 >
                     <LineChart className="h-5 w-5" />
+                    <span className="text-[9px] font-black uppercase tracking-wider xl:hidden">Cruzamento de auditorias</span>
                 </button>
             </aside>
         );
@@ -761,12 +839,15 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                     ))}
                 </div>
 
-                <div className="mt-3 grid grid-cols-1 gap-2">
+                <div className="mt-3 grid grid-cols-2 gap-2">
                     <label className="relative">
                         <Building2 className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 pointer-events-none" />
                         <select
                             value={areaFilter}
-                            onChange={event => setAreaFilter(event.target.value)}
+                            onChange={event => {
+                                setAreaFilter(event.target.value);
+                                setCityFilter('all');
+                            }}
                             className="h-10 w-full appearance-none border border-white/10 bg-slate-900 pl-10 pr-8 text-xs font-bold text-white outline-none focus:border-indigo-400 cursor-pointer"
                         >
                             <option value="all">Todas as áreas</option>
@@ -775,11 +856,23 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                         <Filter className="absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500 pointer-events-none" />
                     </label>
                     <label className="relative">
+                        <Store className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 pointer-events-none" />
+                        <select
+                            value={cityFilter}
+                            onChange={event => setCityFilter(event.target.value)}
+                            className="h-10 w-full appearance-none border border-white/10 bg-slate-900 pl-10 pr-8 text-xs font-bold text-white outline-none focus:border-indigo-400 cursor-pointer"
+                        >
+                            <option value="all">Todas as cidades</option>
+                            {cities.map(city => <option key={city} value={city}>{city}</option>)}
+                        </select>
+                        <Filter className="absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500 pointer-events-none" />
+                    </label>
+                    <label className="relative col-span-2">
                         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 pointer-events-none" />
                         <input
                             value={search}
                             onChange={event => setSearch(event.target.value)}
-                            placeholder="Buscar filial ou inventário"
+                            placeholder="Filiais/inventários: F3, F14, N1, N2"
                             className="h-10 w-full border border-white/10 bg-slate-900 pl-10 pr-9 text-xs font-bold text-white placeholder:text-slate-600 outline-none focus:border-indigo-400"
                         />
                         {search && (
@@ -989,23 +1082,71 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                             </div>
                         </div>
 
+                        {selectedRows.length > 0 && (
+                            <div className="border-b border-indigo-400/30 bg-indigo-500/10 px-3 py-3">
+                                <div className="flex items-center justify-between gap-3">
+                                    <div>
+                                        <p className="text-[8px] font-black uppercase tracking-wider text-indigo-200">Seleção da análise</p>
+                                        <p className="mt-0.5 text-[8px] font-bold text-slate-500">Cruzamento manual de {selectedRows.length} auditoria(s)</p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setSelectedKeys([])}
+                                        className="text-[8px] font-black uppercase text-white hover:text-indigo-200 cursor-pointer"
+                                    >
+                                        Limpar {selectedRows.length}
+                                    </button>
+                                </div>
+                                <div className="mt-2 flex flex-wrap gap-1.5">
+                                    {selectedRows.map(row => (
+                                        <span
+                                            key={`analysis-selection|${row.key}`}
+                                            className={`border px-2 py-1 text-[8px] font-black ${row.status === 'open' ? 'border-blue-400/30 bg-blue-500/10 text-blue-200' : 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200'}`}
+                                        >
+                                            {row.branch} · Inv. {row.auditNumber} · {formatAuditStatus(row.status)}
+                                        </span>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
                         <div className="grid grid-cols-2 border-b border-white/10 text-center">
-                            <div className="py-3">
+                            <button
+                                type="button"
+                                onClick={() => showSignalDetails('products', { product: 'all' })}
+                                className="py-3 transition-colors hover:bg-indigo-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-400 cursor-pointer"
+                                title="Mostrar todos os reduzidos analisados"
+                            >
                                 <p className="text-[8px] font-black uppercase text-slate-500">Reduzidos analisados</p>
                                 <p className="mt-1 text-lg font-black text-white tabular-nums">{auditSignals.analyzedSkus}</p>
-                            </div>
-                            <div className="border-l border-white/10 py-3">
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => showSignalDetails('products', { product: 'high' })}
+                                className="border-l border-white/10 py-3 transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-red-400 cursor-pointer"
+                                title="Mostrar somente produtos de prioridade alta"
+                            >
                                 <p className="text-[8px] font-black uppercase text-slate-500">Prioridade alta</p>
                                 <p className={`mt-1 text-lg font-black tabular-nums ${auditSignals.highPriority > 0 ? 'text-red-300' : 'text-slate-300'}`}>{auditSignals.highPriority}</p>
-                            </div>
-                            <div className="border-t border-white/10 py-3">
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => showSignalDetails('reversals', { reversal: 'all' })}
+                                className="border-t border-white/10 py-3 transition-colors hover:bg-amber-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-400 cursor-pointer"
+                                title="Mostrar SKUs com inversão entre falta e sobra"
+                            >
                                 <p className="text-[8px] font-black uppercase text-slate-500">SKUs (mix) com inversão</p>
                                 <p className={`mt-1 text-lg font-black tabular-nums ${auditSignals.reversals.length > 0 ? 'text-amber-300' : 'text-slate-300'}`}>{auditSignals.reversals.length}</p>
-                            </div>
-                            <div className="border-l border-t border-white/10 py-3">
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => showSignalDetails('recurrence')}
+                                className="border-l border-t border-white/10 py-3 transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-red-400 cursor-pointer"
+                                title="Mostrar produtos com faltas recorrentes"
+                            >
                                 <p className="text-[8px] font-black uppercase text-slate-500">Faltas recorrentes</p>
                                 <p className={`mt-1 text-lg font-black tabular-nums ${auditSignals.recurrentShortages.length > 0 ? 'text-red-300' : 'text-slate-300'}`}>{auditSignals.recurrentShortages.length}</p>
-                            </div>
+                            </button>
                             <div className="col-span-2 flex items-center justify-between gap-3 border-t border-cyan-400/20 bg-cyan-500/[0.04] px-3 py-2">
                                 <div>
                                     <p className="text-[8px] font-black uppercase text-cyan-200">Possível erro de conferência</p>
@@ -1041,14 +1182,13 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                             </div>
                         </div>
 
-                        <div className="mt-3 grid grid-cols-4 border border-white/10">
-                            {([['transfers', 'Filiais/áreas'], ['reversals', 'Inversões'], ['recurrence', 'Recorrências'], ['hierarchy', 'Hierarquia']] as const).map(([value, label]) => (
+                        <div className="mt-3 grid grid-cols-5 border border-white/10">
+                            {([['products', 'Produtos'], ['transfers', 'Filiais/áreas'], ['reversals', 'Inversões'], ['recurrence', 'Recorr.'], ['hierarchy', 'Hierarquia']] as const).map(([value, label]) => (
                                 <button
                                     key={value}
                                     type="button"
                                     onClick={() => {
-                                        setSignalView(value);
-                                        setExpandedSignal(null);
+                                        showSignalDetails(value, value === 'products' ? { product: 'all' } : undefined);
                                     }}
                                     className={`h-9 px-1 text-[8px] font-black uppercase tracking-wider cursor-pointer ${signalView === value ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-white/5 hover:text-white'}`}
                                 >
@@ -1057,14 +1197,51 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                             ))}
                         </div>
 
-                        {selectedRows.length > 0 && (
-                            <div className="mt-3 flex items-center justify-between gap-3 border border-indigo-400/30 bg-indigo-500/10 px-3 py-2 text-[8px] font-bold text-indigo-200">
-                                <span>Analisando seleção manual</span>
-                                <button type="button" onClick={() => setSelectedKeys([])} className="font-black uppercase text-white cursor-pointer">Limpar {selectedRows.length}</button>
-                            </div>
-                        )}
+                        <div ref={signalResultsRef} className="mt-3 max-h-[500px] overflow-y-auto space-y-2 pr-1">
+                            {signalView === 'products' && (
+                                <>
+                                    <div className="grid grid-cols-2 border border-white/10">
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setProductFilter('all');
+                                                setExpandedSignal(null);
+                                            }}
+                                            className={`h-8 px-2 text-[8px] font-black uppercase cursor-pointer ${productFilter === 'all' ? 'bg-indigo-500/15 text-indigo-200' : 'text-slate-500 hover:bg-white/5 hover:text-white'}`}
+                                        >
+                                            Todos {auditSignals.products.length}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setProductFilter('high');
+                                                setExpandedSignal(null);
+                                            }}
+                                            className={`h-8 px-2 text-[8px] font-black uppercase cursor-pointer ${productFilter === 'high' ? 'bg-red-500/15 text-red-200' : 'text-slate-500 hover:bg-white/5 hover:text-white'}`}
+                                        >
+                                            Prioridade alta {auditSignals.highPriority}
+                                        </button>
+                                    </div>
+                                    {displayedProducts.length > 0 && (
+                                        <div className="border border-white/10 bg-white/[0.02] px-3 py-2 text-[8px] font-bold text-slate-400">
+                                            Exibindo {visibleProducts.length} de {displayedProducts.length} produto(s), ordenados por prioridade e impacto.
+                                        </div>
+                                    )}
+                                    {displayedProducts.length > 0
+                                        ? visibleProducts.map(signal => renderProductSignal(signal, 'product'))
+                                        : <div className="border-y border-white/10 py-8 text-center text-[10px] font-bold text-slate-500">Nenhum produto neste filtro.</div>}
+                                    {visibleProducts.length < displayedProducts.length && (
+                                        <button
+                                            type="button"
+                                            onClick={() => setProductVisibleLimit(current => current + 30)}
+                                            className="h-9 w-full border border-white/10 text-[8px] font-black uppercase text-indigo-200 hover:bg-white/5 cursor-pointer"
+                                        >
+                                            Mostrar mais 30
+                                        </button>
+                                    )}
+                                </>
+                            )}
 
-                        <div className="mt-3 max-h-[500px] overflow-y-auto space-y-2 pr-1">
                             {signalView === 'transfers' && (
                                 <>
                                     <div className="grid grid-cols-3 border border-white/10">
@@ -1119,9 +1296,32 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                             Qtd. exata {auditSignals.exactReversals.length}
                                         </button>
                                     </div>
+                                    {displayedReversals.length > 0 && (
+                                        <div className="border border-white/10 bg-white/[0.02] px-3 py-2 text-[8px] font-bold">
+                                            <div className="flex items-center justify-between gap-3 text-slate-400">
+                                                <span>Exibindo {visibleReversals.length} de {displayedReversals.length} SKU(s), ordenados por impacto financeiro</span>
+                                                <span className={filteredReversalNetCost < 0 ? 'text-red-300' : filteredReversalNetCost > 0 ? 'text-emerald-300' : 'text-slate-300'}>
+                                                    Total {formatSignedCurrency(filteredReversalNetCost)}
+                                                </span>
+                                            </div>
+                                            <div className="mt-1 flex items-center justify-between gap-3 border-t border-white/10 pt-1 text-slate-500">
+                                                <span>Subtotal exibido: {formatSignedCurrency(visibleReversalNetCost)}</span>
+                                                <span>Restante: {formatSignedCurrency(remainingReversalNetCost)}</span>
+                                            </div>
+                                        </div>
+                                    )}
                                     {displayedReversals.length > 0
-                                        ? displayedReversals.slice(0, 30).map(signal => renderProductSignal(signal, 'reversal'))
+                                        ? visibleReversals.map(signal => renderProductSignal(signal, 'reversal'))
                                         : <div className="border-y border-white/10 py-8 text-center text-[10px] font-bold text-slate-500">{reversalFilter === 'exact' ? 'Nenhuma inversão com quantidade exatamente oposta neste recorte.' : 'Nenhuma inversão de falta para sobra neste recorte.'}</div>}
+                                    {visibleReversals.length < displayedReversals.length && (
+                                        <button
+                                            type="button"
+                                            onClick={() => setReversalVisibleLimit(current => current + 30)}
+                                            className="h-9 w-full border border-white/10 text-[8px] font-black uppercase text-indigo-200 hover:bg-white/5 cursor-pointer"
+                                        >
+                                            Mostrar mais 30
+                                        </button>
+                                    )}
                                 </>
                             )}
 

@@ -17,6 +17,9 @@ export interface Product {
 
 export interface PostAuditAdjustment {
     id: string;
+    branch?: string;
+    auditNumber?: number;
+    inventoryNumber?: string;
     code: string;
     barcode?: string;
     reducedCode?: string;

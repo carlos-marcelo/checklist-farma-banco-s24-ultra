@@ -235,10 +235,48 @@ const PreVencidosManager = PRE_VENCIDOS_MODULE_ENABLED
     : null;
 
 const AnaliseDashboard = React.lazy(() => import('./components/AnaliseResultados/AnaliseDashboard'));
-const AuditModule = React.lazy(() => import('./components/auditoria/AuditModule'));
-const AuditCrossPanel = React.lazy(() => import('./components/auditoria/AuditCrossPanel'));
+const loadAuditModule = () => import('./components/auditoria/AuditModule');
+const loadAuditCrossPanel = () => import('./components/auditoria/AuditCrossPanel');
+const AuditModule = React.lazy(loadAuditModule);
+const AuditCrossPanel = React.lazy(loadAuditCrossPanel);
 const StockConference = React.lazy(() =>
     import('./components/StockConference').then(module => ({ default: module.StockConference }))
+);
+
+const AuditWorkspaceFallback: React.FC = () => (
+    <div
+        className="min-h-[720px] w-full border border-slate-800 bg-slate-950 px-4 py-8 sm:px-8"
+        role="status"
+        aria-label="Carregando módulo de auditoria"
+    >
+        <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg bg-white shadow-2xl">
+            <div className="flex h-28 items-center justify-center bg-indigo-600 px-6 text-white">
+                <div className="flex items-center gap-3">
+                    <span className="inline-flex h-10 w-10 items-center justify-center rounded-lg bg-white/10">
+                        <LineChart className="h-5 w-5" />
+                    </span>
+                    <div>
+                        <p className="text-lg font-black italic leading-none">AuditFlow</p>
+                        <p className="mt-1 text-[9px] font-black uppercase tracking-wider text-indigo-100">Carregando auditoria...</p>
+                    </div>
+                    <Loader2 className="ml-2 h-5 w-5 animate-spin text-indigo-100" />
+                </div>
+            </div>
+            <div className="animate-pulse p-6 sm:p-8">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    {[0, 1, 2].map(index => (
+                        <div key={`audit-loading-control-${index}`} className="h-14 rounded-lg bg-slate-100" />
+                    ))}
+                </div>
+                <div className="mt-7 grid grid-cols-2 gap-3 sm:grid-cols-5">
+                    {Array.from({ length: 10 }, (_, index) => (
+                        <div key={`audit-loading-slot-${index}`} className="h-28 rounded-lg border border-slate-200 bg-slate-50" />
+                    ))}
+                </div>
+                <div className="mt-7 h-11 rounded-lg bg-slate-900/10" />
+            </div>
+        </div>
+    </div>
 );
 
 const canonicalizeFilterLabel = (value: string) => {
@@ -704,20 +742,6 @@ const parseJsonValue = <T,>(value: any): T | null => {
 
 const AUDIT_GLOBAL_UNIFIED_TERM_BATCH_ID = '__global_unified_term__';
 const roundAuditMoney = (value: unknown) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
-
-const getPostAuditAdjustmentTotals = (parsedData: any) => {
-    const adjustments = Array.isArray(parsedData?.postAuditAdjustments) ? parsedData.postAuditAdjustments : [];
-    return adjustments.reduce((acc: { quantity: number; cost: number }, item: any) => {
-        const quantity = Number(item?.quantity || 0);
-        const unitCost = roundAuditMoney(item?.unitCost || 0);
-        const totalCost = roundAuditMoney(item?.totalCost ?? (quantity * unitCost));
-        if (!Number.isFinite(quantity) || !Number.isFinite(totalCost)) return acc;
-        return {
-            quantity: acc.quantity + quantity,
-            cost: roundAuditMoney(acc.cost + totalCost)
-        };
-    }, { quantity: 0, cost: 0 });
-};
 
 const auditMetricsContainsPostAuditAdjustments = (metrics: any) => {
     const normalizeText = (value: unknown) =>
@@ -1314,12 +1338,34 @@ const getAuditTermMetricsFromData = (parsedData: any) => {
     };
 };
 
-const getAdjustedAuditTermMetricsFromData = (parsedData: any) => {
+const normalizeAdjustmentBranch = (value: unknown) => {
+    const raw = String(value ?? '').trim();
+    const match = raw.match(/\d+/);
+    return match ? String(Number(match[0])) : raw.toLowerCase();
+};
+
+const getAdjustedAuditTermMetricsFromData = (
+    parsedData: any,
+    context?: { branch?: unknown; auditNumber?: unknown; inventoryNumber?: unknown }
+) => {
     const baseMetrics = getAuditTermMetricsFromData(parsedData);
     const sourceAlreadyHasAdjustments = auditMetricsContainsPostAuditAdjustments(baseMetrics);
+    const expectedBranch = normalizeAdjustmentBranch(context?.branch);
+    const expectedAuditNumber = Number(context?.auditNumber || 0);
+    const expectedInventoryNumber = String(context?.inventoryNumber || parsedData?.inventoryNumber || '').trim();
+    const recordedAdjustments = (Array.isArray(parsedData?.postAuditAdjustments) ? parsedData.postAuditAdjustments : [])
+        .filter((item: any) => {
+            const itemBranch = normalizeAdjustmentBranch(item?.branch);
+            const itemAuditNumber = Number(item?.auditNumber || 0);
+            const itemInventoryNumber = String(item?.inventoryNumber || '').trim();
+            if (itemBranch && expectedBranch && itemBranch !== expectedBranch) return false;
+            if (itemAuditNumber > 0 && expectedAuditNumber > 0 && itemAuditNumber !== expectedAuditNumber) return false;
+            if (itemInventoryNumber && expectedInventoryNumber && itemInventoryNumber !== expectedInventoryNumber) return false;
+            return true;
+        });
     const adjustments = sourceAlreadyHasAdjustments
         ? []
-        : (Array.isArray(parsedData?.postAuditAdjustments) ? parsedData.postAuditAdjustments : []);
+        : recordedAdjustments;
     const adjustmentRows = adjustments
         .map((item: any, index: number) => {
             const quantity = Number(item?.quantity || 0);
@@ -1349,9 +1395,23 @@ const getAdjustedAuditTermMetricsFromData = (parsedData: any) => {
             };
         })
         .filter(Boolean) as any[];
+    const recordedAdjustmentTotals = recordedAdjustments.reduce((acc: { quantity: number; cost: number }, item: any) => {
+        const quantity = Number(item?.quantity || 0);
+        const unitCost = roundAuditMoney(item?.unitCost || 0);
+        const totalCost = roundAuditMoney(item?.totalCost ?? (quantity * unitCost));
+        if (!Number.isFinite(quantity) || !Number.isFinite(totalCost)) return acc;
+        acc.quantity += quantity;
+        acc.cost = roundAuditMoney(acc.cost + totalCost);
+        return acc;
+    }, { quantity: 0, cost: 0 });
     const adjustmentTotals = sourceAlreadyHasAdjustments
         ? { quantity: 0, cost: 0 }
-        : getPostAuditAdjustmentTotals(parsedData);
+        : recordedAdjustmentTotals;
+    const latestAdjustment = recordedAdjustments.reduce((latest: any, item: any) => {
+        const latestTime = Date.parse(String(latest?.createdAt || '')) || 0;
+        const itemTime = Date.parse(String(item?.createdAt || '')) || 0;
+        return itemTime >= latestTime ? item : latest;
+    }, null);
 
     if (!baseMetrics && adjustmentRows.length === 0) return null;
     const base = baseMetrics || {
@@ -1373,7 +1433,13 @@ const getAdjustedAuditTermMetricsFromData = (parsedData: any) => {
         diffQty: Number(base.diffQty || 0) + Number(adjustmentTotals.quantity || 0),
         diffCost: roundAuditMoney(Number(base.diffCost || 0) + Number(adjustmentTotals.cost || 0)),
         items: [...(Array.isArray(base.items) ? base.items : []), ...adjustmentRows],
-        postAuditAdjustmentTotals: adjustmentTotals,
+        postAuditAdjustmentTotals: {
+            count: recordedAdjustments.length,
+            quantity: recordedAdjustmentTotals.quantity,
+            cost: recordedAdjustmentTotals.cost,
+            latestAt: latestAdjustment?.createdAt ? String(latestAdjustment.createdAt) : undefined,
+            latestBy: latestAdjustment?.createdBy ? String(latestAdjustment.createdBy) : undefined
+        },
         containsPostAuditAdjustments: sourceAlreadyHasAdjustments || adjustmentRows.length > 0
     };
 };
@@ -1402,7 +1468,11 @@ const getCachedAuditSessionAnalysis = (session: any): CachedAuditSessionAnalysis
     const analysis: CachedAuditSessionAnalysis = {
         sourceData,
         parsedData,
-        termMetrics: getAdjustedAuditTermMetricsFromData(parsedData)
+        termMetrics: getAdjustedAuditTermMetricsFromData(parsedData, {
+            branch: session?.branch,
+            auditNumber: session?.audit_number,
+            inventoryNumber: parsedData?.inventoryNumber
+        })
     };
     if (!auditSessionAnalysisCache.has(cacheKey) && auditSessionAnalysisCache.size >= AUDIT_SESSION_ANALYSIS_CACHE_LIMIT) {
         const oldestKey = auditSessionAnalysisCache.keys().next().value as string | undefined;
@@ -2636,6 +2706,13 @@ const App: React.FC = () => {
             localStorage.setItem('APP_CURRENT_VIEW', currentView);
         }
     }, [currentView]);
+
+    useEffect(() => {
+        if (!currentUser?.email) return;
+        scheduleBackgroundTask(() => {
+            void Promise.allSettled([loadAuditModule(), loadAuditCrossPanel()]);
+        }, 2500);
+    }, [currentUser?.email]);
     const [ignoredChecklists, setIgnoredChecklists] = useState<Set<string>>(new Set());
     const errorBoxRef = useRef<HTMLDivElement>(null);
 
@@ -7724,6 +7801,11 @@ const App: React.FC = () => {
             divergencePct: number;
             termsWithExcel: number;
             termItems: AuditCrossItem[];
+            postAuditAdjustmentCount: number;
+            postAuditAdjustmentQty: number;
+            postAuditAdjustmentCost: number;
+            latestPostAuditAdjustmentAt?: string;
+            latestPostAuditAdjustmentBy?: string;
             openPartialScopes: number;
             hasOpenPartial: boolean;
             isPartialOverdue: boolean;
@@ -8177,6 +8259,10 @@ const App: React.FC = () => {
                 });
                 diffCost = roundAuditMoney(diffCost);
             }
+            const postAuditAdjustmentTotals = (authoritativeTermMetrics as any)?.postAuditAdjustmentTotals || {};
+            const postAuditAdjustmentCount = Number(postAuditAdjustmentTotals.count || 0);
+            const postAuditAdjustmentQty = Number(postAuditAdjustmentTotals.quantity || 0);
+            const postAuditAdjustmentCost = roundAuditMoney(postAuditAdjustmentTotals.cost || 0);
             const pendingSkus = Math.max(0, totalSkus - countedSkus);
             const pendingUnits = Math.max(0, totalUnits - countedUnits);
             const pendingCost = roundAuditMoney(Math.max(0, totalCost - countedCost));
@@ -8214,6 +8300,11 @@ const App: React.FC = () => {
                 divergencePct,
                 termsWithExcel,
                 termItems: getAuditCrossItemsFromMetrics(authoritativeTermMetrics),
+                postAuditAdjustmentCount,
+                postAuditAdjustmentQty,
+                postAuditAdjustmentCost,
+                latestPostAuditAdjustmentAt: postAuditAdjustmentTotals.latestAt,
+                latestPostAuditAdjustmentBy: postAuditAdjustmentTotals.latestBy,
                 openPartialScopes,
                 hasOpenPartial,
                 isPartialOverdue
@@ -8248,6 +8339,9 @@ const App: React.FC = () => {
             countedCost: number;
             diffQty: number;
             diffCost: number;
+            postAuditAdjustmentCount: number;
+            postAuditAdjustmentQty: number;
+            postAuditAdjustmentCost: number;
             partialOpenAudits: number;
             partialOpenScopes: number;
             partialOverdueAudits: number;
@@ -8267,6 +8361,9 @@ const App: React.FC = () => {
                 countedCost: 0,
                 diffQty: 0,
                 diffCost: 0,
+                postAuditAdjustmentCount: 0,
+                postAuditAdjustmentQty: 0,
+                postAuditAdjustmentCost: 0,
                 partialOpenAudits: 0,
                 partialOpenScopes: 0,
                 partialOverdueAudits: 0
@@ -8282,6 +8379,9 @@ const App: React.FC = () => {
             current.countedCost += item.countedCost;
             current.diffQty += item.diffQty;
             current.diffCost += item.diffCost;
+            current.postAuditAdjustmentCount += item.postAuditAdjustmentCount;
+            current.postAuditAdjustmentQty += item.postAuditAdjustmentQty;
+            current.postAuditAdjustmentCost = roundAuditMoney(current.postAuditAdjustmentCost + item.postAuditAdjustmentCost);
             if (item.hasOpenPartial) current.partialOpenAudits += 1;
             current.partialOpenScopes += item.openPartialScopes;
             if (item.isPartialOverdue) current.partialOverdueAudits += 1;
@@ -8303,6 +8403,9 @@ const App: React.FC = () => {
             acc.countedCost += item.countedCost;
             acc.diffQty += item.diffQty;
             acc.diffCost += item.diffCost;
+            acc.postAuditAdjustmentCount += item.postAuditAdjustmentCount;
+            acc.postAuditAdjustmentQty += item.postAuditAdjustmentQty;
+            acc.postAuditAdjustmentCost = roundAuditMoney(acc.postAuditAdjustmentCost + item.postAuditAdjustmentCost);
             if (item.hasOpenPartial) acc.partialOpenAudits += 1;
             acc.partialOpenScopes += item.openPartialScopes;
             if (item.isPartialOverdue) acc.partialOverdueAudits += 1;
@@ -8321,6 +8424,9 @@ const App: React.FC = () => {
             countedCost: 0,
             diffQty: 0,
             diffCost: 0,
+            postAuditAdjustmentCount: 0,
+            postAuditAdjustmentQty: 0,
+            postAuditAdjustmentCost: 0,
             partialOpenAudits: 0,
             partialOpenScopes: 0,
             partialOverdueAudits: 0
@@ -10103,8 +10209,8 @@ const App: React.FC = () => {
 
                     {currentView === 'audit' && (
                         <div className="h-full animate-fade-in relative pb-24">
-                            <div className="flex flex-col xl:flex-row items-stretch gap-3">
-                                <Suspense fallback={<div className="w-full xl:w-14 shrink-0 min-h-14 bg-slate-950 border border-slate-800" />}>
+                            <Suspense fallback={<AuditWorkspaceFallback />}>
+                                <div className="flex flex-col xl:flex-row items-stretch gap-3">
                                     <AuditCrossPanel
                                         rows={auditCrossRows}
                                         loading={isLoadingDashboardAudits || isLoadingCompletedDashboardAudits}
@@ -10136,9 +10242,7 @@ const App: React.FC = () => {
                                             row.companyName
                                         )}
                                     />
-                                </Suspense>
-                                <div className="min-w-0 flex-1">
-                                    <Suspense fallback={<div className="p-6 text-sm font-semibold text-slate-500">Carregando módulo...</div>}>
+                                    <div className="min-w-0 flex-1">
                                         <AuditModule
                                             key={`audit-${auditJumpCompanyId || currentUser?.company_id || 'all'}-${auditJumpArea || currentUser?.area || 'all'}-${auditJumpFilial || 'manual'}`}
                                             userEmail={currentUser?.email || ''}
@@ -10156,9 +10260,9 @@ const App: React.FC = () => {
                                             onAuditExited={handleAuditExited}
                                             onFilialSelected={clearAuditManualBranchSelectionRequired}
                                         />
-                                    </Suspense>
+                                    </div>
                                 </div>
-                            </div>
+                            </Suspense>
                         </div>
                     )}
 
@@ -13839,6 +13943,15 @@ const App: React.FC = () => {
                                                 {dashboardAuditOverview.summary.diffCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
                                             </p>
                                             <p className="text-[9px] font-bold text-slate-500/80 leading-none">Impacto financeiro total das divergências</p>
+                                            {dashboardAuditOverview.summary.postAuditAdjustmentCount > 0 && (
+                                                <p
+                                                    className="text-[8px] font-black leading-none text-amber-700"
+                                                    title="Ajustes após auditoria registrados e incluídos nos termos"
+                                                >
+                                                    Inclui {dashboardAuditOverview.summary.postAuditAdjustmentCount.toLocaleString('pt-BR')} ajuste(s):{' '}
+                                                    {dashboardAuditOverview.summary.postAuditAdjustmentCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                </p>
+                                            )}
                                         </div>
                                         <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 h-36 min-w-0 flex flex-col items-center justify-center text-center gap-2">
                                             <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Total conferido R$</p>
@@ -13989,6 +14102,12 @@ const App: React.FC = () => {
                                                                         {areaDivergencePct > 0 ? '+' : ''}{areaDivergencePct.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
                                                                     </span>
                                                                 </div>
+                                                                {area.postAuditAdjustmentCount > 0 && (
+                                                                    <p className="mt-1 text-[9px] font-black text-amber-700">
+                                                                        Ajustes após auditoria: {area.postAuditAdjustmentQty > 0 ? '+' : ''}{area.postAuditAdjustmentQty.toLocaleString('pt-BR')} un. ·{' '}
+                                                                        {area.postAuditAdjustmentCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                                    </p>
+                                                                )}
                                                                 <div className="mt-2 h-2 rounded-full bg-gray-100 overflow-hidden">
                                                                     <div className="h-full rounded-full bg-indigo-500" style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
                                                                 </div>
@@ -14051,6 +14170,15 @@ const App: React.FC = () => {
                                                                         {branch.divergencePct > 0 ? '+' : ''}{branch.divergencePct.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
                                                                     </span>
                                                                 </div>
+                                                                {branch.postAuditAdjustmentCount > 0 && (
+                                                                    <p
+                                                                        className="mt-1 text-[9px] font-black text-amber-700"
+                                                                        title={`Último ajuste: ${branch.latestPostAuditAdjustmentBy || 'usuário não informado'}${branch.latestPostAuditAdjustmentAt ? ` em ${new Date(branch.latestPostAuditAdjustmentAt).toLocaleString('pt-BR')}` : ''}`}
+                                                                    >
+                                                                        Ajuste após auditoria: {branch.postAuditAdjustmentQty > 0 ? '+' : ''}{branch.postAuditAdjustmentQty.toLocaleString('pt-BR')} un. ·{' '}
+                                                                        {branch.postAuditAdjustmentCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                                                                    </p>
+                                                                )}
                                                                 <div className="mt-2 h-2 rounded-full bg-gray-100 overflow-hidden">
                                                                     <div className={`h-full rounded-full ${progressColor}`} style={{ width: `${Math.max(0, Math.min(100, branch.progressPct))}%` }} />
                                                                 </div>
