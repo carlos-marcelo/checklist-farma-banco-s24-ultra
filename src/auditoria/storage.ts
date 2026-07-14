@@ -9,13 +9,32 @@ const auditStore = localforage.createInstance({
 });
 
 const LOCAL_AUDIT_SESSION_KEY = 'audit_flow_v72_master'; // Mantendo a chave original para compatibilidade ou troca total
+let memoryAuditSession: AuditData | null | undefined;
+let deferredSaveTimer: number | null = null;
+let deferredSavePayload: AuditData | null = null;
+
+const buildStoredAuditSession = (data: AuditData, pendingSync: boolean): AuditData => ({
+    ...data,
+    pendingSync,
+    lastLocalUpdate: new Date().toISOString()
+});
+
+const cancelDeferredSave = () => {
+    if (deferredSaveTimer !== null) {
+        globalThis.clearTimeout(deferredSaveTimer);
+        deferredSaveTimer = null;
+    }
+    deferredSavePayload = null;
+};
 
 /**
  * Carrega a sessão de auditoria do IndexedDB
  */
 export async function loadLocalAuditSession(): Promise<AuditData | null> {
+    if (memoryAuditSession !== undefined) return memoryAuditSession;
     try {
         const data = await auditStore.getItem<AuditData>(LOCAL_AUDIT_SESSION_KEY);
+        memoryAuditSession = data;
         return data;
     } catch (error) {
         console.error('Erro ao carregar sessão do IndexedDB (Audit):', error);
@@ -28,18 +47,16 @@ export async function loadLocalAuditSession(): Promise<AuditData | null> {
  */
 export async function saveLocalAuditSession(data: AuditData, pendingSync: boolean = false): Promise<void> {
     if (!data) return;
+    cancelDeferredSave();
     try {
         // Tenta remover do localStorage caso exista (migração)
         try {
             window.localStorage.removeItem(LOCAL_AUDIT_SESSION_KEY);
         } catch (e) { }
 
-        const updatedData = {
-            ...data,
-            pendingSync,
-            lastLocalUpdate: new Date().toISOString()
-        };
+        const updatedData = buildStoredAuditSession(data, pendingSync);
 
+        memoryAuditSession = updatedData;
         await auditStore.setItem(LOCAL_AUDIT_SESSION_KEY, updatedData);
     } catch (error) {
         console.error('Erro ao salvar sessão no IndexedDB (Audit):', error);
@@ -47,9 +64,33 @@ export async function saveLocalAuditSession(data: AuditData, pendingSync: boolea
 }
 
 /**
+ * Agrupa autosaves sucessivos. A memória é atualizada imediatamente e somente o
+ * último snapshot é serializado, evitando clonar vários MB a cada interação.
+ */
+export function scheduleLocalAuditSessionSave(data: AuditData, pendingSync: boolean = false): void {
+    if (!data) return;
+    const updatedData = buildStoredAuditSession(data, pendingSync);
+    memoryAuditSession = updatedData;
+    deferredSavePayload = updatedData;
+
+    if (deferredSaveTimer !== null) globalThis.clearTimeout(deferredSaveTimer);
+    deferredSaveTimer = globalThis.setTimeout(() => {
+        deferredSaveTimer = null;
+        const payload = deferredSavePayload;
+        deferredSavePayload = null;
+        if (!payload) return;
+        void auditStore.setItem(LOCAL_AUDIT_SESSION_KEY, payload).catch(error => {
+            console.error('Erro no autosave agrupado da auditoria:', error);
+        });
+    }, 400) as unknown as number;
+}
+
+/**
  * Limpa a sessão de auditoria local
  */
 export async function clearLocalAuditSession(): Promise<void> {
+    cancelDeferredSave();
+    memoryAuditSession = null;
     try {
         await auditStore.removeItem(LOCAL_AUDIT_SESSION_KEY);
         // Garante que o localStorage também seja limpo

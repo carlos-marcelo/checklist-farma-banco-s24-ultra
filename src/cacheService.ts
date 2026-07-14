@@ -26,15 +26,81 @@ type FetchWithCacheOptions<T> = {
 
 const META_PREFIX = '__meta__:';
 const inFlightRequests = new Map<string, Promise<any>>();
+const memoryCache = new Map<string, unknown>();
+const memoryMeta = new Map<string, CacheMeta>();
+const scheduledRevalidations = new Set<string>();
+const pendingPersistentWrites = new Map<string, { data: unknown; meta: CacheMeta }>();
+let persistentWriteHandle: number | null = null;
+
+const scheduleWhenIdle = (task: () => void, timeoutMs = 1200) => {
+    if (typeof window === 'undefined') {
+        globalThis.setTimeout(task, 0);
+        return;
+    }
+
+    const requestIdleCallback = (window as any).requestIdleCallback as
+        | undefined
+        | ((callback: () => void, options?: { timeout?: number }) => number);
+    if (requestIdleCallback) {
+        requestIdleCallback(task, { timeout: timeoutMs });
+        return;
+    }
+
+    window.setTimeout(task, 0);
+};
+
+const flushPersistentWrites = async () => {
+    persistentWriteHandle = null;
+    const entries = Array.from(pendingPersistentWrites.entries());
+    pendingPersistentWrites.clear();
+    if (entries.length === 0) return;
+
+    await Promise.allSettled(entries.flatMap(([key, value]) => [
+        generalStore.setItem(key, value.data),
+        generalStore.setItem(`${META_PREFIX}${key}`, value.meta)
+    ]));
+};
+
+const schedulePersistentWrite = (key: string, data: unknown, meta: CacheMeta) => {
+    pendingPersistentWrites.set(key, { data, meta });
+    if (persistentWriteHandle !== null) return;
+
+    if (typeof window !== 'undefined') {
+        const requestIdleCallback = (window as any).requestIdleCallback as
+            | undefined
+            | ((callback: () => void, options?: { timeout?: number }) => number);
+        if (requestIdleCallback) {
+            persistentWriteHandle = requestIdleCallback(() => {
+                void flushPersistentWrites();
+            }, { timeout: 1800 });
+            return;
+        }
+        persistentWriteHandle = window.setTimeout(() => {
+            void flushPersistentWrites();
+        }, 0);
+        return;
+    }
+
+    persistentWriteHandle = globalThis.setTimeout(() => {
+        void flushPersistentWrites();
+    }, 0) as unknown as number;
+};
 
 const withTimeout = async <T>(promise: Promise<T>, timeoutMs?: number): Promise<T> => {
     if (!timeoutMs || timeoutMs <= 0) return promise;
-    return Promise.race([
-        promise,
-        new Promise<T>((_, reject) => {
-            globalThis.setTimeout(() => reject(new Error(`timeout ${timeoutMs}ms`)), timeoutMs);
-        })
-    ]);
+    return new Promise<T>((resolve, reject) => {
+        const timeoutId = globalThis.setTimeout(() => reject(new Error(`timeout ${timeoutMs}ms`)), timeoutMs);
+        promise.then(
+            value => {
+                globalThis.clearTimeout(timeoutId);
+                resolve(value);
+            },
+            error => {
+                globalThis.clearTimeout(timeoutId);
+                reject(error);
+            }
+        );
+    });
 };
 
 const getValueTimestamp = (value: any): string => {
@@ -101,7 +167,23 @@ const hasDataChanged = <T>(
     const cachedFingerprint = fingerprintData(cachedData);
     if (cachedFingerprint !== remoteFingerprint) return true;
 
-    if (Array.isArray(remoteData) && remoteData.length > 200) return false;
+    const canCompareDeeply = (value: unknown): boolean => {
+        if (Array.isArray(value)) {
+            if (value.length > 200) return false;
+            return value.every(item => {
+                if (item === null || typeof item !== 'object') return true;
+                const values = Object.values(item as Record<string, unknown>);
+                return values.length <= 30 && values.every(entry => entry === null || typeof entry !== 'object');
+            });
+        }
+        if (!value || typeof value !== 'object') return true;
+        const values = Object.values(value as Record<string, unknown>);
+        return values.length <= 50 && values.every(entry => entry === null || typeof entry !== 'object');
+    };
+
+    // Snapshots de auditoria e relatórios podem ter vários MB. Neles, id/updated_at
+    // é a versão autoritativa; serializar o objeto inteiro trava a thread principal.
+    if (!canCompareDeeply(remoteData) || !canCompareDeeply(cachedData)) return false;
     try {
         return JSON.stringify(cachedData) !== JSON.stringify(remoteData);
     } catch {
@@ -110,6 +192,11 @@ const hasDataChanged = <T>(
 };
 
 export const CacheService = {
+    /** Retorna apenas o valor já aquecido em memória, sem tocar no IndexedDB. */
+    peek<T>(key: string): T | null {
+        return memoryCache.has(key) ? memoryCache.get(key) as T : null;
+    },
+
     /**
      * Wrapper para chamadas de rede com cache local.
      * 1. Retorna o cache imediatamente se disponível.
@@ -126,10 +213,13 @@ export const CacheService = {
         onUpdate?: (newData: T) => void,
         options: FetchWithCacheOptions<T> = {}
     ): Promise<T | null> {
-        const [cachedData, cachedMeta] = await Promise.all([
-            this.get<T>(key),
-            this.getMeta(key)
-        ]);
+        const hasHotData = memoryCache.has(key);
+        const [cachedData, cachedMeta] = hasHotData
+            ? [memoryCache.get(key) as T, memoryMeta.get(key) || await CacheService.getMeta(key)] as const
+            : await Promise.all([
+                CacheService.get<T>(key),
+                CacheService.getMeta(key)
+            ]);
 
         const revalidate = options.revalidate || 'always';
         const isFresh = !!cachedMeta?.savedAt && !!options.maxAgeMs && Date.now() - cachedMeta.savedAt < options.maxAgeMs;
@@ -138,69 +228,81 @@ export const CacheService = {
             return cachedData;
         }
 
-        const remoteRequest = inFlightRequests.get(key) || withTimeout(remoteFetch(), options.timeoutMs)
-            .finally(() => {
-                inFlightRequests.delete(key);
-            });
-        inFlightRequests.set(key, remoteRequest);
+        const runRemote = () => {
+            const existing = inFlightRequests.get(key) as Promise<T | null> | undefined;
+            if (existing) return existing;
 
-        const remotePromise = remoteRequest.then(async (remoteData) => {
-            if (remoteData !== null) {
-                const changed = hasDataChanged(cachedData, cachedMeta, remoteData, options.compare);
+            const remoteRequest = withTimeout(Promise.resolve().then(remoteFetch), options.timeoutMs)
+                .then(async (remoteData) => {
+                    if (remoteData !== null) {
+                        const changed = hasDataChanged(cachedData, cachedMeta, remoteData, options.compare);
+                        await CacheService.set(key, remoteData);
 
-                await this.set(key, remoteData);
-
-                if (changed && onUpdate) {
-                    onUpdate(remoteData);
-                }
-                return remoteData;
-            }
-            return cachedData; // Se falhar o remoto, retorna o cache
-        }).catch(err => {
-            console.error(`[CacheService] Erro na busca remota para ${key}:`, err);
-            return cachedData;
-        });
+                        if (changed && onUpdate) {
+                            scheduleWhenIdle(() => onUpdate(remoteData), 500);
+                        }
+                        return remoteData;
+                    }
+                    return cachedData;
+                })
+                .catch(err => {
+                    console.error(`[CacheService] Erro na busca remota para ${key}:`, err);
+                    return cachedData;
+                })
+                .finally(() => {
+                    inFlightRequests.delete(key);
+                    scheduledRevalidations.delete(key);
+                });
+            inFlightRequests.set(key, remoteRequest);
+            return remoteRequest;
+        };
 
         // Se tem cache, retorna o cache e deixa o remoto rodando em background
         // Se NÃO tem cache, espera pelo remoto
         if (cachedData !== null) {
+            if (!scheduledRevalidations.has(key)) {
+                scheduledRevalidations.add(key);
+                scheduleWhenIdle(() => {
+                    void runRemote();
+                });
+            }
             return cachedData;
         }
 
         console.log(`[CacheService] Cache MISS para ${key}, esperando remoto...`);
-        return remotePromise;
+        return runRemote();
     },
 
     /**
      * Salva um item no cache
      */
     async set<T>(key: string, data: T): Promise<T> {
-        try {
-            const saved = await generalStore.setItem(key, data);
-            await this.setMeta(key, {
-                savedAt: Date.now(),
-                fingerprint: fingerprintData(data)
-            });
-            return saved;
-        } catch (e) {
-            console.error(`[CacheService] Erro ao salvar ${key}:`, e);
-            return data;
-        }
+        const meta = {
+            savedAt: Date.now(),
+            fingerprint: fingerprintData(data)
+        };
+        memoryCache.set(key, data);
+        memoryMeta.set(key, meta);
+        schedulePersistentWrite(key, data, meta);
+        return data;
     },
 
     /**
      * Recupera um item do cache
      */
     async get<T>(key: string): Promise<T | null> {
+        if (memoryCache.has(key)) return memoryCache.get(key) as T;
         try {
-            return await generalStore.getItem<T>(key);
+            const value = await generalStore.getItem<T>(key);
+            if (value !== null) memoryCache.set(key, value);
+            return value;
         } catch (e) {
             return null;
         }
     },
 
     async getMany<T = unknown>(keys: string[]): Promise<Record<string, T | null>> {
-        const entries = await Promise.all(keys.map(async key => [key, await this.get<T>(key)] as const));
+        const entries = await Promise.all(keys.map(async key => [key, await CacheService.get<T>(key)] as const));
         return entries.reduce((acc, [key, value]) => {
             acc[key] = value;
             return acc;
@@ -208,33 +310,44 @@ export const CacheService = {
     },
 
     async getMeta(key: string): Promise<CacheMeta | null> {
+        if (memoryMeta.has(key)) return memoryMeta.get(key) || null;
         try {
-            return await generalStore.getItem<CacheMeta>(`${META_PREFIX}${key}`);
+            const meta = await generalStore.getItem<CacheMeta>(`${META_PREFIX}${key}`);
+            if (meta) memoryMeta.set(key, meta);
+            return meta;
         } catch {
             return null;
         }
     },
 
     async setMeta(key: string, meta: CacheMeta): Promise<void> {
-        try {
-            await generalStore.setItem(`${META_PREFIX}${key}`, meta);
-        } catch {
-            // Metadados são otimização; falha aqui não deve bloquear o app.
-        }
+        memoryMeta.set(key, meta);
+        const data = memoryCache.get(key);
+        if (data !== undefined) schedulePersistentWrite(key, data, meta);
     },
 
     /**
      * Remove um item do cache
      */
     async remove(key: string): Promise<void> {
-        await generalStore.removeItem(key);
-        await generalStore.removeItem(`${META_PREFIX}${key}`);
+        memoryCache.delete(key);
+        memoryMeta.delete(key);
+        pendingPersistentWrites.delete(key);
+        scheduledRevalidations.delete(key);
+        await Promise.all([
+            generalStore.removeItem(key),
+            generalStore.removeItem(`${META_PREFIX}${key}`)
+        ]);
     },
 
     /**
      * Limpa todo o cache
      */
     async clear(): Promise<void> {
+        memoryCache.clear();
+        memoryMeta.clear();
+        pendingPersistentWrites.clear();
+        scheduledRevalidations.clear();
         await generalStore.clear();
     }
 };

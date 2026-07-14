@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, startTransition } from 'react';
 import * as XLSX from 'xlsx';
 import html2canvas from 'html2canvas';
 import { 
@@ -48,6 +48,14 @@ interface AnalysisParsedCache {
 
 const ANALYSIS_VENDAS_MODULE_KEY = 'analysis_vendas_totais';
 const ANALYSIS_PEDIDOS_MODULE_KEY = 'analysis_pedidos';
+
+const yieldAnalysisFrame = () => new Promise<void>(resolve => {
+    if (typeof window === 'undefined') {
+        resolve();
+        return;
+    }
+    window.requestAnimationFrame(() => window.setTimeout(resolve, 0));
+});
 
 const buildAnalysisFileSignature = (
     companyId: string,
@@ -180,10 +188,12 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 if (cached?.state) {
                     hadUsableCache = true;
                     if (!cancelled) {
-                        setRawState({
-                            loading: false,
-                            error: null,
-                            ...cached.state
+                        startTransition(() => {
+                            setRawState({
+                                loading: false,
+                                error: null,
+                                ...cached.state
+                            });
                         });
                     }
                 } else if (!cancelled) {
@@ -221,9 +231,17 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     pedidosFileMeta || pedidosMeta
                 ]);
 
+                // Se o usuário já saiu do módulo durante o download, não inicia o parse pesado.
+                if (cancelled) return;
+                await yieldAnalysisFrame();
+                if (cancelled) return;
+
                 // 1. Parse Vendas Totais
                 const vendasRes = await fetch(vendasFileMeta.file_data_base64);
-                const vendasWb = XLSX.read(await vendasRes.arrayBuffer(), { type: 'array' });
+                const vendasBuffer = await vendasRes.arrayBuffer();
+                if (cancelled) return;
+                await yieldAnalysisFrame();
+                const vendasWb = XLSX.read(vendasBuffer, { type: 'array' });
                 const vendasSheet = vendasWb.Sheets[vendasWb.SheetNames[0]];
                 const vendasRaw: any[] = XLSX.utils.sheet_to_json(vendasSheet, { defval: null });
                 const vendasRawAOA: any[] = XLSX.utils.sheet_to_json(vendasSheet, { header: 'A', defval: null });
@@ -360,7 +378,10 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 if (pedidosFileMeta?.file_data_base64) {
                     try {
                         const pedRes = await fetch(pedidosFileMeta.file_data_base64);
-                        const pedWb = XLSX.read(await pedRes.arrayBuffer(), { type: 'array' });
+                        const pedBuffer = await pedRes.arrayBuffer();
+                        if (cancelled) return;
+                        await yieldAnalysisFrame();
+                        const pedWb = XLSX.read(pedBuffer, { type: 'array' });
                         const pedSheet = pedWb.Sheets[pedWb.SheetNames[0]];
                         const pedRaw: any[] = XLSX.utils.sheet_to_json(pedSheet, { defval: null });
 
@@ -413,17 +434,19 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     vendasUpdatedAt: String(vendasFileMeta.updated_at || vendasFileMeta.created_at || '')
                 };
 
-                await CacheService.set<AnalysisParsedCache>(cacheKey, {
+                void CacheService.set<AnalysisParsedCache>(cacheKey, {
                     signature: parsedSignature,
                     state: nextState,
                     savedAt: new Date().toISOString()
                 });
 
                 if (!cancelled) {
-                    setRawState({
-                        loading: false,
-                        error: null,
-                        ...nextState
+                    startTransition(() => {
+                        setRawState({
+                            loading: false,
+                            error: null,
+                            ...nextState
+                        });
                     });
                 }
 

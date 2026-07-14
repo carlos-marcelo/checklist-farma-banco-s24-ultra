@@ -513,6 +513,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
   const lastSyncTimestampRef = useRef<number>(0);
   const lastConflictCheckRef = useRef<number>(0);
   const signatureHashRef = useRef('');
+  const foregroundQuietUntilRef = useRef(0);
 
   // --- Effects ---
 
@@ -522,23 +523,51 @@ export const StockConference: React.FC<StockConferenceProps> = ({
     if (!userEmail) return;
     if (masterProducts.size === 0 || inventory.size === 0) return;
 
-    // Auto-save to Supabase when idle for 3 seconds
-    const timer = setTimeout(() => {
-      if (isDirty && !isSavingSession) {
-        void persistSession().then(() => setIsDirty(false));
-      }
+    let wakeTimer: number | null = null;
+    let wakeIdleId: number | null = null;
+    const cancelScheduledSave = () => {
+      if (wakeTimer !== null) window.clearTimeout(wakeTimer);
+      wakeTimer = null;
+      const cancelIdleCallback = (window as any).cancelIdleCallback as undefined | ((id: number) => void);
+      if (wakeIdleId !== null && cancelIdleCallback) cancelIdleCallback(wakeIdleId);
+      wakeIdleId = null;
+    };
+    const scheduleIdleSave = (delay: number) => {
+      cancelScheduledSave();
+      wakeTimer = window.setTimeout(() => {
+        wakeTimer = null;
+        const run = () => {
+          wakeIdleId = null;
+          if (!document.hidden && isDirty && !isSavingSession) {
+            void persistSession().then(() => setIsDirty(false));
+          }
+        };
+        const requestIdleCallback = (window as any).requestIdleCallback as undefined | ((cb: () => void, opts?: { timeout?: number }) => number);
+        if (requestIdleCallback) {
+          wakeIdleId = requestIdleCallback(run, { timeout: 5000 });
+        } else {
+          run();
+        }
+      }, Math.max(0, delay));
+    };
+
+    // Auto-save to Supabase quando a interface estiver ociosa por 3 segundos.
+    const timer = window.setTimeout(() => {
+      if (document.hidden) return;
+      scheduleIdleSave(foregroundQuietUntilRef.current - Date.now());
     }, 3000);
 
     const handleWake = () => {
-      if (!document.hidden && isDirty && !isSavingSession) {
-        void persistSession().then(() => setIsDirty(false));
-      }
+      if (document.hidden) return;
+      foregroundQuietUntilRef.current = Math.max(foregroundQuietUntilRef.current, Date.now() + 3000);
+      scheduleIdleSave(foregroundQuietUntilRef.current - Date.now() + 700);
     };
     document.addEventListener('visibilitychange', handleWake);
     window.addEventListener('focus', handleWake);
 
     return () => {
-      clearTimeout(timer);
+      window.clearTimeout(timer);
+      cancelScheduledSave();
       document.removeEventListener('visibilitychange', handleWake);
       window.removeEventListener('focus', handleWake);
     };

@@ -1,15 +1,10 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Camera, FileText, CheckSquare, Printer, Clipboard, ClipboardList, Image as ImageIcon, Trash2, Menu, X, ChevronRight, Download, Star, AlertTriangle, CheckCircle, AlertCircle, LayoutDashboard, FileCheck, Settings, LogOut, Users, Palette, Upload, UserPlus, History, RotateCcw, Save, Search, Eye, EyeOff, Phone, User as UserIcon, Ban, Check, Filter, UserX, Undo2, CheckSquare as CheckSquareIcon, Trophy, Frown, PartyPopper, Lock, Loader2, Building2, MapPin, Store, MessageSquare, Send, ThumbsUp, ThumbsDown, Clock, CheckCheck, Lightbulb, MessageSquareQuote, Package, ArrowRight, ArrowLeft, ShieldCheck, HelpCircle, Info, LayoutGrid, UserCircle, FileSearch, ChevronDown, Calendar, RefreshCw, UserCircle2, Plus, SearchX, WifiOff, LineChart } from 'lucide-react';
-import { jsPDF } from 'jspdf';
-import autoTable from 'jspdf-autotable';
-import * as XLSX from 'xlsx';
 import { FileSpreadsheet } from 'lucide-react';
 import { CHECKLISTS as BASE_CHECKLISTS, THEMES, ACCESS_MODULES, ACCESS_LEVELS, INPUT_TYPE_LABELS, generateId } from './constants';
 import { ChecklistData, ChecklistImages, InputType, ChecklistSection, ChecklistDefinition, ChecklistItem, ThemeColor, AppConfig, User, ReportHistoryItem, StockConferenceHistoryItem, CompanyArea, AccessLevelId, AccessModule, AccessLevelMeta, UserRole, StockConferenceSummary } from './types';
-import AuditModule from './components/auditoria/AuditModule';
 import SignaturePad from './components/SignaturePad';
-import { StockConference } from './components/StockConference';
 import { supabase } from './supabaseClient';
 import * as SupabaseService from './supabaseService';
 import { updateCompany, saveConfig, fetchTickets, createTicket, updateTicketStatus, createCompany, DbTicket } from './supabaseService';
@@ -122,6 +117,7 @@ const mapViewToAppName = (view: string) => {
         access: 'acessos',
         pre: 'pre_vencidos',
         audit: 'auditoria',
+        analise_resultados: 'analise_resultados',
         logs: 'metricas_gerenciais',
         cadastros_globais: 'cadastros_globais'
     };
@@ -238,6 +234,10 @@ const PreVencidosManager = PRE_VENCIDOS_MODULE_ENABLED
     : null;
 
 const AnaliseDashboard = React.lazy(() => import('./components/AnaliseResultados/AnaliseDashboard'));
+const AuditModule = React.lazy(() => import('./components/auditoria/AuditModule'));
+const StockConference = React.lazy(() =>
+    import('./components/StockConference').then(module => ({ default: module.StockConference }))
+);
 
 const canonicalizeFilterLabel = (value: string) => {
     const normalized = value.normalize('NFKC').replace(/\s+/g, ' ').trim();
@@ -1566,8 +1566,12 @@ const StockConferenceReportViewer = ({ report, onClose, currentUser }: StockConf
         }
     };
 
-    const exportPDF = () => {
+    const exportPDF = async () => {
         try {
+            const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+                import('jspdf'),
+                import('jspdf-autotable')
+            ]);
             if (currentUser?.email) {
                 SupabaseService.insertAppEventLog({
                     company_id: currentUser.company_id || null,
@@ -2481,9 +2485,11 @@ const App: React.FC = () => {
     const [isSidebarOpen, setIsSidebarOpen] = useState(() => isMobileLayout());
     const [showErrors, setShowErrors] = useState(false);
 
-    const [currentView, setCurrentView] = useState<'checklist' | 'summary' | 'dashboard' | 'report' | 'settings' | 'history' | 'view_history' | 'support' | 'stock' | 'access' | 'pre' | 'audit' | 'logs' | 'cadastros_globais'>('dashboard');
+    const [currentView, setCurrentView] = useState<'checklist' | 'summary' | 'dashboard' | 'report' | 'settings' | 'history' | 'view_history' | 'support' | 'stock' | 'access' | 'pre' | 'audit' | 'analise_resultados' | 'logs' | 'cadastros_globais'>('dashboard');
+    const currentViewRef = useRef(currentView);
 
     useEffect(() => {
+        currentViewRef.current = currentView;
         if (currentView) {
             localStorage.setItem('APP_CURRENT_VIEW', currentView);
         }
@@ -2629,6 +2635,29 @@ const App: React.FC = () => {
     const [syncStatus, setSyncStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
     const saveDraftAbortControllerRef = useRef<AbortController | null>(null);
     const clientIdRef = useRef<string>(Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
+    const foregroundQuietUntilRef = useRef(0);
+
+    const isForegroundSettling = useCallback(() => (
+        typeof document !== 'undefined' &&
+        !document.hidden &&
+        Date.now() < foregroundQuietUntilRef.current
+    ), []);
+
+    useEffect(() => {
+        const markForegroundResume = () => {
+            if (document.hidden) return;
+            foregroundQuietUntilRef.current = Math.max(
+                foregroundQuietUntilRef.current,
+                Date.now() + 2800
+            );
+        };
+        document.addEventListener('visibilitychange', markForegroundResume);
+        window.addEventListener('focus', markForegroundResume);
+        return () => {
+            document.removeEventListener('visibilitychange', markForegroundResume);
+            window.removeEventListener('focus', markForegroundResume);
+        };
+    }, []);
 
     // User Activity
     const [lastUserActivity, setLastUserActivity] = useState<number>(Date.now());
@@ -3154,21 +3183,27 @@ const App: React.FC = () => {
             return propKey ? (element as any)[propKey] : null;
         };
 
+        const inspectedElements = new WeakSet<Element>();
+
         const markClickableElement = (target: EventTarget | null) => {
             let element = target instanceof Element ? target : null;
+            if (!element || element.closest(semanticClickableSelector)) return;
             let depth = 0;
 
             while (element && element !== document.documentElement && depth < 8) {
                 if (element.matches(semanticClickableSelector)) return;
-                const props = getReactProps(element);
-                if (
-                    props &&
-                    (typeof props.onClick === 'function' ||
-                        typeof props.onMouseDown === 'function' ||
-                        typeof props.onPointerDown === 'function')
-                ) {
-                    element.classList.add('app-clickable-cursor');
-                    return;
+                if (!inspectedElements.has(element)) {
+                    inspectedElements.add(element);
+                    const props = getReactProps(element);
+                    if (
+                        props &&
+                        (typeof props.onClick === 'function' ||
+                            typeof props.onMouseDown === 'function' ||
+                            typeof props.onPointerDown === 'function')
+                    ) {
+                        element.classList.add('app-clickable-cursor');
+                        return;
+                    }
                 }
                 element = element.parentElement;
                 depth += 1;
@@ -3227,20 +3262,24 @@ const App: React.FC = () => {
             setAccessMatrix(mapAccessRowsToMatrix(rows));
         };
 
+        const applyDeferred = <T,>(apply: (value: T) => void) => (value: T) => {
+            startTransition(() => apply(value));
+        };
+
         const refreshCoreData = async () => {
             await Promise.allSettled([
-                refreshUsersIfChanged(applyUsers),
-                CacheService.fetchWithCache(CACHE_KEY_CONFIG, SupabaseService.fetchConfig, applyConfig, {
+                refreshUsersIfChanged(applyDeferred(applyUsers)),
+                CacheService.fetchWithCache(CACHE_KEY_CONFIG, SupabaseService.fetchConfig, applyDeferred(applyConfig), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 6000
                 }),
-                CacheService.fetchWithCache(CACHE_KEY_COMPANIES, SupabaseService.fetchCompanies, applyCompanies, {
+                CacheService.fetchWithCache(CACHE_KEY_COMPANIES, SupabaseService.fetchCompanies, applyDeferred(applyCompanies), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 8000
                 }),
-                CacheService.fetchWithCache(CACHE_KEY_ACCESS, SupabaseService.fetchAccessMatrix, applyAccessMatrix, {
+                CacheService.fetchWithCache(CACHE_KEY_ACCESS, SupabaseService.fetchAccessMatrix, applyDeferred(applyAccessMatrix), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 8000
@@ -3250,18 +3289,18 @@ const App: React.FC = () => {
 
         const preloadSecondaryData = async () => {
             await Promise.allSettled([
-                CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE), applyReports, {
+                CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE), applyDeferred(applyReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 10000
                 }),
-                CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE), applyStockReports, {
+                CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE), applyDeferred(applyStockReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 10000
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_TICKETS, SupabaseService.fetchTickets, (data) => {
-                    if (!cancelled) setTickets(data || []);
+                    if (!cancelled) startTransition(() => setTickets(data || []));
                 }, {
                     maxAgeMs: 60 * 1000,
                     revalidate: 'stale',
@@ -4257,6 +4296,7 @@ const App: React.FC = () => {
 
         const performHeartbeat = async () => {
             if (remoteForceLogoutDeadline) return;
+            if (isForegroundSettling()) return;
             try {
                 await SupabaseService.upsertActiveSession({
                     client_id: clientIdRef.current,
@@ -4264,7 +4304,7 @@ const App: React.FC = () => {
                     user_name: currentUser.name || null,
                     branch: currentUser.filial || null,
                     area: currentUser.area || null,
-                    current_view: mapViewToAppName(currentView),
+                    current_view: mapViewToAppName(currentViewRef.current),
                     last_ping: new Date().toISOString()
                 });
             } catch (err) {
@@ -4278,12 +4318,13 @@ const App: React.FC = () => {
         const handleWakeHeartbeat = () => {
             if (document.hidden) return;
             if (wakeHeartbeatTimer !== null) window.clearTimeout(wakeHeartbeatTimer);
+            const delay = Math.max(500, foregroundQuietUntilRef.current - Date.now() + 250);
             wakeHeartbeatTimer = window.setTimeout(() => {
                 wakeHeartbeatTimer = null;
                 scheduleBackgroundTask(() => {
                     if (!document.hidden) void performHeartbeat();
-                }, 1500);
-            }, 500);
+                }, 5000);
+            }, delay);
         };
         document.addEventListener('visibilitychange', handleWakeHeartbeat);
         window.addEventListener('focus', handleWakeHeartbeat);
@@ -4295,7 +4336,7 @@ const App: React.FC = () => {
             window.removeEventListener('focus', handleWakeHeartbeat);
             SupabaseService.deleteActiveSession(clientIdRef.current).catch(() => { });
         };
-    }, [currentUser?.email, currentView, remoteForceLogoutDeadline]);
+    }, [currentUser?.email, currentUser?.name, currentUser?.filial, currentUser?.area, remoteForceLogoutDeadline, isForegroundSettling]);
 
     useEffect(() => {
         if (!currentUser || !remoteForceLogoutDeadline) return;
@@ -4316,6 +4357,7 @@ const App: React.FC = () => {
         const checkSessionCommand = async () => {
             if (isCheckingCommand) return;
             if (document.hidden) return;
+            if (isForegroundSettling()) return;
             isCheckingCommand = true;
             try {
                 const mySession = await SupabaseService.fetchActiveSessionByClientId(clientIdRef.current);
@@ -4342,12 +4384,13 @@ const App: React.FC = () => {
         const handleWakeCommandCheck = () => {
             if (document.hidden) return;
             if (wakeCommandTimer !== null) window.clearTimeout(wakeCommandTimer);
+            const delay = Math.max(700, foregroundQuietUntilRef.current - Date.now() + 650);
             wakeCommandTimer = window.setTimeout(() => {
                 wakeCommandTimer = null;
                 scheduleBackgroundTask(() => {
                     if (!document.hidden) void checkSessionCommand();
-                }, 1500);
-            }, 500);
+                }, 5500);
+            }, delay);
         };
         document.addEventListener('visibilitychange', handleWakeCommandCheck);
         window.addEventListener('focus', handleWakeCommandCheck);
@@ -4358,7 +4401,7 @@ const App: React.FC = () => {
             document.removeEventListener('visibilitychange', handleWakeCommandCheck);
             window.removeEventListener('focus', handleWakeCommandCheck);
         };
-    }, [currentUser?.email, handleLogout, remoteForceLogoutDeadline, SESSION_COMMAND_POLL_MS]);
+    }, [currentUser?.email, handleLogout, remoteForceLogoutDeadline, SESSION_COMMAND_POLL_MS, isForegroundSettling]);
 
     // Polling curto para fila de aprovação de usuários (evita atraso para aparecer novos cadastros).
     useEffect(() => {
@@ -4371,6 +4414,7 @@ const App: React.FC = () => {
 
         const refreshUsers = async () => {
             if (inFlight) return;
+            if (document.hidden || isForegroundSettling()) return;
             inFlight = true;
             try {
                 await refreshUsersIfChanged((dbUsers) => {
@@ -4389,12 +4433,13 @@ const App: React.FC = () => {
         const handleWake = () => {
             if (document.hidden) return;
             if (wakeUsersTimer !== null) window.clearTimeout(wakeUsersTimer);
+            const delay = Math.max(900, foregroundQuietUntilRef.current - Date.now() + 1050);
             wakeUsersTimer = window.setTimeout(() => {
                 wakeUsersTimer = null;
                 scheduleBackgroundTask(() => {
                     if (!document.hidden) void refreshUsers();
-                }, 1500);
-            }, 500);
+                }, 6000);
+            }, delay);
         };
         document.addEventListener('visibilitychange', handleWake);
         window.addEventListener('focus', handleWake);
@@ -4406,7 +4451,7 @@ const App: React.FC = () => {
             document.removeEventListener('visibilitychange', handleWake);
             window.removeEventListener('focus', handleWake);
         };
-    }, [currentUser?.email, currentUser?.role, accessMatrix, USER_APPROVAL_POLL_MS]);
+    }, [currentUser?.email, currentUser?.role, accessMatrix, USER_APPROVAL_POLL_MS, isForegroundSettling]);
 
     const handleRegister = async (newUser: User) => {
         try {
@@ -5762,13 +5807,14 @@ const App: React.FC = () => {
         }
     };
 
-    const handleExportAllCompletedAuditsExcel = () => {
+    const handleExportAllCompletedAuditsExcel = async () => {
         if (!dashboardCompletedAuditSessions || dashboardCompletedAuditSessions.length === 0) {
             alert("Nenhum dado de auditoria concluída disponível no momento.");
             return;
         }
 
         try {
+            const XLSX = await import('xlsx');
             const branchToArea = new Map<string, string>();
             scopedCompanies.forEach(c => {
                 (c.areas || []).forEach((area: any) => {
@@ -6508,6 +6554,8 @@ const App: React.FC = () => {
         if (currentView !== 'logs') return;
         if (!currentUser?.company_id) return;
 
+        let cancelled = false;
+
         const sinceDate = logsDateRange === '7d'
             ? new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
             : logsDateRange === '30d'
@@ -6515,24 +6563,52 @@ const App: React.FC = () => {
                 : null;
 
         const effectiveBranch = currentUser.role === 'MASTER' ? null : (currentUser.filial || null);
-
-        setIsLoadingLogs(true);
-        SupabaseService.fetchAppEventLogs({
-            companyId: currentUser.company_id,
-            branch: effectiveBranch,
-            sinceISO: sinceDate ? sinceDate.toISOString() : null,
-            limit: 2000
-        })
-            .then(logs => {
-                setAppEventLogs(logs || []);
+        const logsCacheKey = `app_event_logs_${currentUser.company_id}_${effectiveBranch || 'all'}_${logsDateRange}`;
+        const applyLogs = (logs: SupabaseService.DbAppEventLog[] | null | undefined) => {
+            if (cancelled || !logs) return;
+            startTransition(() => {
+                setAppEventLogs(logs);
                 if (currentUser.role !== 'MASTER' && currentUser.filial) {
                     setLogsBranchFilter(currentUser.filial);
                 }
-            })
-            .finally(() => {
+            });
+        };
+
+        const loadLogs = async () => {
+            const cached = await CacheService.get<SupabaseService.DbAppEventLog[]>(logsCacheKey);
+            if (cancelled) return;
+            if (cached) {
+                applyLogs(cached);
                 setIsLoadingLogs(false);
                 setHasLoadedLogsForMetrics(true);
-            });
+            } else {
+                setIsLoadingLogs(true);
+            }
+
+            try {
+                const logs = await CacheService.fetchWithCache(
+                    logsCacheKey,
+                    () => SupabaseService.fetchAppEventLogs({
+                        companyId: currentUser.company_id!,
+                        branch: effectiveBranch,
+                        sinceISO: sinceDate ? sinceDate.toISOString() : null,
+                        limit: 2000
+                    }),
+                    applyLogs,
+                    { maxAgeMs: 60_000, revalidate: 'stale', timeoutMs: 10_000 }
+                );
+                applyLogs(logs);
+            } finally {
+                if (!cancelled) {
+                    setIsLoadingLogs(false);
+                    setHasLoadedLogsForMetrics(true);
+                }
+            }
+        };
+        void loadLogs();
+        return () => {
+            cancelled = true;
+        };
     }, [currentView, currentUser?.company_id, currentUser?.filial, currentUser?.role, logsDateRange]);
 
     const refreshActiveSessions = useCallback(async () => {
@@ -7064,7 +7140,7 @@ const App: React.FC = () => {
                 Array.isArray(cachedRows) &&
                 cachedRows.length === latestMetadata.length
             ) {
-                setDashboardAuditSessions(cachedRows);
+                startTransition(() => setDashboardAuditSessions(cachedRows));
                 setDashboardAuditsFetchedAt(new Date().toISOString());
                 return;
             }
@@ -7098,7 +7174,7 @@ const App: React.FC = () => {
                 .map((meta) => detailsById.get(String(meta.id)))
                 .filter((row): row is SupabaseService.DbAuditSession => Boolean(row));
 
-            setDashboardAuditSessions(resolvedRows);
+            startTransition(() => setDashboardAuditSessions(resolvedRows));
             await CacheService.set(dashboardMetaKey, metadataSignature);
             await CacheService.set(dashboardCacheKey, resolvedRows);
             setDashboardAuditsFetchedAt(new Date().toISOString());
@@ -7176,7 +7252,7 @@ const App: React.FC = () => {
                 Array.isArray(cachedRows) &&
                 cachedRows.length === latestMetadata.length
             ) {
-                setDashboardCompletedAuditSessions(cachedRows);
+                startTransition(() => setDashboardCompletedAuditSessions(cachedRows));
                 setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
                 return;
             }
@@ -7210,7 +7286,7 @@ const App: React.FC = () => {
                 .map((meta) => detailsById.get(String(meta.id)))
                 .filter((row): row is SupabaseService.DbAuditSession => Boolean(row));
 
-            setDashboardCompletedAuditSessions(resolvedRows);
+            startTransition(() => setDashboardCompletedAuditSessions(resolvedRows));
             await CacheService.set(dashboardMetaKey, metadataSignature);
             await CacheService.set(dashboardCacheKey, resolvedRows);
             setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
@@ -9331,14 +9407,15 @@ const App: React.FC = () => {
                 CacheService.remove(dashboardCacheKey);
             }
 
-            SupabaseService.logAuditEvent({
-                action: 'AREA_PARTIAL_UNDO_BATCH',
-                entity: 'audit_session',
+            SupabaseService.insertAppEventLog({
+                company_id: currentUser.company_id || null,
+                branch: null,
                 area: cleanAreaName,
                 user_email: currentUser.email,
                 user_name: currentUser.name || null,
-                target_user_email: null,
-                target_user_name: null,
+                app: 'auditoria',
+                event_type: 'audit_partial_pause',
+                entity_type: 'audit_session',
                 entity_id: cleanAreaName,
                 status: failedBranches.length > 0 ? 'partial' : 'success',
                 success: failedBranches.length === 0,
@@ -9806,27 +9883,29 @@ const App: React.FC = () => {
                     {/* --- STOCK CONFERENCE VIEW --- */}
                     {currentView === 'stock' && (
                         <div className="h-full animate-fade-in relative pb-24">
-                            <StockConference
-                                userEmail={currentUser?.email || ''}
-                                userName={currentUser?.name || ''}
-                                companies={companies}
-                                onReportSaved={async () => { await refreshStockConferenceReports(); }}
-                                pendingReportsCount={pendingStockReports.length}
-                                onManualSync={async () => {
-                                    const raw = await StockStorage.loadPendingStockReports();
-                                    if (raw && raw.length > 0) {
-                                        await syncPendingStockReports(raw);
-                                        const remaining = await StockStorage.loadPendingStockReports();
-                                        if (remaining.length === 0) {
-                                            alert("✅ Sincronização concluída com sucesso! Todos os relatórios foram enviados ao servidor.");
+                            <Suspense fallback={<div className="p-6 text-sm font-semibold text-slate-500">Carregando módulo...</div>}>
+                                <StockConference
+                                    userEmail={currentUser?.email || ''}
+                                    userName={currentUser?.name || ''}
+                                    companies={companies}
+                                    onReportSaved={async () => { await refreshStockConferenceReports(); }}
+                                    pendingReportsCount={pendingStockReports.length}
+                                    onManualSync={async () => {
+                                        const raw = await StockStorage.loadPendingStockReports();
+                                        if (raw && raw.length > 0) {
+                                            await syncPendingStockReports(raw);
+                                            const remaining = await StockStorage.loadPendingStockReports();
+                                            if (remaining.length === 0) {
+                                                alert("✅ Sincronização concluída com sucesso! Todos os relatórios foram enviados ao servidor.");
+                                            } else {
+                                                alert("⚠️ Alguns relatórios ainda não puderam ser sincronizados devido a falhas na conexão. Tente novamente em instantes.");
+                                            }
                                         } else {
-                                            alert("⚠️ Alguns relatórios ainda não puderam ser sincronizados devido a falhas na conexão. Tente novamente em instantes.");
+                                            alert("ℹ️ Não há relatórios pendentes para sincronizar.");
                                         }
-                                    } else {
-                                        alert("ℹ️ Não há relatórios pendentes para sincronizar.");
-                                    }
-                                }}
-                            />
+                                    }}
+                                />
+                            </Suspense>
                         </div>
                     )}
 
@@ -9846,23 +9925,25 @@ const App: React.FC = () => {
 
                     {currentView === 'audit' && (
                         <div className="h-full animate-fade-in relative pb-24">
-                            <AuditModule
-                                key={`audit-${auditJumpCompanyId || currentUser?.company_id || 'all'}-${auditJumpArea || currentUser?.area || 'all'}-${auditJumpFilial || 'manual'}`}
-                                userEmail={currentUser?.email || ''}
-                                userName={currentUser?.name || ''}
-                                userRole={currentUser?.role || 'USER'}
-                                userCompanyId={currentUser?.company_id || null}
-                                userArea={currentUser?.area || null}
-                                userFilial={currentUser?.filial || null}
-                                companies={companies}
-                                initialFilial={auditJumpFilial}
-                                initialArea={auditJumpArea}
-                                initialCompanyId={auditJumpCompanyId || null}
-                                initialCompanyName={auditJumpCompanyName || null}
-                                forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
-                                onAuditExited={handleAuditExited}
-                                onFilialSelected={clearAuditManualBranchSelectionRequired}
-                            />
+                            <Suspense fallback={<div className="p-6 text-sm font-semibold text-slate-500">Carregando módulo...</div>}>
+                                <AuditModule
+                                    key={`audit-${auditJumpCompanyId || currentUser?.company_id || 'all'}-${auditJumpArea || currentUser?.area || 'all'}-${auditJumpFilial || 'manual'}`}
+                                    userEmail={currentUser?.email || ''}
+                                    userName={currentUser?.name || ''}
+                                    userRole={currentUser?.role || 'USER'}
+                                    userCompanyId={currentUser?.company_id || null}
+                                    userArea={currentUser?.area || null}
+                                    userFilial={currentUser?.filial || null}
+                                    companies={companies}
+                                    initialFilial={auditJumpFilial}
+                                    initialArea={auditJumpArea}
+                                    initialCompanyId={auditJumpCompanyId || null}
+                                    initialCompanyName={auditJumpCompanyName || null}
+                                    forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
+                                    onAuditExited={handleAuditExited}
+                                    onFilialSelected={clearAuditManualBranchSelectionRequired}
+                                />
+                            </Suspense>
                         </div>
                     )}
 

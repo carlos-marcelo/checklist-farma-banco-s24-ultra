@@ -1,9 +1,6 @@
 
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef, startTransition } from 'react';
 import { createPortal } from 'react-dom';
-import * as XLSX from 'xlsx';
-import { jsPDF } from 'jspdf';
-import autoTable from 'jspdf-autotable';
 import {
     AuditData,
     ViewState,
@@ -58,7 +55,61 @@ import {
 } from 'lucide-react';
 
 const GROUP_UPLOAD_IDS = ['2000', '3000', '4000', '8000', '10000', '66', '67'] as const;
+const AUDIT_CLIENT_NORMALIZED_VERSION = 1;
+const AUDIT_HISTORY_MEMORY_TTL_MS = 15_000;
 type GroupUploadId = typeof GROUP_UPLOAD_IDS[number];
+
+let xlsxModulePromise: Promise<typeof import('xlsx')> | null = null;
+let pdfModulesPromise: Promise<{
+    jsPDF: typeof import('jspdf').jsPDF;
+    autoTable: typeof import('jspdf-autotable').default;
+}> | null = null;
+const auditHistoryMemoryCache = new Map<string, { loadedAt: number; items: DbAuditSession[] }>();
+const auditHistoryRequests = new Map<string, Promise<DbAuditSession[]>>();
+const excelRowsMemoryCache = new WeakMap<File, Promise<any[][]>>();
+
+const loadXlsxModule = () => {
+    if (!xlsxModulePromise) xlsxModulePromise = import('xlsx');
+    return xlsxModulePromise;
+};
+
+const loadPdfModules = () => {
+    if (!pdfModulesPromise) {
+        pdfModulesPromise = Promise.all([import('jspdf'), import('jspdf-autotable')])
+            .then(([jspdfModule, autoTableModule]) => ({
+                jsPDF: jspdfModule.jsPDF,
+                autoTable: autoTableModule.default
+            }));
+    }
+    return pdfModulesPromise;
+};
+
+const fetchAuditsHistoryShared = (branch: string, forceFresh = false): Promise<DbAuditSession[]> => {
+    const key = String(branch || '').trim();
+    if (!key) return Promise.resolve([]);
+    const cached = auditHistoryMemoryCache.get(key);
+    if (!forceFresh && cached && Date.now() - cached.loadedAt < AUDIT_HISTORY_MEMORY_TTL_MS) {
+        return Promise.resolve(cached.items);
+    }
+    const pending = auditHistoryRequests.get(key);
+    if (pending) return pending;
+    const request = fetchAuditsHistory(key)
+        .then(items => {
+            const safeItems = Array.isArray(items) ? items : [];
+            auditHistoryMemoryCache.set(key, { loadedAt: Date.now(), items: safeItems });
+            return safeItems;
+        })
+        .finally(() => {
+            auditHistoryRequests.delete(key);
+        });
+    auditHistoryRequests.set(key, request);
+    return request;
+};
+
+const invalidateAuditsHistoryCache = (branch?: string | null) => {
+    const key = String(branch || '').trim();
+    if (key) auditHistoryMemoryCache.delete(key);
+};
 const GROUP_GLOBAL_BASE_KEYS: Record<GroupUploadId, string> = {
     '2000': 'audit_cadastro_2000',
     '3000': 'audit_cadastro_3000',
@@ -78,6 +129,23 @@ const yieldToBrowser = () => new Promise<void>((resolve) => {
         window.setTimeout(resolve, 0);
     });
 });
+
+const scheduleAfterInteraction = (task: () => void) => {
+    if (typeof window === 'undefined') {
+        task();
+        return;
+    }
+    window.requestAnimationFrame(() => {
+        window.setTimeout(() => {
+            const requestIdleCallback = (window as any).requestIdleCallback as undefined | ((cb: () => void, options?: { timeout?: number }) => number);
+            if (requestIdleCallback) {
+                requestIdleCallback(task, { timeout: 5000 });
+            } else {
+                task();
+            }
+        }, 350);
+    });
+};
 
 const buildSharedStockModuleKey = (branchRaw: string) => {
     const raw = String(branchRaw || '').trim();
@@ -244,6 +312,45 @@ const AuditTermInput = React.memo(({
         />
     );
 });
+
+const DeferredRender = ({
+    children,
+    minHeight = 184,
+    rootMargin = '320px 0px'
+}: {
+    children: () => React.ReactNode;
+    minHeight?: number;
+    rootMargin?: string;
+}) => {
+    const hostRef = useRef<HTMLDivElement | null>(null);
+    const [isReady, setIsReady] = useState(false);
+
+    useEffect(() => {
+        if (isReady) return;
+        const host = hostRef.current;
+        if (!host || typeof IntersectionObserver === 'undefined') {
+            setIsReady(true);
+            return;
+        }
+
+        const observer = new IntersectionObserver(([entry]) => {
+            if (!entry?.isIntersecting) return;
+            setIsReady(true);
+            observer.disconnect();
+        }, { rootMargin });
+
+        observer.observe(host);
+        return () => observer.disconnect();
+    }, [isReady, rootMargin]);
+
+    return (
+        <div ref={hostRef} style={!isReady ? { minHeight } : undefined}>
+            {isReady
+                ? children()
+                : <div aria-hidden="true" className="h-full min-h-[160px] rounded-xl border border-slate-100 bg-slate-50" />}
+        </div>
+    );
+};
 
 const isDiversosLabel = (value?: string) => {
     const t = String(value || '')
@@ -1757,8 +1864,11 @@ const scaleTermMetricRows = (
     return scaled;
 };
 
+const NORMALIZED_TERM_METRICS = Symbol('normalized-term-metrics');
+
 const normalizeTermMetricsToOfficial = (metrics: any) => {
     if (!metrics) return metrics;
+    if (metrics[NORMALIZED_TERM_METRICS]) return metrics;
     const scale = buildOfficialTermScale(metrics);
     const items = scaleTermMetricRows(scale.cleanItems, scale, false);
     const groupedDifferences = scaleTermMetricRows(scale.groupedRows, scale, true);
@@ -1770,7 +1880,7 @@ const normalizeTermMetricsToOfficial = (metrics: any) => {
     const diffQty = Number(metrics.diffQty || 0);
     const countedQty = Number(metrics.sysQty || 0) + diffQty;
 
-    return {
+    const normalized = {
         ...metrics,
         sysCost,
         countedCost,
@@ -1779,6 +1889,11 @@ const normalizeTermMetricsToOfficial = (metrics: any) => {
         items,
         groupedDifferences
     };
+    Object.defineProperty(normalized, NORMALIZED_TERM_METRICS, {
+        value: true,
+        enumerable: false
+    });
+    return normalized;
 };
 
 const getWholeTermMetricsTotals = (metrics: any) => {
@@ -2224,6 +2339,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const termFormRef = useRef<TermForm | null>(null);
     const termDraftsRef = useRef<Record<string, TermForm>>({});
     const rawTermMetricsRef = useRef<typeof rawTermComparisonMetrics>(null);
+    const termDraftDirtyRef = useRef(false);
     const termOpenSeqRef = useRef(0);
     const termShakeTimeoutRef = useRef<number | null>(null);
     const termExcelUploadSeqRef = useRef(0);
@@ -2244,6 +2360,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const termComparisonMetrics = useMemo(() => {
         if (!rawTermComparisonMetrics) return null;
+        if ((rawTermComparisonMetrics as any)[NORMALIZED_TERM_METRICS]) {
+            return rawTermComparisonMetrics;
+        }
 
         const newItems = (rawTermComparisonMetrics.items || []).filter((item: any) => !isTermMetadataRow(item));
 
@@ -2258,6 +2377,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [expandedCatKeys, setExpandedCatKeys] = useState<Set<string>>(new Set());
     const [auditLookup, setAuditLookup] = useState('');
     const [auditLookupOpen, setAuditLookupOpen] = useState(false);
+    const [isAuditLookupIndexPrewarmed, setIsAuditLookupIndexPrewarmed] = useState(false);
     const [postAdjustmentCode, setPostAdjustmentCode] = useState('');
     const [postAdjustmentQty, setPostAdjustmentQty] = useState('');
     const [postAdjustmentNote, setPostAdjustmentNote] = useState('');
@@ -2355,10 +2475,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const lastAuditUpdateRef = useRef<string | null>(null);
     const activeFilialRef = useRef<string>('');
+    const auditLoadsInFlightRef = useRef<Set<string>>(new Set());
     const completedAuditConsultationRef = useRef(false);
     const activeAuditOpenChoiceRef = useRef<Map<string, 'open' | 'completed'>>(new Map());
     const activeAuditOpenChoicePendingRef = useRef<Map<string, Promise<'open' | 'completed'>>>(new Map());
     const partialFinalizeInFlightRef = useRef(false);
+    const foregroundQuietUntilRef = useRef(0);
     const globalBaseMetaRef = useRef<{
         stock: DbGlobalBaseFile | null;
         groups: Record<GroupUploadId, DbGlobalBaseFile | null>;
@@ -2418,6 +2540,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const withAuditDataBranch = useCallback((auditData: AuditData, branch: string | number | null | undefined): AuditData => {
         const targetBranch = toAuditBranchValue(branch);
         if (!targetBranch) return auditData;
+        if (toAuditBranchValue((auditData as any)?.filial) === targetBranch) return auditData;
         return { ...auditData, filial: targetBranch };
     }, []);
 
@@ -2465,6 +2588,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 deduped.set(partialCompletedKey(p), p);
             });
             (nextData as any).partialCompleted = Array.from(deduped.values());
+        }
+        if (!(nextData as any).lastPartialBatchId) {
+            (nextData as any).lastPartialBatchId = getLatestBatchId((nextData as any).partialCompleted);
         }
         if (nextData.groups) {
             nextData.groups.forEach((g: any) => {
@@ -2534,9 +2660,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setDbSessionId(latest.id);
         setNextAuditNumber(latest.audit_number);
         lastAuditUpdateRef.current = latest.updated_at || lastAuditUpdateRef.current;
-        await CacheService.set(`audit_session_${selectedFilial}`, { ...latest, data: nextDataWithDrafts } as any);
+        void CacheService.set(`audit_session_${selectedFilial}`, {
+            ...latest,
+            data: nextDataWithDrafts,
+            _clientNormalizedVersion: AUDIT_CLIENT_NORMALIZED_VERSION
+        } as any);
         if (getAuditDataStrength(nextDataWithDrafts) > 0) {
-            await CacheService.set(`audit_session_lastgood_${selectedFilial}`, { ...latest, data: nextDataWithDrafts } as any);
+            void CacheService.set(`audit_session_lastgood_${selectedFilial}`, {
+                ...latest,
+                data: nextDataWithDrafts,
+                _clientNormalizedVersion: AUDIT_CLIENT_NORMALIZED_VERSION
+            } as any);
         }
 
         return { session: latest, data: nextDataWithDrafts, drafts: mergedDrafts };
@@ -2595,25 +2729,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const loadAuditNum = useCallback(async (silent: boolean = false) => {
         if (!selectedFilial) return;
         const requestedFilial = selectedFilial;
+        if (auditLoadsInFlightRef.current.has(requestedFilial)) return;
+        auditLoadsInFlightRef.current.add(requestedFilial);
         const isStaleRequest = () => activeFilialRef.current !== requestedFilial;
         try {
-            let forceFreshFetch = false;
+            let polledMeta: Awaited<ReturnType<typeof fetchLatestAuditMetadata>> = null;
             // Se for polling silencioso, busca apenas metadados para economizar banda e processamento
             if (silent) {
-                const meta = await fetchLatestAuditMetadata(selectedFilial);
-                if (!meta || isStaleRequest()) return;
+                polledMeta = await fetchLatestAuditMetadata(selectedFilial);
+                if (!polledMeta || isStaleRequest()) return;
 
                 // Se a data de atualização for a mesma, não faz nada
-                if (lastAuditUpdateRef.current === meta.updated_at) {
+                if (lastAuditUpdateRef.current === polledMeta.updated_at) {
                     return;
                 }
-
-                lastAuditUpdateRef.current = meta.updated_at;
-                forceFreshFetch = true;
             }
 
-            const localData = await AuditStorage.loadLocalAuditSession();
+            const cacheKey = `audit_session_${selectedFilial}`;
+            const backupKey = `audit_session_lastgood_${selectedFilial}`;
+            // IndexedDB, metadados e cache começam juntos. Antes, a leitura do rascunho
+            // local bloqueava até o início das demais cargas da filial.
+            const snapshotInputsPromise = Promise.all([
+                polledMeta ? Promise.resolve(polledMeta) : fetchLatestAuditMetadata(selectedFilial),
+                CacheService.get<DbAuditSession>(cacheKey),
+                CacheService.get<DbAuditSession>(backupKey)
+            ]);
+            const localData = silent ? null : await AuditStorage.loadLocalAuditSession();
             const hasPendingSync = !!localData?.pendingSync;
+            let pendingSyncCompleted = false;
 
             // Se temos dados pendentes localmente e estamos online, tentamos sincronizar antes de carregar.
             // Nunca cria um novo inventário nesse fluxo: criação deve passar pelo botão de iniciar/carregar.
@@ -2650,6 +2793,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             });
                             if (synced) {
                                 await AuditStorage.saveLocalAuditSession(localData, false);
+                                pendingSyncCompleted = true;
                                 console.log("Sincronização automática concluída com sucesso.");
                             }
                         }
@@ -2661,29 +2805,41 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 }
             }
 
-            const cacheKey = `audit_session_${selectedFilial}`;
-            const backupKey = `audit_session_lastgood_${selectedFilial}`;
-            const latestFromDbRaw = await fetchLatestAudit(selectedFilial);
+            let [latestMeta, cachedCurrentRaw, cachedBackupRaw] = await snapshotInputsPromise;
+            if (pendingSyncCompleted) {
+                latestMeta = await fetchLatestAuditMetadata(selectedFilial);
+            }
+            if (isStaleRequest()) return;
+
+            const cachedCurrent = guardAuditSessionForBranch(cachedCurrentRaw, selectedFilial, 'cache-current');
+            const cachedBackup = guardAuditSessionForBranch(cachedBackupRaw, selectedFilial, 'cache-lastgood');
+            const cachedMatchingMeta = [cachedBackup, cachedCurrent].find(candidate =>
+                !!candidate &&
+                !!latestMeta &&
+                candidate.id === latestMeta.id &&
+                candidate.audit_number === latestMeta.audit_number &&
+                String(candidate.updated_at || '') === String(latestMeta.updated_at || '') &&
+                !!candidate.data
+            ) || null;
+
+            // Na reentrada, um snapshot cuja versão coincide com o metadado remoto já é
+            // autoritativo. Só baixa o JSON completo quando a versão realmente mudou.
+            const mustFetchFullSnapshot = silent || (!cachedMatchingMeta && (!cachedCurrent || !!latestMeta));
+            const latestFromDbRaw = mustFetchFullSnapshot
+                ? await fetchLatestAudit(selectedFilial)
+                : null;
             const latestFromDb = guardAuditSessionForBranch(latestFromDbRaw, selectedFilial, 'latest-db');
             if (latestFromDbRaw && !latestFromDb) {
                 await CacheService.remove(cacheKey);
                 await CacheService.remove(backupKey);
             }
-            if (latestFromDb) {
-                await CacheService.set(cacheKey, latestFromDb as any);
-                if (latestFromDb.data && getAuditDataStrength(latestFromDb.data as AuditData) > 0) {
-                    await CacheService.set(backupKey, latestFromDb as any);
-                }
-            }
-            const cachedCurrent = !silent
-                ? guardAuditSessionForBranch(await CacheService.get<DbAuditSession>(cacheKey), selectedFilial, 'cache-current')
-                : null;
-            const cachedBackup = guardAuditSessionForBranch(await CacheService.get<DbAuditSession>(backupKey), selectedFilial, 'cache-lastgood');
 
             let latest: DbAuditSession | null = null;
             if (latestFromDb) {
                 // Security-first: trust the latest server snapshot and use cache only as fallback.
                 latest = latestFromDb;
+            } else if (cachedMatchingMeta) {
+                latest = cachedMatchingMeta;
             } else {
                 const fallbackCandidates = [cachedCurrent, cachedBackup].filter(Boolean) as DbAuditSession[];
                 if (fallbackCandidates.length > 0) {
@@ -2709,50 +2865,39 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
 
             if (isStaleRequest()) return;
+            if (latest?.updated_at) {
+                lastAuditUpdateRef.current = latest.updated_at;
+            }
             if (silent && latest && dbSessionId === latest.id && latest.data) {
-                lastAuditUpdateRef.current = latest.updated_at || null;
-                // Normaliza e aplica os dados frescos do banco para todos os usuários
-                if ((latest.data as any).partialStart && !(latest.data as any).partialStarts) {
-                    (latest.data as any).partialStarts = [(latest.data as any).partialStart];
+                const canReuseNormalizedSnapshot = (latest as any)._clientNormalizedVersion === AUDIT_CLIENT_NORMALIZED_VERSION;
+                if (!canReuseNormalizedSnapshot) {
+                    await yieldToBrowser();
+                    if (isStaleRequest()) return;
                 }
-                if (!(latest.data as any).partialCompleted) {
-                    (latest.data as any).partialCompleted = [];
-                }
-                if ((latest.data as any).partialCompleted) {
-                    const deduped = new Map<string, any>();
-                    (latest.data as any).partialCompleted.forEach((p: any) => {
-                        deduped.set(partialCompletedKey(p), p);
-                    });
-                    (latest.data as any).partialCompleted = Array.from(deduped.values());
-                }
-                if (latest.data.groups) {
-                    latest.data.groups.forEach((g: any) => {
-                        g.departments.forEach((d: any) => {
-                            d.categories.forEach((c: any) => {
-                                c.status = normalizeAuditStatus(c.status);
-                                if (c.totalCost === undefined || c.totalCost === null || (c.totalCost === 0 && c.totalQuantity > 0)) {
-                                    let catCost = 0;
-                                    c.products.forEach((p: any) => { catCost += (p.quantity * (p.cost || 0)); });
-                                    c.totalCost = catCost;
-                                }
-                            });
-                        });
-                    });
-                }
-                const reconciled = reconcileAuditStateFromCompletedScopes(latest.data as AuditData);
-                const normalized = normalizeAuditDataStructure(reconciled);
-                const normalizedData = normalizeRemoteAuditSnapshotForBranch((normalized.data || reconciled) as AuditData, requestedFilial);
+                const normalizedData = canReuseNormalizedSnapshot
+                    ? withAuditDataBranch(latest.data as AuditData, requestedFilial)
+                    : normalizeRemoteAuditSnapshotForBranch(latest.data as AuditData, requestedFilial);
                 if (!normalizedData) return;
-                const normalizedWithPartials = compactAuditDataActivePartials(normalizedData);
-                setData(normalizedWithPartials);
-                setTermDrafts(current =>
-                    composeTermDraftsForPersist(
-                        ((normalizedWithPartials as any).termDrafts || {}) as Record<string, TermForm>,
-                        current
-                    )
+                const normalizedWithPartials = canReuseNormalizedSnapshot
+                    ? normalizedData
+                    : compactAuditDataActivePartials(normalizedData);
+                const nextDrafts = composeTermDraftsForPersist(
+                    ((normalizedWithPartials as any).termDrafts || {}) as Record<string, TermForm>,
+                    termDraftsRef.current
                 );
+                startTransition(() => {
+                    setData(normalizedWithPartials);
+                    setTermDrafts(nextDrafts);
+                });
+                termDraftsRef.current = nextDrafts;
                 if (getAuditDataStrength(normalizedWithPartials) > 0) {
-                    await CacheService.set(backupKey, { ...latest, data: normalizedWithPartials } as any);
+                    const normalizedSession = {
+                        ...latest,
+                        data: normalizedWithPartials,
+                        _clientNormalizedVersion: AUDIT_CLIENT_NORMALIZED_VERSION
+                    } as any;
+                    void CacheService.set(cacheKey, normalizedSession);
+                    void CacheService.set(backupKey, normalizedSession);
                 }
                 return;
             }
@@ -2786,7 +2931,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         const choicePromise = (async (): Promise<'open' | 'completed'> => {
                             if (!canUseAuditMasterTools) return 'open';
                             try {
-                                const history = await fetchAuditsHistory(requestedFilial);
+                                const history = await fetchAuditsHistoryShared(requestedFilial);
                                 const completedCount = history.filter(item => item.status === 'completed').length;
                                 const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
                                 const baseMeta = globalBaseMetaRef.current;
@@ -2833,53 +2978,38 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 }
                 setIsReadOnlyCompletedView(false);
                 setConsultingAuditNumber(null);
-                setNextAuditNumber(latest.audit_number);
-                setDbSessionId(latest.id);
 
                 if (latest.data) {
                     if (isStaleRequest()) return;
-                    if ((latest.data as any).partialStart && !(latest.data as any).partialStarts) {
-                        (latest.data as any).partialStarts = [(latest.data as any).partialStart];
+                    const canReuseNormalizedSnapshot = (latest as any)._clientNormalizedVersion === AUDIT_CLIENT_NORMALIZED_VERSION;
+                    if (!canReuseNormalizedSnapshot) {
+                        await yieldToBrowser();
+                        if (isStaleRequest()) return;
                     }
-                    if (!(latest.data as any).partialCompleted) {
-                        (latest.data as any).partialCompleted = [];
-                    }
-                    if ((latest.data as any).partialCompleted) {
-                        const deduped = new Map<string, any>();
-                        (latest.data as any).partialCompleted.forEach((p: any) => {
-                            deduped.set(partialCompletedKey(p), p);
-                        });
-                        (latest.data as any).partialCompleted = Array.from(deduped.values());
-                    }
-
-                    if (!(latest.data as any).lastPartialBatchId) {
-                        (latest.data as any).lastPartialBatchId = getLatestBatchId((latest.data as any).partialCompleted);
-                    }
-                    if (latest.data.groups) {
-                        latest.data.groups.forEach((g: any) => {
-                            g.departments.forEach((d: any) => {
-                                d.categories.forEach((c: any) => {
-                                    c.status = normalizeAuditStatus(c.status);
-                                    if (c.totalCost === undefined || c.totalCost === null || (c.totalCost === 0 && c.totalQuantity > 0)) {
-                                        let catCost = 0;
-                                        c.products.forEach((p: any) => {
-                                            catCost += (p.quantity * (p.cost || 0));
-                                        });
-                                        c.totalCost = catCost;
-                                    }
-                                });
-                            });
-                        });
-                    }
-                    const normalizedData = normalizeRemoteAuditSnapshotForBranch(latest.data as AuditData, requestedFilial);
+                    const normalizedData = canReuseNormalizedSnapshot
+                        ? withAuditDataBranch(latest.data as AuditData, requestedFilial)
+                        : normalizeRemoteAuditSnapshotForBranch(latest.data as AuditData, requestedFilial);
                     if (!normalizedData) return;
-                    const normalizedWithPartials = compactAuditDataActivePartials(normalizedData);
-                    setData(normalizedWithPartials);
+                    const normalizedWithPartials = canReuseNormalizedSnapshot
+                        ? normalizedData
+                        : compactAuditDataActivePartials(normalizedData);
                     const draftsFromData = ((normalizedWithPartials as any).termDrafts || {}) as Record<string, TermForm>;
-                    setTermDrafts(current => composeTermDraftsForPersist(draftsFromData, current));
-                    setDbSessionId(latest.id);
+                    const nextDrafts = composeTermDraftsForPersist(draftsFromData, termDraftsRef.current);
+                    startTransition(() => {
+                        setData(normalizedWithPartials);
+                        setTermDrafts(nextDrafts);
+                        setDbSessionId(latest.id);
+                        setNextAuditNumber(latest.audit_number);
+                    });
+                    termDraftsRef.current = nextDrafts;
                     if (getAuditDataStrength(normalizedWithPartials) > 0) {
-                        await CacheService.set(backupKey, { ...latest, data: normalizedWithPartials } as any);
+                        const normalizedSession = {
+                            ...latest,
+                            data: normalizedWithPartials,
+                            _clientNormalizedVersion: AUDIT_CLIENT_NORMALIZED_VERSION
+                        } as any;
+                        void CacheService.set(cacheKey, normalizedSession);
+                        void CacheService.set(backupKey, normalizedSession);
                     }
 
                     if (!silent) {
@@ -2901,6 +3031,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         };
 
                         if (canUseAuditMasterTools) {
+                            const currentBaseMeta = globalBaseMetaRef.current;
                             const { latestStockTs, hasPendingGlobalStock, hasPendingGlobalStructure, hasPendingGlobalBase } = resolveLatestStockTimestampForPrompt(
                                 latest.data?.sourceFiles?.stock?.syncedAt || latest.data?.sourceFiles?.lastStockUpdateAt || latest.created_at
                             );
@@ -2910,7 +3041,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             // a auditoria em aberto deve voltar para a tela de atualização até o saldo ser aplicado.
                             if (hasPendingGlobalBase) {
                                 const stockTs = latestStockTs ? new Date(latestStockTs).getTime() : NaN;
-                                const syncKey = `${latest.id || 'no_session'}|${requestedFilial}|${baseMeta.stock?.module_key || 'stock'}|${Number.isFinite(stockTs) ? stockTs : latestStockTs || 'pending'}|${baseMeta.structureSignature}`;
+                                const syncKey = `${latest.id || 'no_session'}|${requestedFilial}|${currentBaseMeta.stock?.module_key || 'stock'}|${Number.isFinite(stockTs) ? stockTs : latestStockTs || 'pending'}|${currentBaseMeta.structureSignature}`;
                                 enterStockUpdateMode({
                                     stockTsRaw: latestStockTs,
                                     syncKey,
@@ -2949,6 +3080,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         }
                         setInitialDoneUnits(done);
                     }
+                } else {
+                    setNextAuditNumber(latest.audit_number);
+                    setDbSessionId(latest.id);
                 }
             } else {
                 if (latest !== undefined) {
@@ -2972,6 +3106,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
         } catch (error) {
             console.error('Error loading audit info:', error);
+        } finally {
+            auditLoadsInFlightRef.current.delete(requestedFilial);
         }
     }, [
         selectedFilial,
@@ -2991,9 +3127,36 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     // Carga Inicial
     useEffect(() => {
-        setData(null);
-        setTermDrafts({});
-        setDbSessionId(undefined);
+        const cacheKey = selectedFilial ? `audit_session_${selectedFilial}` : '';
+        const backupKey = selectedFilial ? `audit_session_lastgood_${selectedFilial}` : '';
+        const hotCandidates = selectedFilial
+            ? [CacheService.peek<DbAuditSession>(cacheKey), CacheService.peek<DbAuditSession>(backupKey)]
+                .map(item => guardAuditSessionForBranch(item, selectedFilial, 'hot-cache'))
+                .filter((item): item is DbAuditSession => !!item)
+            : [];
+        const hotSession = hotCandidates.find(item =>
+            item.status !== 'completed' &&
+            !!item.data &&
+            (item as any)._clientNormalizedVersion === AUDIT_CLIENT_NORMALIZED_VERSION &&
+            isAuditSessionConfirmed(item.id)
+        ) || null;
+
+        if (hotSession?.data && selectedFilial) {
+            const hotData = withAuditDataBranch(hotSession.data as AuditData, selectedFilial);
+            const hotDrafts = (((hotData as any).termDrafts || {}) as Record<string, TermForm>);
+            setData(hotData);
+            setTermDrafts(hotDrafts);
+            termDraftsRef.current = hotDrafts;
+            setDbSessionId(hotSession.id);
+            setNextAuditNumber(hotSession.audit_number);
+            setAllowActiveAuditAutoOpen(true);
+            lastAuditUpdateRef.current = hotSession.updated_at || null;
+        } else {
+            setData(null);
+            setTermDrafts({});
+            termDraftsRef.current = {};
+            setDbSessionId(undefined);
+        }
         setIsUpdatingStock(false);
         setIsTermsPanelCollapsed(true);
         setTermModal(null);
@@ -3002,9 +3165,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         completedAuditConsultationRef.current = false;
         setIsReadOnlyCompletedView(false);
         setConsultingAuditNumber(null);
-        setAllowActiveAuditAutoOpen(false);
+        if (!hotSession) setAllowActiveAuditAutoOpen(false);
         removedExcelDraftKeysRef.current.clear();
-        lastAuditUpdateRef.current = null;
+        if (!hotSession) lastAuditUpdateRef.current = null;
         lastAutoStockSyncKeyRef.current = '';
         if (selectedFilial) {
             loadAuditNum();
@@ -3024,7 +3187,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const loadBranchHistory = async () => {
             setIsLoadingBranchAudits(true);
             try {
-                const history = await fetchAuditsHistory(requestedFilial);
+                const history = await fetchAuditsHistoryShared(requestedFilial);
                 if (cancelled || activeFilialRef.current !== requestedFilial) return;
                 const filtered = history.filter(item => isAuditSessionForBranch(item, requestedFilial));
                 const sorted = [...filtered].sort((a, b) => {
@@ -3043,7 +3206,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
         void loadBranchHistory();
         return () => { cancelled = true; };
-    }, [selectedFilial, dbSessionId, nextAuditNumber, isAuditSessionForBranch]);
+    }, [selectedFilial, isAuditSessionForBranch]);
 
     const latestOpenAudit = useMemo(
         () => {
@@ -3065,6 +3228,23 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         },
         [branchAuditsHistory, isAuditSessionForBranch, selectedFilial]
     );
+
+    useEffect(() => {
+        const markForegroundResume = () => {
+            if (document.hidden) return;
+            foregroundQuietUntilRef.current = Math.max(
+                foregroundQuietUntilRef.current,
+                Date.now() + 3000
+            );
+        };
+        document.addEventListener('visibilitychange', markForegroundResume);
+        window.addEventListener('focus', markForegroundResume);
+        return () => {
+            document.removeEventListener('visibilitychange', markForegroundResume);
+            window.removeEventListener('focus', markForegroundResume);
+        };
+    }, []);
+
     // Polling de sincronização entre usuários
     useEffect(() => {
         if (!selectedFilial) return;
@@ -3073,6 +3253,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         let cancelled = false;
         const syncNow = () => {
             if (cancelled) return;
+            if (document.hidden) return;
+            if (Date.now() < foregroundQuietUntilRef.current) return;
             // Suspende polling caso alguma operação de salvamento em segundo plano esteja em andamento,
             // evitando sobrescrever o estado otimista da UI com dados antigos do banco (ex: Concluir Ativas).
             if (partialFinalizeInFlightRef.current || isSavingTerm || isSavingPostAdjustment) return;
@@ -3092,6 +3274,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const scheduleWakeSync = () => {
             if (document.hidden) return;
             cancelWakeSync();
+            const delay = Math.max(900, foregroundQuietUntilRef.current - Date.now() + 500);
             wakeTimer = window.setTimeout(() => {
                 wakeTimer = null;
                 const run = () => {
@@ -3104,7 +3287,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 } else {
                     run();
                 }
-            }, 900);
+            }, delay);
         };
 
         const getIntervalMs = () => (document.hidden ? 12000 : 5000);
@@ -3238,7 +3421,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [globalStockMeta, setGlobalStockMeta] = useState<DbGlobalBaseFile | null>(null);
     const [stockCodeAliasesByReduced, setStockCodeAliasesByReduced] = useState<Record<string, string[]>>({});
     const [cadastroBarcodeAliasesByReduced, setCadastroBarcodeAliasesByReduced] = useState<Record<string, string[]>>({});
-    const [isLoadingGlobalBases, setIsLoadingGlobalBases] = useState(false);
+    const [isLoadingStaticBases, setIsLoadingStaticBases] = useState(false);
+    const [isLoadingStockBase, setIsLoadingStockBase] = useState(false);
+    const isLoadingGlobalBases = isLoadingStaticBases || isLoadingStockBase;
     const lastAutoStockSyncKeyRef = useRef('');
     const stockBaseRefreshInFlightRef = useRef(false);
 
@@ -3347,15 +3532,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setGlobalCatIdsFile(null);
             setGlobalDeptIdsMeta(null);
             setGlobalCatIdsMeta(null);
-            setGlobalStockFile(null);
-            setGlobalStockMeta(null);
-            setIsLoadingGlobalBases(false);
+            setIsLoadingStaticBases(false);
             return;
         }
 
         let cancelled = false;
-        const loadGlobalAuditBases = async () => {
-            setIsLoadingGlobalBases(true);
+        const loadStaticAuditBases = async () => {
+            setIsLoadingStaticBases(true);
             try {
                 const staticKeys = [
                     ...GROUP_UPLOAD_IDS.map(groupId => GROUP_GLOBAL_BASE_KEYS[groupId]),
@@ -3369,19 +3552,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 );
                 if (cancelled) return;
 
-                const stockModuleKey = selectedFilial ? buildSharedStockModuleKey(selectedFilial) : '';
-                const stockMeta = stockModuleKey
-                    ? await CadastrosBaseService.getGlobalBaseFileCached(companyId, stockModuleKey, { forceFresh: true })
-                    : null;
-                if (cancelled) return;
-
                 const byKey = new Map<string, DbGlobalBaseFile>();
                 staticFiles.forEach(file => {
                     if (file) byKey.set(file.module_key, file as DbGlobalBaseFile);
                 });
-                if (stockMeta) {
-                    byKey.set(stockMeta.module_key, stockMeta as DbGlobalBaseFile);
-                }
 
                 const nextGroupFiles = createInitialGroupFiles();
                 const nextGroupMeta = createInitialGroupMeta();
@@ -3398,16 +3572,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const deptMeta = byKey.get(AUDIT_DEPT_IDS_GLOBAL_KEY) || null;
                 const catMeta = byKey.get(AUDIT_CAT_IDS_GLOBAL_KEY) || null;
 
-                setGlobalGroupFiles(nextGroupFiles);
-                setGlobalGroupMeta(nextGroupMeta);
-                setGlobalDeptIdsMeta(deptMeta);
-                setGlobalCatIdsMeta(catMeta);
-                setGlobalDeptIdsFile(deptMeta ? decodeGlobalFileToBrowserFile(deptMeta) : null);
-                setGlobalCatIdsFile(catMeta ? decodeGlobalFileToBrowserFile(catMeta) : null);
-                setGlobalStockMeta(stockMeta as DbGlobalBaseFile | null);
-                setGlobalStockFile(stockMeta ? decodeGlobalFileToBrowserFile(stockMeta as DbGlobalBaseFile) : null);
+                startTransition(() => {
+                    setGlobalGroupFiles(nextGroupFiles);
+                    setGlobalGroupMeta(nextGroupMeta);
+                    setGlobalDeptIdsMeta(deptMeta);
+                    setGlobalCatIdsMeta(catMeta);
+                    setGlobalDeptIdsFile(deptMeta ? decodeGlobalFileToBrowserFile(deptMeta) : null);
+                    setGlobalCatIdsFile(catMeta ? decodeGlobalFileToBrowserFile(catMeta) : null);
+                });
             } catch (error) {
-                console.error('Erro ao carregar bases globais da auditoria:', error);
+                console.error('Erro ao carregar bases estruturais globais da auditoria:', error);
                 if (!cancelled) {
                     setGlobalGroupFiles(createInitialGroupFiles());
                     setGlobalGroupMeta(createInitialGroupMeta());
@@ -3415,15 +3589,55 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     setGlobalCatIdsMeta(null);
                     setGlobalDeptIdsFile(null);
                     setGlobalCatIdsFile(null);
+                }
+            } finally {
+                if (!cancelled) setIsLoadingStaticBases(false);
+            }
+        };
+
+        void loadStaticAuditBases();
+        return () => {
+            cancelled = true;
+        };
+    }, [selectedCompany?.id]);
+
+    useEffect(() => {
+        const companyId = selectedCompany?.id;
+        const requestedFilial = toAuditBranchValue(selectedFilial);
+        if (!companyId || !requestedFilial) {
+            setGlobalStockFile(null);
+            setGlobalStockMeta(null);
+            setIsLoadingStockBase(false);
+            return;
+        }
+
+        let cancelled = false;
+        const loadBranchStockBase = async () => {
+            setIsLoadingStockBase(true);
+            try {
+                const stockModuleKey = buildSharedStockModuleKey(requestedFilial);
+                const stockMeta = await CadastrosBaseService.getGlobalBaseFileCached(
+                    companyId,
+                    stockModuleKey,
+                    { forceFresh: true }
+                );
+                if (cancelled || activeFilialRef.current !== requestedFilial) return;
+                startTransition(() => {
+                    setGlobalStockMeta(stockMeta as DbGlobalBaseFile | null);
+                    setGlobalStockFile(stockMeta ? decodeGlobalFileToBrowserFile(stockMeta as DbGlobalBaseFile) : null);
+                });
+            } catch (error) {
+                console.error('Erro ao carregar estoque global da filial:', error);
+                if (!cancelled && activeFilialRef.current === requestedFilial) {
                     setGlobalStockMeta(null);
                     setGlobalStockFile(null);
                 }
             } finally {
-                if (!cancelled) setIsLoadingGlobalBases(false);
+                if (!cancelled && activeFilialRef.current === requestedFilial) setIsLoadingStockBase(false);
             }
         };
 
-        loadGlobalAuditBases();
+        void loadBranchStockBase();
         return () => {
             cancelled = true;
         };
@@ -3445,9 +3659,32 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         refreshCurrentStockBaseMeta();
 
+        let wakeTimer: number | null = null;
+        let wakeIdleId: number | null = null;
+        const cancelWakeRefresh = () => {
+            if (wakeTimer !== null) window.clearTimeout(wakeTimer);
+            wakeTimer = null;
+            const cancelIdleCallback = (window as any).cancelIdleCallback as undefined | ((id: number) => void);
+            if (wakeIdleId !== null && cancelIdleCallback) cancelIdleCallback(wakeIdleId);
+            wakeIdleId = null;
+        };
         const checkWhenVisible = () => {
             if (typeof document !== 'undefined' && document.hidden) return;
-            refreshCurrentStockBaseMeta();
+            cancelWakeRefresh();
+            const delay = Math.max(0, foregroundQuietUntilRef.current - Date.now() + 900);
+            wakeTimer = window.setTimeout(() => {
+                wakeTimer = null;
+                const run = () => {
+                    wakeIdleId = null;
+                    if (!document.hidden) void refreshCurrentStockBaseMeta();
+                };
+                const requestIdleCallback = (window as any).requestIdleCallback as undefined | ((cb: () => void, opts?: { timeout?: number }) => number);
+                if (requestIdleCallback) {
+                    wakeIdleId = requestIdleCallback(run, { timeout: 5000 });
+                } else {
+                    run();
+                }
+            }, delay);
         };
 
         const intervalId = window.setInterval(checkWhenVisible, 30_000);
@@ -3456,6 +3693,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         return () => {
             window.clearInterval(intervalId);
+            cancelWakeRefresh();
             window.removeEventListener('focus', checkWhenVisible);
             document.removeEventListener('visibilitychange', checkWhenVisible);
         };
@@ -3500,7 +3738,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return;
             }
             // Preserva a flag de pendingSync se ela já existir no data
-            AuditStorage.saveLocalAuditSession(
+            AuditStorage.scheduleLocalAuditSessionSave(
                 selectedFilial ? withAuditDataBranch(data, selectedFilial) : data,
                 !!data.pendingSync
             );
@@ -3515,6 +3753,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         activeFilialRef.current = normalized;
         setData(null);
         setTermDrafts({});
+        termDraftsRef.current = {};
         setDbSessionId(undefined);
         setIsUpdatingStock(false);
         setAllowActiveAuditAutoOpen(false);
@@ -3739,12 +3978,30 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     : incomingData) as any,
                 updated_at: baseUpdatedAt || undefined
             });
-            
+            let savedForClient = saved;
             if (saved?.updated_at) {
                 lastAuditUpdateRef.current = saved.updated_at;
+                invalidateAuditsHistoryCache(branch);
+                if (activeFilialRef.current === branch) {
+                    setBranchAuditsHistory(current => {
+                        const metadataOnly = { ...saved, data: undefined as any } as DbAuditSession;
+                        return [metadataOnly, ...current.filter(item =>
+                            item.id !== saved.id && item.audit_number !== saved.audit_number
+                        )].sort((a, b) => {
+                            if (a.audit_number !== b.audit_number) return b.audit_number - a.audit_number;
+                            return new Date(b.updated_at || b.created_at || 0).getTime() -
+                                new Date(a.updated_at || a.created_at || 0).getTime();
+                        });
+                    });
+                }
                 const reconciled = saved.data ? reconcileAuditStateFromCompletedScopes(saved.data as AuditData) : null;
                 if (reconciled && getAuditDataStrength(reconciled) > 0) {
-                    await CacheService.set(`audit_session_lastgood_${branch}`, { ...saved, data: reconciled } as any);
+                    savedForClient = {
+                        ...saved,
+                        data: withAuditDataBranch(reconciled, branch),
+                        _clientNormalizedVersion: AUDIT_CLIENT_NORMALIZED_VERSION
+                    } as any;
+                    await CacheService.set(`audit_session_lastgood_${branch}`, savedForClient as any);
                 }
                 // Limpa flag de pendência local ao sincronizar com sucesso
                 if (incomingData) {
@@ -3752,7 +4009,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     setData(prev => prev ? { ...prev, pendingSync: false } : prev);
                 }
             }
-            return saved;
+            return savedForClient;
         } catch (err) {
             console.error("Erro ao persistir sessão (possível queda de rede):", err);
             if (incomingData) {
@@ -4515,27 +4772,29 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         return Number.isFinite(n) ? n : 0;
     };
 
-    const readExcel = (file: File): Promise<any[][]> => {
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                try {
-                    const ab = e.target?.result;
-                    const workbook = XLSX.read(ab, { type: 'array' });
-                    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-                    const rows = XLSX.utils.sheet_to_json(firstSheet, { header: 1 });
-                    resolve(rows as any[][]);
-                } catch (err) { reject(err); }
-            };
-            reader.readAsArrayBuffer(file);
+    const readExcel = async (file: File): Promise<any[][]> => {
+        const cached = excelRowsMemoryCache.get(file);
+        if (cached) return cached;
+        const request = Promise.all([loadXlsxModule(), file.arrayBuffer()]).then(([XLSX, ab]) => {
+            const workbook = XLSX.read(ab, { type: 'array' });
+            const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+            return XLSX.utils.sheet_to_json(firstSheet, { header: 1 }) as any[][];
         });
+        excelRowsMemoryCache.set(file, request);
+        return request;
     };
+
+    const shouldPrepareBarcodeAliases =
+        auditLookupOpen ||
+        !!auditLookup.trim() ||
+        !!postAdjustmentCode.trim();
 
     useEffect(() => {
         if (!globalStockFile) {
             setStockCodeAliasesByReduced({});
             return;
         }
+        if (!shouldPrepareBarcodeAliases) return;
         let cancelled = false;
         const loadStockAliases = async () => {
             try {
@@ -4559,7 +4818,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
         void loadStockAliases();
         return () => { cancelled = true; };
-    }, [globalStockFile]);
+    }, [globalStockFile, shouldPrepareBarcodeAliases]);
 
     useEffect(() => {
         const files = GROUP_UPLOAD_IDS
@@ -4569,6 +4828,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setCadastroBarcodeAliasesByReduced({});
             return;
         }
+        if (!shouldPrepareBarcodeAliases) return;
 
         let cancelled = false;
         const addAlias = (target: Record<string, string[]>, reducedRaw: unknown, barcodeRaw: unknown) => {
@@ -4581,16 +4841,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         const loadCadastroAliases = async () => {
             try {
-                const allRows = await Promise.all(files.map(file => readExcel(file)));
-                if (cancelled) return;
                 const next: Record<string, string[]> = {};
-                allRows.forEach(rows => {
+                for (const file of files) {
+                    const rows = await readExcel(file);
+                    if (cancelled) return;
                     rows.forEach(row => {
                         if (!row) return;
                         // Cadastro Global: coluna C = reduzido, coluna L = código de barras.
                         addAlias(next, row[2], row[11]);
                     });
-                });
+                    await yieldToBrowser();
+                }
                 setCadastroBarcodeAliasesByReduced(next);
             } catch (error) {
                 console.warn('Falha ao indexar códigos de barras do Cadastro Global para ajustes:', error);
@@ -4600,7 +4861,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         void loadCadastroAliases();
         return () => { cancelled = true; };
-    }, [globalGroupFiles]);
+    }, [globalGroupFiles, shouldPrepareBarcodeAliases]);
 
     const barcodeAliasToReduced = useMemo(() => {
         const next: Record<string, string> = {};
@@ -6649,6 +6910,29 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
     }, [termComparisonMetrics, termModal, getPostAuditAdjustmentsForTermScope, metricsContainsPostAuditAdjustments]);
 
+    const termMetricItemIndexes = useMemo(() => {
+        const byCategory = new Map<string, any[]>();
+        const byDepartment = new Map<string, any[]>();
+        const items = Array.isArray(termDisplayMetrics?.items) ? termDisplayMetrics.items : [];
+
+        items.forEach((item: any) => {
+            const deptKey = normalizeText(item?.deptName);
+            const catKey = `${deptKey}|${normalizeText(item?.catName)}`;
+            const departmentItems = byDepartment.get(deptKey) || [];
+            departmentItems.push(item);
+            byDepartment.set(deptKey, departmentItems);
+            const categoryItems = byCategory.get(catKey) || [];
+            categoryItems.push(item);
+            byCategory.set(catKey, categoryItems);
+        });
+
+        byCategory.forEach(categoryItems => {
+            categoryItems.sort((a: any, b: any) => Number(a?.diffCost || 0) - Number(b?.diffCost || 0));
+        });
+
+        return { byCategory, byDepartment };
+    }, [termDisplayMetrics]);
+
     const applyPostAuditAdjustmentsToMetrics = useCallback((
         metrics: any | null,
         scope: { groupId?: string; deptId?: string; catId?: string }
@@ -6816,11 +7100,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         termOpenSeqRef.current = openSeq;
         let sourceData = data;
         let sourceDrafts = termDraftsRef.current || termDrafts;
-        const refreshFreshSnapshotInBackground = () => {
-            void fetchFreshOpenAuditSnapshot().catch(err => {
-                console.warn("Atualização do termo em segundo plano adiada:", err);
-            });
-        };
         if (!sourceData) {
             try {
                 const fresh = await fetchFreshOpenAuditSnapshot();
@@ -6831,8 +7110,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             } catch (err) {
                 console.error("Falha ao buscar atualização antes de abrir termo:", err);
             }
-        } else {
-            refreshFreshSnapshotInBackground();
         }
         if (!sourceData) return;
 
@@ -6840,6 +7117,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const data = sourceData;
         const termDrafts = sourceDrafts;
         const key = buildTermKey(scope);
+        termDraftDirtyRef.current = false;
         const isGlobalUnifiedCustomTerm = scope.type === 'custom' && normalizeScopeId(scope.batchId) === GLOBAL_UNIFIED_TERM_BATCH_ID;
         let draft = termDrafts[key];
         const legacyKey = getLegacyCustomTermKey(scope);
@@ -6870,7 +7148,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setTermFieldErrors({});
         setTermTouchedFields({});
         setTermShakeFields({});
-        const initialMetrics = normalizeTermMetricsToOfficial(resolvedExcelMetrics);
+        const initialMetrics = resolvedExcelMetrics;
         setTermComparisonMetrics(initialMetrics);
         rawTermMetricsRef.current = initialMetrics;
         setIsTermMetricsPreparing(true);
@@ -7201,6 +7479,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         // Corrigir apenas groupName e tentar upgrade de DIVERSOS via data.groups
         // NÃO re-classifica itens que já têm dept/cat válidos — apenas corrige o grupo
         if (( !hasDirectExcelMetrics || shouldNormalizeLegacyIds ) && nextMetrics && scope.groupId) {
+            // A versão normalizada pode estar sendo exibida e reutilizada por outro termo.
+            // Não altere esse objeto compartilhado ao corrigir identificadores legados.
+            nextMetrics = {
+                ...nextMetrics,
+                items: Array.isArray(nextMetrics.items) ? [...nextMetrics.items] : [],
+                groupedDifferences: Array.isArray(nextMetrics.groupedDifferences)
+                    ? [...nextMetrics.groupedDifferences]
+                    : []
+            };
             const termGroupName = GROUP_CONFIG_DEFAULTS[scope.groupId] || `Grupo ${scope.groupId}`;
             const scopeGroupIdNorm = normalizeScopeId(scope.groupId);
             const scopeGroupNameNorm = normalizeText(termGroupName);
@@ -7412,6 +7699,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             return;
         }
         const normalizedNextMetrics = normalizeTermMetricsToOfficial(nextMetrics);
+        if (
+            shouldNormalizeLegacyIds ||
+            (!hasDirectExcelMetrics && !!normalizedNextMetrics && !isGlobalUnifiedCustomTerm) ||
+            !termDrafts[key]
+        ) {
+            termDraftDirtyRef.current = true;
+        }
         rawTermMetricsRef.current = normalizedNextMetrics;
         setTermComparisonMetrics(normalizedNextMetrics);
 
@@ -7421,11 +7715,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             : (nextForm?.excelMetrics
                 ? { ...nextForm, excelMetrics: normalizeTermMetricsToOfficial(nextForm.excelMetrics) }
                 : ((draft?.excelMetrics ? { ...nextForm, excelMetrics: normalizeTermMetricsToOfficial(draft.excelMetrics) } : nextForm)));
-        setTermDrafts(current => {
-            const mergedBase = composeTermDraftsForPersist(current, termDrafts);
-            const nextDrafts = upsertScopeDraft(mergedBase, scope as any, formToSave);
-            termDraftsRef.current = nextDrafts;
-            return nextDrafts;
+        startTransition(() => {
+            setTermDrafts(current => {
+                const currentDraft = current[key];
+                const alreadyPrepared = currentDraft === nextForm && (
+                    isGlobalUnifiedCustomTerm ||
+                    (!normalizedNextMetrics && !currentDraft?.excelMetrics) ||
+                    currentDraft?.excelMetrics === normalizedNextMetrics
+                );
+                if (alreadyPrepared) return current;
+                const mergedBase = composeTermDraftsForPersist(current, termDrafts);
+                const nextDrafts = upsertScopeDraft(mergedBase, scope as any, formToSave);
+                termDraftsRef.current = nextDrafts;
+                return nextDrafts;
+            });
         });
         setIsTermMetricsPreparing(false);
         } catch (err) {
@@ -7465,6 +7768,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (!prev) return prev;
             if (isReadOnlyCompletedView) return prev;
             const next = updater(prev);
+            if (next !== prev) termDraftDirtyRef.current = true;
             if (termModal) {
                 const key = buildTermKey(termModal);
                 setTermDrafts(current => {
@@ -7622,6 +7926,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }, { allowProgressRegression: true });
             if (savedSession) {
                 await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
+                termDraftDirtyRef.current = false;
                 setShowSavedFeedback(true);
                 alert("✅ Dados salvos com sucesso no Banco de Dados!");
                 setTimeout(() => setShowSavedFeedback(false), 2500);
@@ -7635,14 +7940,25 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     };
     const closeTermModal = useCallback(() => {
         termOpenSeqRef.current += 1;
-        setIsTermMetricsPreparing(false);
         const currentScope = termModal;
         const currentForm = termFormRef.current || termForm;
         const currentData = data;
         const currentDrafts = termDraftsRef.current || termDrafts;
         const currentMetrics = rawTermMetricsRef.current || rawTermComparisonMetrics || termComparisonMetrics;
+        const currentKey = currentScope ? buildTermKey(currentScope) : '';
+        const forceClearedFlag = !!currentKey && removedExcelDraftKeysRef.current.has(currentKey);
+        const shouldPersistOnClose =
+            !isReadOnlyCompletedView &&
+            !!currentScope &&
+            !!currentForm &&
+            !!currentData &&
+            (termDraftDirtyRef.current || forceClearedFlag);
 
-        // Fecha instantaneamente; persistência roda em background.
+        // O clique precisa terminar antes de qualquer normalização ou acesso ao banco.
+        // Assim o React remove o portal no mesmo quadro visual.
+        termDraftDirtyRef.current = false;
+        rawTermMetricsRef.current = null;
+        setIsTermMetricsPreparing(false);
         setTermModal(null);
         setTermForm(null);
         setTermComparisonMetrics(null);
@@ -7650,14 +7966,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setTermTouchedFields({});
         setTermShakeFields({});
 
-        if (!isReadOnlyCompletedView && currentScope && currentForm && currentData) {
-            const key = buildTermKey(currentScope);
-            const forceClearedFlag = removedExcelDraftKeysRef.current.has(key);
+        if (!shouldPersistOnClose || !currentScope || !currentForm || !currentData) return;
+
+        scheduleAfterInteraction(() => {
+            const key = currentKey;
             const latestDraftAtKey = currentDrafts[key];
             const hasAnyMetricsInMemory =
-                !!(rawTermMetricsRef.current ||
-                    rawTermComparisonMetrics ||
-                    termComparisonMetrics ||
+                !!(currentMetrics ||
                     currentForm.excelMetrics ||
                     latestDraftAtKey?.excelMetrics);
             const forceCleared = forceClearedFlag && !hasAnyMetricsInMemory;
@@ -7689,9 +8004,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 metricsStore[key] = persistedMetrics;
             }
             const nextDataWithTerms = { ...currentData, termDrafts: syncedDrafts, termExcelMetricsByKey: metricsStore } as any;
-            setTermDrafts(syncedDrafts);
             termDraftsRef.current = syncedDrafts;
-            setData(nextDataWithTerms as AuditData);
+            startTransition(() => {
+                setTermDrafts(syncedDrafts);
+                setData(nextDataWithTerms as AuditData);
+            });
             void (async () => {
                 try {
                     let dataToPersist = nextDataWithTerms;
@@ -7699,7 +8016,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     let auditNumberToPersist = nextAuditNumber;
                     let statusToPersist: DbAuditSession['status'] = 'open';
                     let updatedAtToPersist = lastAuditUpdateRef.current || undefined;
-                    const fresh = await fetchFreshOpenAuditSnapshot();
+                    const latestMeta = await fetchLatestAuditMetadata(selectedFilial);
+                    const remoteChanged = !!latestMeta?.updated_at && (
+                        !lastAuditUpdateRef.current ||
+                        String(latestMeta.updated_at) !== String(lastAuditUpdateRef.current)
+                    );
+                    const fresh = remoteChanged ? await fetchFreshOpenAuditSnapshot() : null;
                     if (fresh) {
                         const remoteMetricsStore = { ...(((fresh.data as any)?.termExcelMetricsByKey || {}) as Record<string, any>) };
                         const remoteDrafts = fresh.drafts || {};
@@ -7729,9 +8051,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         auditNumberToPersist = fresh.session.audit_number;
                         statusToPersist = fresh.session.status;
                         updatedAtToPersist = fresh.session.updated_at || updatedAtToPersist;
-                        setTermDrafts(freshSyncedDrafts);
                         termDraftsRef.current = freshSyncedDrafts;
-                        setData(dataToPersist as AuditData);
+                        startTransition(() => {
+                            setTermDrafts(freshSyncedDrafts);
+                            setData(dataToPersist as AuditData);
+                        });
                     }
                     let skus = 0;
                     let doneSkus = 0;
@@ -7764,7 +8088,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (forceCleared) {
                 removedExcelDraftKeysRef.current.delete(key);
             }
-        }
+        });
     }, [termModal, termForm, rawTermComparisonMetrics, termComparisonMetrics, data, termDrafts, dbSessionId, selectedFilial, nextAuditNumber, userEmail, isReadOnlyCompletedView, fetchFreshOpenAuditSnapshot]);
 
     const handleProcessTermComparisonExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -8468,6 +8792,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             };
 
             if (termExcelUploadSeqRef.current !== uploadSeq) return;
+            termDraftDirtyRef.current = true;
             setTermComparisonMetrics(payload);
             rawTermMetricsRef.current = payload as any;
             setTermForm(prev => (prev ? { ...prev, excelMetrics: payload, excelMetricsRemovedAt: undefined } : prev));
@@ -8564,6 +8889,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const savedData = (savedSession.data as AuditData) || nextData;
                 setData(savedData);
                 setTermDrafts((((savedData as any)?.termDrafts || nextDrafts || {}) as Record<string, TermForm>));
+                termDraftDirtyRef.current = false;
             }
 
             if (termExcelUploadSeqRef.current === uploadSeq) {
@@ -8591,7 +8917,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         inputEl.value = '';
     };
 
-    const downloadTermComparisonExcel = () => {
+    const downloadTermComparisonExcel = async () => {
         const metrics = normalizeTermMetricsToOfficial(
             pickPreferredTermMetrics(rawTermMetricsRef.current, termComparisonMetrics, termForm?.excelMetrics)
         );
@@ -8599,6 +8925,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             alert("Nenhuma planilha de divergências carregada para baixar.");
             return;
         }
+        const XLSX = await loadXlsxModule();
 
         const sanitizeFileToken = (value: unknown) =>
             String(value || '')
@@ -8702,6 +9029,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             alert("Apenas Master ou Administrativo pode remover planilha do termo.");
             return;
         }
+        termDraftDirtyRef.current = true;
         setTermComparisonMetrics(null);
         const removedAt = new Date().toISOString();
         setTermForm(prev => (prev ? { ...prev, excelMetrics: undefined, excelMetricsRemovedAt: removedAt } : prev));
@@ -8789,6 +9117,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     const savedData = (savedSession.data as AuditData) || nextData;
                     setData(savedData);
                     setTermDrafts((((savedData as any)?.termDrafts || nextDrafts || {}) as Record<string, TermForm>));
+                    termDraftDirtyRef.current = false;
                 } else {
                     throw new Error("Erro ao salvar remoção do Excel.");
                 }
@@ -9120,6 +9449,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const isGlobalUnifiedTermPdf =
             termModal.type === 'custom' &&
             normalizeScopeId((termModal as any).batchId) === GLOBAL_UNIFIED_TERM_BATCH_ID;
+        const { jsPDF, autoTable } = await loadPdfModules();
         const doc = new jsPDF({
             orientation: 'portrait',
             unit: 'mm',
@@ -10023,6 +10353,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const handleExportPDF = async () => {
         if (!data) return;
+        const { jsPDF, autoTable } = await loadPdfModules();
         const doc = new jsPDF('l', 'mm', 'a4');
         const ts = new Date().toLocaleString('pt-BR');
 
@@ -10104,13 +10435,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         doc.save(fileName);
     };
 
-    const handleExportDetailedExcel = () => {
+    const handleExportDetailedExcel = async () => {
         if (!data) {
             alert("Nenhum dado de auditoria disponível para exportação.");
             return;
         }
 
         try {
+            const XLSX = await loadXlsxModule();
             const allProductsData: any[] = [];
             let totalSysQty = 0;
             let totalCountedQty = 0;
@@ -10485,22 +10817,57 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             text.includes('categoria:');
     }, []);
 
-    const resolveCompletedAtForScope = useCallback((groupId: string, deptId: string, catId: string) => {
+    const completedAtByCategoryScope = useMemo(() => {
+        const byScope = new Map<string, string>();
         const completed = Array.isArray((data as any)?.partialCompleted) ? (data as any).partialCompleted : [];
-        let latestAt = '';
         completed.forEach((entry: any) => {
-            if (!isPartialScopeMatch(entry, groupId, deptId, catId)) return;
             const candidate = String(entry?.completedAt || entry?.startedAt || '').trim();
             if (!candidate) return;
-            if (!latestAt || new Date(candidate).getTime() > new Date(latestAt).getTime()) {
-                latestAt = candidate;
-            }
+            getScopeCategories(entry?.groupId, entry?.deptId, entry?.catId).forEach(({ group, dept, cat }) => {
+                const key = partialScopeKey({ groupId: group.id, deptId: dept.id, catId: cat.id });
+                const current = byScope.get(key);
+                if (!current || new Date(candidate).getTime() > new Date(current).getTime()) {
+                    byScope.set(key, candidate);
+                }
+            });
         });
-        return latestAt || null;
+        return byScope;
+    }, [data, getScopeCategories]);
+
+    const resolveCompletedAtForScope = useCallback((groupId: string, deptId: string, catId: string) => (
+        completedAtByCategoryScope.get(partialScopeKey({ groupId, deptId, catId })) || null
+    ), [completedAtByCategoryScope]);
+
+    useEffect(() => {
+        setIsAuditLookupIndexPrewarmed(false);
+        if (!data || typeof window === 'undefined') return;
+        let cancelled = false;
+        let idleId: number | null = null;
+        const timerId = window.setTimeout(() => {
+            const warm = () => {
+                idleId = null;
+                if (!cancelled) startTransition(() => setIsAuditLookupIndexPrewarmed(true));
+            };
+            const requestIdleCallback = (window as any).requestIdleCallback as undefined | ((cb: () => void, options?: { timeout?: number }) => number);
+            if (requestIdleCallback) idleId = requestIdleCallback(warm, { timeout: 4000 });
+            else warm();
+        }, 650);
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timerId);
+            const cancelIdleCallback = (window as any).cancelIdleCallback as undefined | ((id: number) => void);
+            if (idleId !== null && cancelIdleCallback) cancelIdleCallback(idleId);
+        };
     }, [data]);
 
+    const shouldBuildAuditLookupIndex =
+        isAuditLookupIndexPrewarmed ||
+        auditLookupOpen ||
+        !!auditLookup.trim() ||
+        !!postAdjustmentCode.trim();
+
     const auditLookupIndex = useMemo(() => {
-        if (!data) return [] as Array<{
+        if (!data || !shouldBuildAuditLookupIndex) return [] as Array<{
             groupId: string;
             groupName: string;
             deptId: string;
@@ -10578,7 +10945,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 )
             )
         );
-    }, [data, resolveCompletedAtForScope, stockCodeAliasesByReduced, cadastroBarcodeAliasesByReduced, barcodeAliasToReduced]);
+    }, [data, shouldBuildAuditLookupIndex, resolveCompletedAtForScope, stockCodeAliasesByReduced, cadastroBarcodeAliasesByReduced, barcodeAliasToReduced]);
 
     const normalizedAuditLookup = useMemo(() => normalizeLookupText(auditLookup), [auditLookup]);
     const normalizedAuditLookupCode = useMemo(() => normalizeProductLookupCode(auditLookup), [auditLookup]);
@@ -10639,6 +11006,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, [auditLookupIndex, normalizedPostAdjustmentCode, postAdjustmentCode, barcodeAliasToReduced]);
 
     const termAuditedProductItems = useMemo(() => {
+        if (!postAdjustmentProduct) return [];
         const metricsByKey = new Map<string, any>();
         Object.entries((((data as any)?.termExcelMetricsByKey || {}) as Record<string, any>)).forEach(([draftKey, metrics]) => {
             if (metrics) metricsByKey.set(draftKey, metrics);
@@ -10690,7 +11058,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         });
 
         return rows;
-    }, [data, termDrafts]);
+    }, [data, termDrafts, postAdjustmentProduct]);
 
     const postAdjustmentAuditedSnapshot = useMemo(() => {
         const product = postAdjustmentProduct;
@@ -12770,7 +13138,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         </div>
                                         {termForm.managerSignature2 ? (
                                             <div className="relative border border-slate-200 rounded-xl overflow-hidden bg-white h-40 flex items-center justify-center">
-                                                <img src={termForm.managerSignature2} alt="Assinatura Gestor" className="max-h-full" />
+                                                <img src={termForm.managerSignature2} alt="Assinatura Gestor" loading="lazy" decoding="async" className="max-h-full" />
                                                 {canFillTermSignatures && (
                                                     <button
                                                         type="button"
@@ -12783,7 +13151,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 )}
                                             </div>
                                         ) : canFillTermSignatures ? (
-                                            <SignaturePad onEnd={(dataUrl) => handleSignatureComplete('managerSignature2', dataUrl)} />
+                                            <DeferredRender>
+                                                {() => <SignaturePad onEnd={(dataUrl) => handleSignatureComplete('managerSignature2', dataUrl)} />}
+                                            </DeferredRender>
                                         ) : (
                                             <div className="border border-slate-100 rounded-xl bg-slate-50 h-40 flex items-center justify-center text-slate-400 text-[10px] font-bold uppercase tracking-widest italic">Assinatura Pendente</div>
                                         )}
@@ -12833,7 +13203,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         </div>
                                         {termForm.managerSignature ? (
                                             <div className="relative border border-slate-200 rounded-xl overflow-hidden bg-white h-40 flex items-center justify-center">
-                                                <img src={termForm.managerSignature} alt="Assinatura Gestor" className="max-h-full" />
+                                                <img src={termForm.managerSignature} alt="Assinatura Gestor" loading="lazy" decoding="async" className="max-h-full" />
                                                 {canFillTermSignatures && (
                                                     <button
                                                         type="button"
@@ -12846,7 +13216,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 )}
                                             </div>
                                         ) : canFillTermSignatures ? (
-                                            <SignaturePad onEnd={(dataUrl) => handleSignatureComplete('managerSignature', dataUrl)} />
+                                            <DeferredRender>
+                                                {() => <SignaturePad onEnd={(dataUrl) => handleSignatureComplete('managerSignature', dataUrl)} />}
+                                            </DeferredRender>
                                         ) : (
                                             <div className="border border-slate-100 rounded-xl bg-slate-50 h-40 flex items-center justify-center text-slate-400 text-[10px] font-bold uppercase tracking-widest italic">Assinatura Pendente</div>
                                         )}
@@ -12924,7 +13296,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                     )}
                                                     {collab.signature ? (
                                                         <div className="relative border border-slate-200 rounded-xl overflow-hidden bg-white h-40 flex items-center justify-center">
-                                                            <img src={collab.signature} alt="Assinatura Colaborador" className="max-h-full" />
+                                                            <img src={collab.signature} alt="Assinatura Colaborador" loading="lazy" decoding="async" className="max-h-full" />
                                                             {canFillTermSignatures && (
                                                                 <button
                                                                     type="button"
@@ -12940,30 +13312,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                             )}
                                                         </div>
                                                     ) : canFillTermSignatures ? (
-                                                        <SignaturePad
-                                                            label={`Assinatura ${collabNumber}`}
-                                                            onEnd={(dataUrl) => {
-                                                                // Salva imediatamente para não perder ao fechar modal rapidamente.
-                                                                updateTermForm(prev => ({
-                                                                    ...prev,
-                                                                    collaborators: prev.collaborators.map((c, i) => i === idx ? { ...c, signature: dataUrl } : c)
-                                                                }));
-                                                                void (async () => {
-                                                                    try {
-                                                                        const compressed = await ImageUtils.compressImage(dataUrl, { maxWidth: 600, quality: 0.6 });
+                                                        <DeferredRender minHeight={210}>
+                                                            {() => (
+                                                                <SignaturePad
+                                                                    label={`Assinatura ${collabNumber}`}
+                                                                    onEnd={(dataUrl) => {
+                                                                        // Salva imediatamente para não perder ao fechar modal rapidamente.
                                                                         updateTermForm(prev => ({
                                                                             ...prev,
-                                                                            collaborators: prev.collaborators.map((c, i) => {
-                                                                                if (i !== idx) return c;
-                                                                                return c.signature === dataUrl ? { ...c, signature: compressed } : c;
-                                                                            })
+                                                                            collaborators: prev.collaborators.map((c, i) => i === idx ? { ...c, signature: dataUrl } : c)
                                                                         }));
-                                                                    } catch {
-                                                                        // Mantém dataUrl original se compress falhar.
-                                                                    }
-                                                                })();
-                                                            }}
-                                                        />
+                                                                        void (async () => {
+                                                                            try {
+                                                                                const compressed = await ImageUtils.compressImage(dataUrl, { maxWidth: 600, quality: 0.6 });
+                                                                                updateTermForm(prev => ({
+                                                                                    ...prev,
+                                                                                    collaborators: prev.collaborators.map((c, i) => {
+                                                                                        if (i !== idx) return c;
+                                                                                        return c.signature === dataUrl ? { ...c, signature: compressed } : c;
+                                                                                    })
+                                                                                }));
+                                                                            } catch {
+                                                                                // Mantém dataUrl original se compress falhar.
+                                                                            }
+                                                                        })();
+                                                                    }}
+                                                                />
+                                                            )}
+                                                        </DeferredRender>
                                                     ) : (
                                                         <div className="border border-slate-100 rounded-xl bg-slate-50 h-40 flex items-center justify-center text-slate-400 text-[10px] font-bold uppercase tracking-widest italic">Assinatura Pendente</div>
                                                     )}
@@ -13020,6 +13396,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 </div>
 
                                 {termDisplayMetrics && (
+                                    <DeferredRender minHeight={220} rootMargin="500px 0px">
+                                    {() => (
                                     <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-3 sm:p-4 relative animate-in fade-in slide-in-from-top-2">
                                         {(() => {
                                             const termComparisonMetrics = termDisplayMetrics;
@@ -13252,11 +13630,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                                                         {/* CATEGORIES */}
                                                                                         <div className="p-2 bg-[#f8fafc] grid grid-cols-1 gap-1.5">
                                                                                             {dept.categories.map((cat: any, cIdx: number) => {
-                                                                                                const catItems = (termComparisonMetrics?.items || []).filter(
-                                                                                                    (item: any) =>
-                                                                                                        norm(item.catName) === norm(cat.name) &&
-                                                                                                        norm(item.deptName) === norm(dept.name)
-                                                                                                ).sort((a: any, b: any) => a.diffCost - b.diffCost);
+                                                                                                const catItems = termMetricItemIndexes.byCategory.get(
+                                                                                                    `${normalizeText(dept.name)}|${normalizeText(cat.name)}`
+                                                                                                ) || [];
                                                                                                 const catKey = `${dept.name}|${cat.name}`;
                                                                                                 return (
                                                                                                     <div key={cIdx} className="rounded-lg overflow-hidden border border-[#dcfce7]">
@@ -13339,10 +13715,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                                                         </div>
                                                                                         {/* Lista de códigos reduzidos para DIVERSOS */}
                                                                                         {dept.name === 'DIVERSOS (SEM DEPARTAMENTO)' && (() => {
-                                                                                            const diversosItems = (termComparisonMetrics?.items || []).filter(
-                                                                                                (item: any) =>
-                                                                                                    item.deptName === 'DIVERSOS (SEM DEPARTAMENTO)' &&
-                                                                                                    (Math.abs(item.diffQty) > 0.01 || Math.abs(item.diffCost) > 0.01)
+                                                                                            const diversosItems = (
+                                                                                                termMetricItemIndexes.byDepartment.get(normalizeText(dept.name)) || []
+                                                                                            ).filter((item: any) =>
+                                                                                                Math.abs(item.diffQty) > 0.01 || Math.abs(item.diffCost) > 0.01
                                                                                             );
                                                                                             if (diversosItems.length === 0) return null;
                                                                                             return (
@@ -13375,6 +13751,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             );
                                         })()}
                                     </div>
+                                    )}
+                                    </DeferredRender>
                                 )}
                             </div>
                         </div>
