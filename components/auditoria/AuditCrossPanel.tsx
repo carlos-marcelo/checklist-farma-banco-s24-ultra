@@ -87,6 +87,8 @@ type AuditProductSignal = {
     shortageCount: number;
     surplusCount: number;
     reversalCount: number;
+    exactReversalCount: number;
+    exactReversalQuantities: number[];
     branchCount: number;
     netQty: number;
     netCost: number;
@@ -187,6 +189,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
     const [panelView, setPanelView] = useState<'audits' | 'signals'>('audits');
     const [signalView, setSignalView] = useState<'transfers' | 'reversals' | 'recurrence' | 'hierarchy'>('transfers');
+    const [reversalFilter, setReversalFilter] = useState<'all' | 'exact'>('all');
     const [flowView, setFlowView] = useState<'branch' | 'area' | 'city'>('branch');
     const [expandedSignal, setExpandedSignal] = useState<string | null>(null);
 
@@ -269,7 +272,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     } : null;
 
     const auditSignals = useMemo(() => {
-        type ProductAccumulator = Omit<AuditProductSignal, 'events' | 'shortageCount' | 'surplusCount' | 'reversalCount' | 'branchCount' | 'netQty' | 'netCost' | 'absoluteCost' | 'score' | 'priority'> & {
+        type ProductAccumulator = Omit<AuditProductSignal, 'events' | 'shortageCount' | 'surplusCount' | 'reversalCount' | 'exactReversalCount' | 'exactReversalQuantities' | 'branchCount' | 'netQty' | 'netCost' | 'absoluteCost' | 'score' | 'priority'> & {
             events: Map<string, AuditSignalEvent>;
         };
         const products = new Map<string, ProductAccumulator>();
@@ -364,12 +367,27 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                 const currentSign = getSign(events[index]);
                 if (previousSign !== 0 && currentSign !== 0 && previousSign !== currentSign) reversalCount += 1;
             }
+            const shortageEvents = events.filter(event => event.diffQty < -0.01);
+            const surplusEvents = events.filter(event => event.diffQty > 0.01);
+            const usedSurplusIndexes = new Set<number>();
+            const exactReversalQuantities: number[] = [];
+            shortageEvents.forEach(shortage => {
+                const exactSurplusIndex = surplusEvents.findIndex((surplus, index) =>
+                    !usedSurplusIndexes.has(index) &&
+                    Math.abs(Math.abs(shortage.diffQty) - surplus.diffQty) <= 0.01
+                );
+                if (exactSurplusIndex < 0) return;
+                usedSurplusIndexes.add(exactSurplusIndex);
+                exactReversalQuantities.push(Math.abs(shortage.diffQty));
+            });
+            const exactReversalCount = exactReversalQuantities.length;
             const branches = new Set(events.map(event => event.branch));
             const netQty = events.reduce((sum, event) => sum + event.diffQty, 0);
             const netCost = events.reduce((sum, event) => sum + event.diffCost, 0);
             const absoluteCost = events.reduce((sum, event) => sum + Math.abs(event.diffCost), 0);
             const score = Math.round(
                 reversalCount * 35 +
+                exactReversalCount * 18 +
                 Math.max(0, shortageCount - 1) * 24 +
                 (branches.size > 1 ? 10 : 0) +
                 Math.min(25, Math.log10(absoluteCost + 1) * 8)
@@ -390,6 +408,8 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                 shortageCount,
                 surplusCount,
                 reversalCount,
+                exactReversalCount,
+                exactReversalQuantities,
                 branchCount: branches.size,
                 netQty,
                 netCost: Math.round(netCost * 100) / 100,
@@ -400,6 +420,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
         }).sort((a, b) => b.score - a.score || b.absoluteCost - a.absoluteCost);
 
         const reversals = productSignals.filter(item => item.reversalCount > 0);
+        const exactReversals = reversals.filter(item => item.exactReversalCount > 0);
         const reversalNetQty = reversals.reduce((sum, item) => sum + item.netQty, 0);
         const reversalNetCost = Math.round(reversals.reduce((sum, item) => sum + item.netCost, 0) * 100) / 100;
         const recurrentShortages = productSignals
@@ -513,6 +534,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             events: productSignals.reduce((sum, item) => sum + item.events.length, 0),
             highPriority: productSignals.filter(item => item.priority === 'high').length,
             reversals,
+            exactReversals,
             reversalNetQty,
             reversalNetCost,
             recurrentShortages,
@@ -527,6 +549,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             rowsWithCity
         };
     }, [deferredSignalRows]);
+    const displayedReversals = reversalFilter === 'exact' ? auditSignals.exactReversals : auditSignals.reversals;
 
     const renderProductSignal = (signal: AuditProductSignal, context: 'reversal' | 'recurrence') => {
         const expandedSignalKey = `${context}|${signal.reducedCode}`;
@@ -548,9 +571,14 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                             <p className="truncate text-[10px] font-black text-white">{signal.description}</p>
                             <p className="mt-0.5 text-[9px] font-bold text-indigo-300">Red. {signal.reducedCode}</p>
                         </div>
-                        <span className={`shrink-0 px-1.5 py-1 text-[8px] font-black uppercase ${signal.priority === 'high' ? 'bg-red-500/15 text-red-300' : signal.priority === 'medium' ? 'bg-amber-500/15 text-amber-300' : 'bg-slate-700 text-slate-300'}`}>
-                            {signal.priority === 'high' ? 'Alta' : signal.priority === 'medium' ? 'Média' : 'Revisar'}
-                        </span>
+                        <div className="flex shrink-0 flex-col items-end gap-1">
+                            {signal.exactReversalCount > 0 && (
+                                <span className="bg-cyan-500/15 px-1.5 py-1 text-[8px] font-black uppercase text-cyan-200">Qtd. exata</span>
+                            )}
+                            <span className={`px-1.5 py-1 text-[8px] font-black uppercase ${signal.priority === 'high' ? 'bg-red-500/15 text-red-300' : signal.priority === 'medium' ? 'bg-amber-500/15 text-amber-300' : 'bg-slate-700 text-slate-300'}`}>
+                                {signal.priority === 'high' ? 'Alta' : signal.priority === 'medium' ? 'Média' : 'Revisar'}
+                            </span>
+                        </div>
                     </div>
                     <p className="mt-2 line-clamp-2 text-[8px] font-bold uppercase leading-relaxed text-slate-500">
                         {signal.groupName} / {signal.deptName} / {signal.catName}
@@ -563,12 +591,17 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                     <div className={`mt-1 text-right text-[8px] font-black ${signal.netQty < 0 ? 'text-red-300' : signal.netQty > 0 ? 'text-emerald-300' : 'text-slate-400'}`}>
                         Divergência final: {formatSignedQuantity(signal.netQty)} un.
                     </div>
+                    {signal.exactReversalCount > 0 && (
+                        <div className="mt-2 border border-cyan-400/20 bg-cyan-500/[0.05] px-2 py-1.5 text-[8px] font-bold leading-relaxed text-cyan-100">
+                            Possível erro de conferência: {signal.exactReversalCount} inversão(ões) com quantidade exatamente oposta ({Array.from(new Set(signal.exactReversalQuantities)).map(value => `${value.toLocaleString('pt-BR')} un.`).join(', ')}).
+                        </div>
+                    )}
                 </button>
                 {isSignalExpanded && (
                     <div className="border-t border-white/10 px-3 pb-3">
                         <div className="py-2 text-[8px] font-bold leading-relaxed text-slate-400">
                             {context === 'reversal'
-                                ? `${signal.reversalCount} inversão(ões) de sinal em ${signal.branchCount} filial(is). Conferir sequência de contagem, movimentações e ajustes.`
+                                ? `${signal.reversalCount} inversão(ões) de sinal em ${signal.branchCount} filial(is). ${signal.exactReversalCount > 0 ? `${signal.exactReversalCount} com quantidade exatamente oposta, indicando possível erro de conferência. ` : ''}Conferir sequência de contagem, movimentações e ajustes.`
                                 : `${signal.shortageCount} registros de falta. A repetição indica necessidade de apuração operacional e documental.`}
                         </div>
                         <div className="divide-y divide-white/10 border-y border-white/10">
@@ -973,6 +1006,13 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                 <p className="text-[8px] font-black uppercase text-slate-500">Faltas recorrentes</p>
                                 <p className={`mt-1 text-lg font-black tabular-nums ${auditSignals.recurrentShortages.length > 0 ? 'text-red-300' : 'text-slate-300'}`}>{auditSignals.recurrentShortages.length}</p>
                             </div>
+                            <div className="col-span-2 flex items-center justify-between gap-3 border-t border-cyan-400/20 bg-cyan-500/[0.04] px-3 py-2">
+                                <div>
+                                    <p className="text-[8px] font-black uppercase text-cyan-200">Possível erro de conferência</p>
+                                    <p className="mt-0.5 text-[8px] font-bold text-slate-500">SKUs com falta e sobra de quantidade exatamente igual</p>
+                                </div>
+                                <span className={`text-sm font-black tabular-nums ${auditSignals.exactReversals.length > 0 ? 'text-cyan-200' : 'text-slate-300'}`}>{auditSignals.exactReversals.length}</span>
+                            </div>
                             <div className="col-span-2 flex items-center justify-between gap-3 border-t border-white/10 px-3 py-2">
                                 <span className="text-[8px] font-black uppercase text-slate-500">Reduzidos correlacionados entre filiais</span>
                                 <span className={`text-sm font-black tabular-nums ${auditSignals.transferMatches.length > 0 ? 'text-cyan-200' : 'text-slate-300'}`}>{new Set(auditSignals.transferMatches.map(match => match.reducedCode)).size}</span>
@@ -1056,9 +1096,33 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                             )}
 
                             {signalView === 'reversals' && (
-                                auditSignals.reversals.length > 0
-                                    ? auditSignals.reversals.slice(0, 30).map(signal => renderProductSignal(signal, 'reversal'))
-                                    : <div className="border-y border-white/10 py-8 text-center text-[10px] font-bold text-slate-500">Nenhuma inversão de falta para sobra neste recorte.</div>
+                                <>
+                                    <div className="grid grid-cols-2 border border-white/10">
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setReversalFilter('all');
+                                                setExpandedSignal(null);
+                                            }}
+                                            className={`h-8 px-2 text-[8px] font-black uppercase cursor-pointer ${reversalFilter === 'all' ? 'bg-amber-500/15 text-amber-200' : 'text-slate-500 hover:bg-white/5 hover:text-white'}`}
+                                        >
+                                            Todas {auditSignals.reversals.length}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setReversalFilter('exact');
+                                                setExpandedSignal(null);
+                                            }}
+                                            className={`h-8 px-2 text-[8px] font-black uppercase cursor-pointer ${reversalFilter === 'exact' ? 'bg-cyan-500/15 text-cyan-200' : 'text-slate-500 hover:bg-white/5 hover:text-white'}`}
+                                        >
+                                            Qtd. exata {auditSignals.exactReversals.length}
+                                        </button>
+                                    </div>
+                                    {displayedReversals.length > 0
+                                        ? displayedReversals.slice(0, 30).map(signal => renderProductSignal(signal, 'reversal'))
+                                        : <div className="border-y border-white/10 py-8 text-center text-[10px] font-bold text-slate-500">{reversalFilter === 'exact' ? 'Nenhuma inversão com quantidade exatamente oposta neste recorte.' : 'Nenhuma inversão de falta para sobra neste recorte.'}</div>}
+                                </>
                             )}
 
                             {signalView === 'recurrence' && (
