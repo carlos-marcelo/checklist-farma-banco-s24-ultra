@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useDeferredValue, useMemo, useState } from 'react';
 import {
     AlertTriangle,
     ArrowDownUp,
@@ -119,6 +119,7 @@ type AuditTransferMatch = {
     surplus: AuditSignalEvent;
     matchedQty: number;
     correlatedCost: number;
+    crossStatus: boolean;
     sameArea: boolean;
     sameCity: boolean | null;
 };
@@ -147,6 +148,8 @@ const formatSignedQuantity = (value: number) => `${value > 0 ? '+' : ''}${value.
     maximumFractionDigits: 0
 })}`;
 
+const formatAuditStatus = (status: AuditCrossStatus) => status === 'open' ? 'Aberta' : 'Concluída';
+
 const formatShortDate = (value: string) => {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return 'Data não informada';
@@ -163,6 +166,8 @@ const getBranchOrder = (branch: string) => {
     const value = Number(String(branch || '').match(/\d+/)?.[0] || Number.MAX_SAFE_INTEGER);
     return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
 };
+
+const EMPTY_AUDIT_CROSS_ROWS: AuditCrossRow[] = [];
 
 const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     rows,
@@ -187,6 +192,11 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
         () => Array.from(new Set(rows.map(row => row.area).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'pt-BR')),
         [rows]
     );
+    const statusCounts = useMemo(() => ({
+        all: rows.length,
+        open: rows.filter(row => row.status === 'open').length,
+        completed: rows.filter(row => row.status === 'completed').length
+    }), [rows]);
 
     const filteredRows = useMemo(() => {
         const normalizedSearch = search.trim().toLocaleLowerCase('pt-BR');
@@ -213,6 +223,9 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     }, [rows, selectedKeys]);
 
     const scopeRows = selectedRows.length > 0 ? selectedRows : filteredRows;
+    const shouldAnalyzeSignals = expanded && panelView === 'signals';
+    const deferredSignalRows = useDeferredValue(shouldAnalyzeSignals ? scopeRows : EMPTY_AUDIT_CROSS_ROWS);
+    const signalAnalysisPending = shouldAnalyzeSignals && deferredSignalRows !== scopeRows;
     const scopeSummary = useMemo(() => scopeRows.reduce((summary, row) => {
         summary.units += row.countedUnits;
         summary.diffQty += row.diffQty;
@@ -262,7 +275,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
         const normalizeCode = (value: unknown) => String(value ?? '').trim().replace(/\D/g, '').replace(/^0+/, '');
         const hierarchyValue = (value: unknown, fallback: string) => String(value || fallback).trim() || fallback;
 
-        scopeRows.forEach(row => {
+        deferredSignalRows.forEach(row => {
             (row.items || []).forEach(item => {
                 const reducedCode = normalizeCode(item.reducedCode);
                 const diffQty = Number(item.diffQty || 0);
@@ -402,15 +415,17 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                 .filter(surplus => surplus.branch !== shortage.branch)
                 .map(surplus => {
                     const hoursApart = Math.abs((Date.parse(shortage.updatedAt) || 0) - (Date.parse(surplus.updatedAt) || 0)) / 3_600_000;
+                    const crossStatus = shortage.status !== surplus.status;
                     const score =
                         (shortage.auditNumber === surplus.auditNumber ? 0 : 1_000) +
                         (shortage.area === surplus.area ? 0 : 100) +
+                        (crossStatus ? 0 : 25) +
                         Math.min(hoursApart, 10_000);
-                    return { shortage, surplus, score };
+                    return { shortage, surplus, score, crossStatus };
                 }))
                 .sort((a, b) => a.score - b.score);
 
-            candidates.forEach(({ shortage, surplus }) => {
+            candidates.forEach(({ shortage, surplus, crossStatus }) => {
                 const shortageQty = shortageRemaining.get(shortage.key) || 0;
                 const surplusQty = surplusRemaining.get(surplus.key) || 0;
                 if (shortageQty <= 0.01 || surplusQty <= 0.01) return;
@@ -432,6 +447,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                     surplus,
                     matchedQty,
                     correlatedCost: Math.round(correlatedCost * 100) / 100,
+                    crossStatus,
                     sameArea: shortage.area === surplus.area,
                     sameCity: shortageCity && surplusCity ? shortageCity === surplusCity : null
                 });
@@ -497,12 +513,14 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             hierarchy: hierarchySignals,
             products: productSignals,
             transferMatches: transferMatches.sort((a, b) => b.correlatedCost - a.correlatedCost),
+            crossStatusMatches: transferMatches.filter(match => match.crossStatus),
+            crossStatusProducts: new Set(transferMatches.filter(match => match.crossStatus).map(match => match.reducedCode)).size,
             branchFlows,
             areaFlows,
             cityFlows,
             rowsWithCity
         };
-    }, [scopeRows]);
+    }, [deferredSignalRows]);
 
     const renderProductSignal = (signal: AuditProductSignal, context: 'reversal' | 'recurrence') => {
         const expandedSignalKey = `${context}|${signal.reducedCode}`;
@@ -550,7 +568,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                 return (
                                     <div key={`${expandedSignalKey}|${event.key}`} className="py-2">
                                         <div className="flex items-center justify-between gap-2">
-                                            <span className="text-[9px] font-black text-white">{event.branch} · N{event.auditNumber}</span>
+                                            <span className="text-[9px] font-black text-white">{event.branch} · N{event.auditNumber} · {formatAuditStatus(event.status)}</span>
                                             <span className={`inline-flex items-center gap-1 text-[8px] font-black uppercase ${isShortage ? 'text-red-300' : 'text-emerald-300'}`}>
                                                 {isShortage ? <TrendingDown className="h-3 w-3" /> : <TrendingUp className="h-3 w-3" />}
                                                 {isShortage ? 'Falta' : 'Sobra'}
@@ -610,12 +628,15 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                         <span className="shrink-0 text-[8px] font-black text-cyan-200">{match.matchedQty.toLocaleString('pt-BR')} un.</span>
                                     </div>
                                     <div className="mt-1 grid grid-cols-2 gap-2 text-[8px] font-black">
-                                        <span className="text-red-300">Falta: {match.shortage.branch} {formatSignedQuantity(match.shortage.diffQty)}</span>
-                                        <span className="text-right text-emerald-300">Sobra: {match.surplus.branch} {formatSignedQuantity(match.surplus.diffQty)}</span>
+                                        <span className="text-red-300">Falta: {match.shortage.branch} ({formatAuditStatus(match.shortage.status)}) {formatSignedQuantity(match.shortage.diffQty)}</span>
+                                        <span className="text-right text-emerald-300">Sobra: {match.surplus.branch} ({formatAuditStatus(match.surplus.status)}) {formatSignedQuantity(match.surplus.diffQty)}</span>
                                     </div>
                                     <p className="mt-1 line-clamp-2 text-[8px] font-bold uppercase leading-relaxed text-slate-600">
                                         {match.groupName} / {match.deptName} / {match.catName}
                                     </p>
+                                    {match.crossStatus && (
+                                        <p className="mt-1 text-[8px] font-black uppercase text-cyan-300">Correlação entre auditoria aberta e concluída</p>
+                                    )}
                                     <div className="mt-1 flex items-center justify-between gap-2 text-[8px] font-bold text-slate-500">
                                         <span>{match.sameArea ? `Mesma área: ${match.shortage.area}` : `${match.shortage.area} → ${match.surplus.area}`}</span>
                                         <span>{formatCurrency(match.correlatedCost)}</span>
@@ -683,9 +704,9 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
 
                 <div className="mt-3 grid grid-cols-3 border border-white/10" aria-label="Filtrar por situação">
                     {([
-                        ['all', 'Todas'],
-                        ['open', 'Abertas'],
-                        ['completed', 'Concluídas']
+                        ['all', `Todas ${statusCounts.all}`],
+                        ['open', `Abertas ${statusCounts.open}`],
+                        ['completed', `Concluídas ${statusCounts.completed}`]
                     ] as const).map(([value, label]) => (
                         <button
                             key={value}
@@ -918,7 +939,9 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                 <div>
                                     <p className="text-[10px] font-black uppercase tracking-wider text-white">Análise indicativa</p>
                                     <p className="mt-1 text-[8px] font-bold leading-relaxed text-slate-500">
-                                        Sinais baseados nos termos do recorte atual. Servem para orientar conferência e apuração; não constituem conclusão de fraude.
+                                        {signalAnalysisPending
+                                            ? 'Preparando os cruzamentos em segundo plano...'
+                                            : 'Sinais baseados nos termos do recorte atual. Servem para orientar conferência e apuração; não constituem conclusão de fraude.'}
                                     </p>
                                 </div>
                             </div>
@@ -945,6 +968,12 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                 <span className="text-[8px] font-black uppercase text-slate-500">Reduzidos correlacionados entre filiais</span>
                                 <span className={`text-sm font-black tabular-nums ${auditSignals.transferMatches.length > 0 ? 'text-cyan-200' : 'text-slate-300'}`}>{new Set(auditSignals.transferMatches.map(match => match.reducedCode)).size}</span>
                             </div>
+                            {statusFilter === 'all' && (
+                                <div className="col-span-2 flex items-center justify-between gap-3 border-t border-cyan-400/20 bg-cyan-500/[0.04] px-3 py-2">
+                                    <span className="text-[8px] font-black uppercase text-cyan-200">Abertas × concluídas</span>
+                                    <span className={`text-sm font-black tabular-nums ${auditSignals.crossStatusProducts > 0 ? 'text-cyan-200' : 'text-slate-300'}`}>{auditSignals.crossStatusProducts} reduzido(s)</span>
+                                </div>
+                            )}
                         </div>
 
                         <div className="mt-3 grid grid-cols-4 border border-white/10">

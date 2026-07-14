@@ -1378,6 +1378,40 @@ const getAdjustedAuditTermMetricsFromData = (parsedData: any) => {
     };
 };
 
+type CachedAuditSessionAnalysis = {
+    sourceData: unknown;
+    parsedData: any;
+    termMetrics: ReturnType<typeof getAdjustedAuditTermMetricsFromData>;
+};
+
+const AUDIT_SESSION_ANALYSIS_CACHE_LIMIT = 48;
+const auditSessionAnalysisCache = new Map<string, CachedAuditSessionAnalysis>();
+
+const getCachedAuditSessionAnalysis = (session: any): CachedAuditSessionAnalysis => {
+    const sourceData = session?.data;
+    const cacheKey = [
+        String(session?.id || ''),
+        String(session?.branch || ''),
+        String(session?.audit_number || 0),
+        String(session?.updated_at || session?.created_at || '')
+    ].join('|');
+    const cached = auditSessionAnalysisCache.get(cacheKey);
+    if (cached && cached.sourceData === sourceData) return cached;
+
+    const parsedData = parseJsonValue<any>(sourceData) || sourceData || {};
+    const analysis: CachedAuditSessionAnalysis = {
+        sourceData,
+        parsedData,
+        termMetrics: getAdjustedAuditTermMetricsFromData(parsedData)
+    };
+    if (!auditSessionAnalysisCache.has(cacheKey) && auditSessionAnalysisCache.size >= AUDIT_SESSION_ANALYSIS_CACHE_LIMIT) {
+        const oldestKey = auditSessionAnalysisCache.keys().next().value as string | undefined;
+        if (oldestKey) auditSessionAnalysisCache.delete(oldestKey);
+    }
+    auditSessionAnalysisCache.set(cacheKey, analysis);
+    return analysis;
+};
+
 const getAuditCrossItemsFromMetrics = (metrics: any): AuditCrossItem[] => {
     const normalizeCode = (value: unknown) => String(value ?? '').trim().replace(/\D/g, '').replace(/^0+/, '');
     return (Array.isArray(metrics?.items) ? metrics.items : [])
@@ -6015,7 +6049,7 @@ const App: React.FC = () => {
                     .replace(/^0+/, '');
 
             latestByBranch.forEach((session, branchLabel) => {
-                const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+                const { parsedData, termMetrics: authoritativeTermMetrics } = getCachedAuditSessionAnalysis(session);
                 const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
                 const branchArea = branchToArea.get(branchLabel) || 'Sem Área';
                 const branchIndicators = {
@@ -6082,7 +6116,6 @@ const App: React.FC = () => {
                 branchIndicators.doneSkus = branchDoneSkuCodes.size + branchFallbackDoneSkus;
 
                 const sessionProducts: any[] = [];
-                const authoritativeTermMetrics = getAdjustedAuditTermMetricsFromData(parsedData);
                 const termSourceLabel = authoritativeTermMetrics?.source === 'global_unified'
                     ? 'Termo Unico Geral'
                     : 'Termos ativos agregados';
@@ -7666,6 +7699,8 @@ const App: React.FC = () => {
         setChecklistMobilePage(0);
     }, [historyFilterUser, historySearch, historyAreaFilter, historyDateRange]);
 
+    const dashboardAfterPartialCutoff = new Date(dashboardClockMinute).getHours() >= 18;
+
     const dashboardAuditOverview = useMemo(() => {
         type BranchMetric = {
             branch: string;
@@ -7696,7 +7731,7 @@ const App: React.FC = () => {
             companyName?: string;
         };
 
-        const isAfterPartialCutoff = new Date(dashboardClockMinute).getHours() >= 18;
+        const isAfterPartialCutoff = dashboardAfterPartialCutoff;
         const branchToArea = new Map<string, string>();
         const branchToCity = new Map<string, string>();
         const branchAreaToCompany = new Map<string, { id?: string; name?: string }>();
@@ -7730,14 +7765,8 @@ const App: React.FC = () => {
             }
         });
 
-        let filteredSessions = dashboardAuditSessions;
-        if (openAuditNumberFilter !== 'all') {
-            const tgtNum = Number(openAuditNumberFilter);
-            filteredSessions = filteredSessions.filter(s => Number(s.audit_number || 0) === tgtNum);
-        }
-
         const latestByBranchAndNumber = new Map<string, SupabaseService.DbAuditSession>();
-        filteredSessions.forEach(session => {
+        dashboardAuditSessions.forEach(session => {
             const branchLabel = normalizeBranchLabel(session.branch);
             const auditNumber = Number(session.audit_number || 0);
             const key = `${branchLabel}_${auditNumber}`;
@@ -7753,7 +7782,7 @@ const App: React.FC = () => {
             }
         });
 
-        const branches: BranchMetric[] = [];
+        let branches: BranchMetric[] = [];
         const uniqueSkuSet = new Set<string>();
         const uniqueSkuDoneSet = new Set<string>();
         const normalizeProductCode = (value: unknown) =>
@@ -7762,8 +7791,10 @@ const App: React.FC = () => {
                 .replace(/\D/g, '')
                 .replace(/^0+/, '');
         latestByBranchAndNumber.forEach((session) => {
+            const includeInDashboard = openAuditNumberFilter === 'all' ||
+                Number(session.audit_number || 0) === Number(openAuditNumberFilter);
             const branchLabel = normalizeBranchLabel(session.branch);
-            const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+            const { parsedData, termMetrics: authoritativeTermMetrics } = getCachedAuditSessionAnalysis(session);
             const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
             const partialStarts = Array.isArray(parsedData?.partialStarts)
                 ? parsedData.partialStarts
@@ -7813,8 +7844,10 @@ const App: React.FC = () => {
                                 }
                                 skuCodes.add(code);
                                 if (done) countedSkuCodes.add(code);
-                                uniqueSkuSet.add(code);
-                                if (done) uniqueSkuDoneSet.add(code);
+                                if (includeInDashboard) {
+                                    uniqueSkuSet.add(code);
+                                    if (done) uniqueSkuDoneSet.add(code);
+                                }
                             });
                         } else if (!fallbackCategoryKeys.has(fallbackKey)) {
                             fallbackCategoryKeys.add(fallbackKey);
@@ -7830,7 +7863,6 @@ const App: React.FC = () => {
             const totalSkus = skuCodes.size + fallbackTotalSkus;
             const countedSkus = countedSkuCodes.size + fallbackCountedSkus;
 
-            const authoritativeTermMetrics = getAdjustedAuditTermMetricsFromData(parsedData);
             let diffQty = 0;
             let diffCost = 0;
             let termsWithExcel = 0;
@@ -8197,6 +8229,11 @@ const App: React.FC = () => {
             if (branchOrder !== 0) return branchOrder;
             return a.auditNumber - b.auditNumber;
         });
+        const allBranches = branches.slice();
+        if (openAuditNumberFilter !== 'all') {
+            const targetAuditNumber = Number(openAuditNumberFilter);
+            branches = branches.filter(branch => branch.auditNumber === targetAuditNumber);
+        }
 
         const areaMap = new Map<string, {
             area: string;
@@ -8300,8 +8337,8 @@ const App: React.FC = () => {
             ? (summary.diffCost / summary.auditedBaseCost) * 100
             : 0;
 
-        return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
-    }, [dashboardAuditSessions, scopedCompanies, scopedUsers, openAuditNumberFilter, dashboardClockMinute]);
+        return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches, allBranches };
+    }, [dashboardAuditSessions, scopedCompanies, scopedUsers, openAuditNumberFilter, dashboardAfterPartialCutoff]);
 
     const dashboardCompletedAuditOverview = useMemo(() => {
         type BranchMetric = {
@@ -8365,9 +8402,6 @@ const App: React.FC = () => {
 
         const latestByBranchAndNumber = new Map<string, SupabaseService.DbAuditSession>();
         dashboardCompletedAuditSessions.forEach(session => {
-            if (completedAuditNumberFilter !== 'all' && String(session.audit_number || 0) !== completedAuditNumberFilter) {
-                return;
-            }
             const branchLabel = normalizeBranchLabel(session.branch);
             const auditNumber = Number(session.audit_number || 0);
             const key = `${branchLabel}_${auditNumber}`;
@@ -8383,7 +8417,7 @@ const App: React.FC = () => {
             }
         });
 
-        const branches: BranchMetric[] = [];
+        let branches: BranchMetric[] = [];
         const uniqueSkuSet = new Set<string>();
         const uniqueSkuDoneSet = new Set<string>();
         const normalizeProductCode = (value: unknown) =>
@@ -8392,8 +8426,10 @@ const App: React.FC = () => {
                 .replace(/\D/g, '')
                 .replace(/^0+/, '');
         latestByBranchAndNumber.forEach((session) => {
+            const includeInDashboard = completedAuditNumberFilter === 'all' ||
+                String(Number(session.audit_number || 0)) === completedAuditNumberFilter;
             const branchLabel = normalizeBranchLabel(session.branch);
-            const parsedData = parseJsonValue<any>(session.data) || session.data || {};
+            const { parsedData, termMetrics: authoritativeTermMetrics } = getCachedAuditSessionAnalysis(session);
             const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
 
             const skuCodes = new Set<string>();
@@ -8437,8 +8473,10 @@ const App: React.FC = () => {
                                 }
                                 skuCodes.add(code);
                                 if (done) countedSkuCodes.add(code);
-                                uniqueSkuSet.add(code);
-                                if (done) uniqueSkuDoneSet.add(code);
+                                if (includeInDashboard) {
+                                    uniqueSkuSet.add(code);
+                                    if (done) uniqueSkuDoneSet.add(code);
+                                }
                             });
                         } else if (!fallbackCategoryKeys.has(fallbackKey)) {
                             fallbackCategoryKeys.add(fallbackKey);
@@ -8454,7 +8492,6 @@ const App: React.FC = () => {
             const totalSkus = skuCodes.size + fallbackTotalSkus;
             const countedSkus = countedSkuCodes.size + fallbackCountedSkus;
 
-            const authoritativeTermMetrics = getAdjustedAuditTermMetricsFromData(parsedData);
             let diffQty = 0;
             let diffCost = 0;
             let termsWithExcel = 0;
@@ -8818,6 +8855,10 @@ const App: React.FC = () => {
             if (branchOrder !== 0) return branchOrder;
             return a.auditNumber - b.auditNumber;
         });
+        const allBranches = branches.slice();
+        if (completedAuditNumberFilter !== 'all') {
+            branches = branches.filter(branch => String(branch.auditNumber) === completedAuditNumberFilter);
+        }
 
         const areaMap = new Map<string, {
             area: string;
@@ -8904,7 +8945,7 @@ const App: React.FC = () => {
             ? (summary.diffCost / summary.auditedBaseCost) * 100
             : 0;
 
-        return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches };
+        return { summary, accumulatedPct, summaryDivergencePct, uniqueTotalSkus, uniqueCountedSkus, uniquePendingSkus, areas, branches, allBranches };
     }, [dashboardCompletedAuditSessions, scopedCompanies, scopedUsers, completedAuditNumberFilter]);
 
     const auditCrossRows = useMemo<AuditCrossRow[]>(() => {
@@ -8928,10 +8969,10 @@ const App: React.FC = () => {
         });
 
         return [
-            ...dashboardAuditOverview.branches.map(branch => mapBranch(branch, 'open')),
-            ...dashboardCompletedAuditOverview.branches.map(branch => mapBranch(branch, 'completed'))
+            ...dashboardAuditOverview.allBranches.map(branch => mapBranch(branch, 'open')),
+            ...dashboardCompletedAuditOverview.allBranches.map(branch => mapBranch(branch, 'completed'))
         ];
-    }, [dashboardAuditOverview.branches, dashboardCompletedAuditOverview.branches]);
+    }, [dashboardAuditOverview.allBranches, dashboardCompletedAuditOverview.allBranches]);
 
 
     const handleOpenAreaPartialFromDashboard = useCallback((areaName: string) => {
@@ -10075,10 +10116,18 @@ const App: React.FC = () => {
                                         }}
                                         onExport={(status) => {
                                             if (status === 'completed') {
-                                                void handleExportAllCompletedAuditsExcel();
+                                                void handleExportNetworkAuditsExcel(
+                                                    dashboardCompletedAuditSessions,
+                                                    'completed',
+                                                    'all'
+                                                );
                                                 return;
                                             }
-                                            void handleExportAllOpenAuditsExcel();
+                                            void handleExportNetworkAuditsExcel(
+                                                dashboardAuditSessions,
+                                                'open',
+                                                'all'
+                                            );
                                         }}
                                         onOpenAudit={(row) => handleOpenAuditFromDashboardBranch(
                                             row.branch,
@@ -13715,7 +13764,10 @@ const App: React.FC = () => {
                                             <div className="relative">
                                                 <select
                                                     value={openAuditNumberFilter}
-                                                    onChange={(e) => setOpenAuditNumberFilter(e.target.value)}
+                                                    onChange={(e) => {
+                                                        const nextValue = e.target.value;
+                                                        startTransition(() => setOpenAuditNumberFilter(nextValue));
+                                                    }}
                                                     className="h-10 min-w-[210px] appearance-none bg-white border border-gray-200 text-gray-700 text-xs font-black uppercase tracking-widest rounded-xl px-4 pr-8 hover:bg-gray-50 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
                                                 >
                                                     <option value="all">Todas as auditorias</option>
@@ -14029,7 +14081,10 @@ const App: React.FC = () => {
                                                 <FileSpreadsheet size={14} />
                                                 Excel Detalhado Rede
                                             </button>
-                                            <select value={completedAuditNumberFilter} onChange={e => setCompletedAuditNumberFilter(e.target.value)} className="h-10 min-w-[210px] px-3 rounded-xl border border-gray-200 text-xs font-bold text-gray-700 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+                                            <select value={completedAuditNumberFilter} onChange={e => {
+                                                const nextValue = e.target.value;
+                                                startTransition(() => setCompletedAuditNumberFilter(nextValue));
+                                            }} className="h-10 min-w-[210px] px-3 rounded-xl border border-gray-200 text-xs font-bold text-gray-700 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
                                                 <option value="all">Todas as auditorias</option>
                                                 {Array.from(new Set(dashboardCompletedAuditSessions.map(s => String(s.audit_number || 0)))).sort((a,b)=>Number(b)-Number(a)).map(num => (<option key={num} value={num}>Auditoria {num}</option>))}
                                             </select>
