@@ -18,6 +18,12 @@ import { ImageUtils } from './src/utils/imageUtils';
 import { CadastrosBaseService } from './src/cadastrosBase/cadastrosBaseService';
 import { PRE_VENCIDOS_MODULE_ENABLED } from './src/featureFlags';
 import * as StockStorage from './src/stockConference/storage';
+import {
+    getCompanyAreasSignature,
+    resolveBranchArea,
+    resolveBranchCity,
+    stabilizeCompanyAreas
+} from './src/branchDirectory';
 
 
 const mergeAccessMatrixWithDefaults = (incoming: Partial<Record<AccessLevelId, Record<string, boolean>>>) => {
@@ -314,11 +320,7 @@ const getAuditBranchCity = (parsedData: any, rawBranch?: string | null): string 
         parsedData?.metadata?.cidade
     ];
     const explicit = candidates.find(value => typeof value === 'string' && value.trim());
-    if (explicit) return String(explicit).trim();
-
-    const label = String(rawBranch || '').replace(/\s+/g, ' ').trim();
-    const suffix = label.match(/(?:filial|loja|unidade)\s*\d+\s*(?:[-–|/])\s*(.+)$/i)?.[1]?.trim();
-    return suffix && /[a-záàâãéèêíïóôõöúçñ]/i.test(suffix) ? suffix : undefined;
+    return resolveBranchCity(rawBranch, explicit);
 };
 
 const normalizeBranchDigits = (digits: string) => digits.replace(/^0+(?=\d)/, '');
@@ -3474,7 +3476,10 @@ const App: React.FC = () => {
 
         const applyCompanies = (rows: any[] | null | undefined) => {
             if (!rows || rows.length === 0 || cancelled) return;
-            setCompanies(rows);
+            setCompanies(rows.map(company => ({
+                ...company,
+                areas: stabilizeCompanyAreas(company?.name, company?.areas)
+            })));
         };
 
         const applyAccessMatrix = (rows: any[] | null | undefined) => {
@@ -3497,7 +3502,8 @@ const App: React.FC = () => {
                 CacheService.fetchWithCache(CACHE_KEY_COMPANIES, SupabaseService.fetchCompanies, applyDeferred(applyCompanies), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
                     revalidate: 'stale',
-                    timeoutMs: 8000
+                    timeoutMs: 8000,
+                    compare: (cached, remote) => getCompanyAreasSignature(cached) !== getCompanyAreasSignature(remote)
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_ACCESS, SupabaseService.fetchAccessMatrix, applyDeferred(applyAccessMatrix), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
@@ -6128,7 +6134,11 @@ const App: React.FC = () => {
             latestByBranch.forEach((session, branchLabel) => {
                 const { parsedData, termMetrics: authoritativeTermMetrics } = getCachedAuditSessionAnalysis(session);
                 const groups = Array.isArray(parsedData?.groups) ? parsedData.groups : [];
-                const branchArea = branchToArea.get(branchLabel) || 'Sem Área';
+                const branchArea = branchToArea.get(branchLabel) || resolveBranchArea(
+                    branchLabel,
+                    scopedCompanies.flatMap(company => company?.areas || []),
+                    'Sem Área'
+                );
                 const branchIndicators = {
                     totalSkus: 0,
                     doneSkus: 0,
@@ -8273,7 +8283,11 @@ const App: React.FC = () => {
             const progressPct = isCompleted ? 100 : calculatedProgress;
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
 
-            const branchArea = branchToArea.get(branchLabel) || 'Sem Área';
+            const branchArea = branchToArea.get(branchLabel) || resolveBranchArea(
+                branchLabel,
+                scopedCompanies.flatMap(company => company?.areas || []),
+                'Sem Área'
+            );
             const branchCity = getAuditBranchCity(parsedData, session.branch) || branchToCity.get(branchLabel);
             const companyInfo = branchAreaToCompany.get(`${normalizeFilterKey(branchArea)}|${branchLabel}`) || branchToCompany.get(branchLabel);
             branches.push({
@@ -8922,7 +8936,11 @@ const App: React.FC = () => {
             const progressPct = isCompleted ? 100 : calculatedProgress;
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
 
-            const branchArea = branchToArea.get(branchLabel) || 'Sem Área';
+            const branchArea = branchToArea.get(branchLabel) || resolveBranchArea(
+                branchLabel,
+                scopedCompanies.flatMap(company => company?.areas || []),
+                'Sem Área'
+            );
             const branchCity = getAuditBranchCity(parsedData, session.branch) || branchToCity.get(branchLabel);
             const companyInfo = branchAreaToCompany.get(`${normalizeFilterKey(branchArea)}|${branchLabel}`) || branchToCompany.get(branchLabel);
             branches.push({

@@ -9,6 +9,12 @@ import { Loader2, DollarSign, Target, Activity, MonitorSmartphone, Package, Tren
 import { User, CompanyArea } from '../../types';
 import * as SupabaseService from '../../supabaseService';
 import { CacheService } from '../../src/cacheService';
+import {
+    BRANCH_DIRECTORY_VERSION,
+    resolveBranchArea,
+    resolveBranchCity,
+    stabilizeCompanyAreas
+} from '../../src/branchDirectory';
 
 interface AnaliseDashboardProps {
     currentUser: User;
@@ -88,17 +94,25 @@ const formatDateToBr = (dateStr?: string) => {
 export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser, companies = [] }) => {
     const dashboardRef = useRef<HTMLDivElement>(null);
     const [isExporting, setIsExporting] = useState(false);
+    const currentCompany = useMemo(
+        () => companies.find(c => c.id === currentUser?.company_id),
+        [companies, currentUser?.company_id]
+    );
+    const effectiveCompanyAreas = useMemo(
+        () => stabilizeCompanyAreas(currentCompany?.name, currentCompany?.areas),
+        [currentCompany?.name, currentCompany?.areas]
+    );
     const companyAreasSignature = useMemo(() => {
-        const company = companies.find(c => c.id === currentUser?.company_id);
-        if (!company) return currentUser?.company_id || '';
+        if (!currentCompany) return `${currentUser?.company_id || ''}|${BRANCH_DIRECTORY_VERSION}`;
         return JSON.stringify({
-            id: company.id,
-            areas: (company.areas || []).map((area: CompanyArea) => ({
+            id: currentCompany.id,
+            directoryVersion: BRANCH_DIRECTORY_VERSION,
+            areas: effectiveCompanyAreas.map((area: CompanyArea) => ({
                 name: area.name,
                 branches: [...(area.branches || [])].sort()
             })).sort((a: any, b: any) => String(a.name).localeCompare(String(b.name), 'pt-BR'))
         });
-    }, [companies, currentUser?.company_id]);
+    }, [currentCompany, currentUser?.company_id, effectiveCompanyAreas]);
 
     const [rawState, setRawState] = useState<RawDataState>({
         loading: true,
@@ -136,42 +150,11 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
 
     // Build area mapping
     const getAreaForBranch = (rawBranchString: string): string => {
-        if (!companies || companies.length === 0) return 'Geral';
-        const company = companies.find(c => c.id === currentUser?.company_id);
-        if (!company || !company.areas) return 'Geral';
-        
-        const rawNormalized = rawBranchString.toLowerCase().trim();
-        const rawNumMatch = rawBranchString.match(/\d+/);
-        const rawNum = rawNumMatch ? parseInt(rawNumMatch[0]) : null;
-
-        for (const area of company.areas as CompanyArea[]) {
-            for (const b of area.branches) {
-                const bNormalized = b.toLowerCase().trim();
-                if (!bNormalized) continue;
-
-                if (rawNormalized.includes(bNormalized) || bNormalized.includes(rawNormalized)) return area.name;
-                const bNumMatch = b.match(/\d+/);
-                const bNum = bNumMatch ? parseInt(bNumMatch[0]) : null;
-                if (rawNum !== null && bNum !== null && rawNum === bNum) return area.name;
-                if ((rawNormalized.includes('matriz') || rawNormalized.includes('geral')) && 
-                    (bNormalized.includes('matriz') || bNormalized.includes('geral'))) return area.name;
-            }
-        }
-        return 'Geral';
+        return resolveBranchArea(rawBranchString, effectiveCompanyAreas, 'Geral');
     };
 
     const getCityForBranch = (bName: string): string => {
-        const n = bName.toUpperCase();
-        if (n.includes('MATRIZ') || n.includes('SAO GABRIEL') || n.includes('SÃO GABRIEL')) return 'SÃO GABRIEL';
-        if (n.includes('LIVRAMENTO')) return 'LIVRAMENTO';
-        if (n.includes('ROSARIO')) return 'ROSARIO';
-        if (n.includes('SANTIAGO')) return 'SANTIAGO';
-        if (n.includes('ALEGRETE')) return 'ALEGRETE';
-        if (n.includes('CACAPAVA')) return 'CACAPAVA';
-        if (n.includes('QUARAI')) return 'QUARAÍ';
-        if (n.includes('SÃO BORJA') || n.includes('SAO BORJA')) return 'SÃO BORJA';
-        
-        return 'SÃO GABRIEL'; // Fallback
+        return resolveBranchCity(bName) || 'Cidade não cadastrada';
     };
 
     useEffect(() => {
@@ -185,7 +168,10 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
 
                 const cacheKey = `analysis_resultados_parsed_${companyId}`;
                 const cached = await CacheService.get<AnalysisParsedCache>(cacheKey);
-                if (cached?.state) {
+                const cacheUsesCurrentDirectory = Boolean(
+                    cached?.signature?.includes(BRANCH_DIRECTORY_VERSION)
+                );
+                if (cached?.state && cacheUsesCurrentDirectory) {
                     hadUsableCache = true;
                     if (!cancelled) {
                         startTransition(() => {
@@ -212,7 +198,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     throw new Error("Arquivo de 'Vendas Totais' não encontrado. Carregue o arquivo em Cadastros Base.");
                 }
 
-                if (cached?.signature === metadataSignature && cached.state) {
+                if (cacheUsesCurrentDirectory && cached?.signature === metadataSignature && cached.state) {
                     return;
                 }
 
