@@ -541,7 +541,8 @@ const normalizePostAuditAdjustments = (value: unknown): PostAuditAdjustment[] =>
                 catName: item?.catName ? String(item.catName) : undefined,
                 note: item?.note ? String(item.note) : undefined,
                 createdAt: String(item?.createdAt || new Date().toISOString()),
-                createdBy: item?.createdBy ? String(item.createdBy) : undefined
+                createdBy: item?.createdBy ? String(item.createdBy) : undefined,
+                createdByName: item?.createdByName ? String(item.createdByName) : undefined
             };
         })
         .filter((item): item is PostAuditAdjustment => !!item);
@@ -11314,7 +11315,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             catName: product.catName,
             note: postAdjustmentNote.trim() || undefined,
             createdAt: new Date().toISOString(),
-            createdBy: userEmail
+            createdBy: userEmail,
+            createdByName: userName || undefined
         };
         setIsSavingPostAdjustment(true);
         try {
@@ -12590,9 +12592,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             Ajustes após auditoria
                                         </h2>
                                     </div>
-                                    <div className={`text-right text-xs font-black tabular-nums ${postAuditAdjustmentTotals.cost < 0 ? 'text-red-600' : postAuditAdjustmentTotals.cost > 0 ? 'text-emerald-600' : 'text-slate-400'}`}>
-                                        <div>{postAuditAdjustmentTotals.quantity > 0 ? '+' : ''}{postAuditAdjustmentTotals.quantity.toLocaleString('pt-BR')} un.</div>
-                                        <div>{postAuditAdjustmentTotals.cost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</div>
+                                    <div className={`shrink-0 text-right text-xs font-black tabular-nums whitespace-nowrap ${postAuditAdjustmentTotals.cost < 0 ? 'text-red-600' : postAuditAdjustmentTotals.cost > 0 ? 'text-emerald-600' : 'text-slate-400'}`}>
+                                        <div className="whitespace-nowrap">{postAuditAdjustmentTotals.quantity > 0 ? '+' : ''}{postAuditAdjustmentTotals.quantity.toLocaleString('pt-BR')} un.</div>
+                                        <div className="whitespace-nowrap">{postAuditAdjustmentTotals.cost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</div>
                                     </div>
                                 </div>
 
@@ -12603,13 +12605,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     </div>
                                     <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 min-w-0">
                                         <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Qtd</p>
-                                        <p className={`text-lg font-black tabular-nums ${postAuditAdjustmentTotals.quantity < 0 ? 'text-red-600' : postAuditAdjustmentTotals.quantity > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
+                                        <p className={`text-lg font-black tabular-nums whitespace-nowrap ${postAuditAdjustmentTotals.quantity < 0 ? 'text-red-600' : postAuditAdjustmentTotals.quantity > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
                                             {postAuditAdjustmentTotals.quantity > 0 ? '+' : ''}{postAuditAdjustmentTotals.quantity.toLocaleString('pt-BR')}
                                         </p>
                                     </div>
                                     <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 min-w-0">
                                         <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Valor</p>
-                                        <p className={`text-base font-black tabular-nums leading-tight ${postAuditAdjustmentTotals.cost < 0 ? 'text-red-600' : postAuditAdjustmentTotals.cost > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
+                                        <p className={`text-sm sm:text-base font-black tabular-nums leading-tight whitespace-nowrap ${postAuditAdjustmentTotals.cost < 0 ? 'text-red-600' : postAuditAdjustmentTotals.cost > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
                                             {postAuditAdjustmentTotals.cost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
                                         </p>
                                     </div>
@@ -12772,6 +12774,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                         {adjustment.note && (
                                                             <p className="mt-1 text-[10px] font-semibold text-slate-500 break-words">{adjustment.note}</p>
                                                         )}
+                                                        <div className="mt-2 border-t border-slate-200/80 pt-2 text-[9px] font-bold leading-relaxed text-slate-500">
+                                                            <p className="break-all">
+                                                                Lançado por: <span className="font-black text-slate-700">{adjustment.createdByName || adjustment.createdBy || 'Usuário não informado'}</span>
+                                                                {adjustment.createdByName && adjustment.createdBy ? ` (${adjustment.createdBy})` : ''}
+                                                            </p>
+                                                            <p>
+                                                                Data e hora: <span className="font-black text-slate-700">{adjustment.createdAt && Number.isFinite(Date.parse(adjustment.createdAt))
+                                                                    ? new Date(adjustment.createdAt).toLocaleString('pt-BR', { hour12: false })
+                                                                    : 'Não informadas'}</span>
+                                                            </p>
+                                                        </div>
                                                     </div>
                                                     <button
                                                         onClick={() => void removePostAuditAdjustment(adjustment.id)}
@@ -12785,17 +12798,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] font-black">
                                                     <div className="rounded-lg bg-white border border-slate-100 px-2 py-1">
                                                         <span className="block text-slate-400 uppercase">Qtd</span>
-                                                        <span className={adjustment.quantity < 0 ? 'text-red-600' : 'text-emerald-600'}>
+                                                        <span className={`block whitespace-nowrap tabular-nums ${adjustment.quantity < 0 ? 'text-red-600' : 'text-emerald-600'}`}>
                                                             {adjustment.quantity > 0 ? '+' : ''}{adjustment.quantity.toLocaleString('pt-BR')}
                                                         </span>
                                                     </div>
                                                     <div className="rounded-lg bg-white border border-slate-100 px-2 py-1">
                                                         <span className="block text-slate-400 uppercase">Custo</span>
-                                                        <span className="text-slate-700">{adjustment.unitCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                                                        <span className="block whitespace-nowrap tabular-nums text-slate-700">{adjustment.unitCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
                                                     </div>
                                                     <div className="rounded-lg bg-white border border-slate-100 px-2 py-1">
                                                         <span className="block text-slate-400 uppercase">Total</span>
-                                                        <span className={adjustment.totalCost < 0 ? 'text-red-600' : 'text-emerald-600'}>
+                                                        <span className={`block whitespace-nowrap tabular-nums ${adjustment.totalCost < 0 ? 'text-red-600' : 'text-emerald-600'}`}>
                                                             {adjustment.totalCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
                                                         </span>
                                                     </div>

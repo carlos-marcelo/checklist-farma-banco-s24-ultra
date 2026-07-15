@@ -39,6 +39,7 @@ export interface PostAuditAdjustment {
     note?: string;
     createdAt: string;
     createdBy?: string;
+    createdByName?: string;
 }
 
 export interface Category {
