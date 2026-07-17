@@ -31,6 +31,11 @@ const memoryMeta = new Map<string, CacheMeta>();
 const scheduledRevalidations = new Set<string>();
 const pendingPersistentWrites = new Map<string, { data: unknown; meta: CacheMeta }>();
 let persistentWriteHandle: number | null = null;
+let remoteFailureStreak = 0;
+let remoteCircuitOpenUntil = 0;
+
+const REMOTE_BACKOFF_BASE_MS = 15_000;
+const REMOTE_BACKOFF_MAX_MS = 2 * 60_000;
 
 const scheduleWhenIdle = (task: () => void, timeoutMs = 1200) => {
     if (typeof window === 'undefined') {
@@ -101,6 +106,40 @@ const withTimeout = async <T>(promise: Promise<T>, timeoutMs?: number): Promise<
             }
         );
     });
+};
+
+const isTimeoutError = (error: unknown): boolean =>
+    error instanceof Error && /^timeout \d+ms$/.test(error.message);
+
+const isTransientRemoteError = (error: unknown): boolean => {
+    const candidate = (error || {}) as Record<string, unknown>;
+    const status = Number(candidate.status || candidate.statusCode || 0);
+    const code = String(candidate.code || '').toUpperCase();
+    const message = String(candidate.message || error || '').toLowerCase();
+    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504 ||
+        status === 520 || status === 521 || status === 522 || status === 523 || status === 524 ||
+        code === 'PGRST002' || code === 'PGRST000' ||
+        message.includes('bad gateway') ||
+        message.includes('service unavailable') ||
+        message.includes('origin time-out') ||
+        message.includes('schema cache') ||
+        message.includes('failed to fetch');
+};
+
+const registerRemoteFailure = (error: unknown) => {
+    if (!isTransientRemoteError(error)) return;
+    remoteFailureStreak = Math.min(remoteFailureStreak + 1, 5);
+    const delay = Math.min(
+        REMOTE_BACKOFF_MAX_MS,
+        REMOTE_BACKOFF_BASE_MS * (2 ** Math.max(0, remoteFailureStreak - 1))
+    );
+    remoteCircuitOpenUntil = Math.max(remoteCircuitOpenUntil, Date.now() + delay);
+};
+
+const registerRemoteSuccess = () => {
+    if (remoteFailureStreak === 0) return;
+    remoteFailureStreak = Math.max(0, remoteFailureStreak - 1);
+    if (remoteFailureStreak === 0) remoteCircuitOpenUntil = 0;
 };
 
 const getValueTimestamp = (value: any): string => {
@@ -232,8 +271,19 @@ export const CacheService = {
             const existing = inFlightRequests.get(key) as Promise<T | null> | undefined;
             if (existing) return existing;
 
-            const remoteRequest = withTimeout(Promise.resolve().then(remoteFetch), options.timeoutMs)
+            // Quando o PostgREST/origin sinaliza indisponibilidade, todas as telas tendem a
+            // revalidar ao mesmo tempo. Durante a pausa, servimos somente o snapshot local.
+            if (Date.now() < remoteCircuitOpenUntil) {
+                scheduledRevalidations.delete(key);
+                return Promise.resolve(cachedData);
+            }
+
+            // O timeout deve liberar somente quem está aguardando pela resposta. A consulta
+            // original continua em segundo plano para aquecer o cache assim que o banco responder.
+            const sourceRequest = Promise.resolve()
+                .then(remoteFetch)
                 .then(async (remoteData) => {
+                    registerRemoteSuccess();
                     if (remoteData !== null) {
                         const changed = hasDataChanged(cachedData, cachedMeta, remoteData, options.compare);
                         await CacheService.set(key, remoteData);
@@ -246,15 +296,37 @@ export const CacheService = {
                     return cachedData;
                 })
                 .catch(err => {
+                    registerRemoteFailure(err);
                     console.error(`[CacheService] Erro na busca remota para ${key}:`, err);
                     return cachedData;
-                })
-                .finally(() => {
+                });
+
+            const visibleRequest = withTimeout(sourceRequest, options.timeoutMs)
+                .catch(err => {
+                    if (isTimeoutError(err)) {
+                        console.warn(
+                            `[CacheService] ${key} excedeu ${options.timeoutMs}ms; ` +
+                            'a sincronização continuará em segundo plano.'
+                        );
+                    } else {
+                        console.error(`[CacheService] Erro ao aguardar ${key}:`, err);
+                    }
+                    return cachedData;
+                });
+
+            inFlightRequests.set(key, visibleRequest);
+
+            const clearInFlight = () => {
+                // Só libera a chave quando a consulta real terminar. Isso impede que um timeout
+                // gere novas consultas iguais enquanto a anterior ainda está no Cloudflare/banco.
+                if (inFlightRequests.get(key) === visibleRequest) {
                     inFlightRequests.delete(key);
                     scheduledRevalidations.delete(key);
-                });
-            inFlightRequests.set(key, remoteRequest);
-            return remoteRequest;
+                }
+            };
+            void sourceRequest.then(clearInFlight, clearInFlight);
+
+            return visibleRequest;
         };
 
         // Se tem cache, retorna o cache e deixa o remoto rodando em background

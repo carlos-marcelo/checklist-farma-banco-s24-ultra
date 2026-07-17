@@ -3099,6 +3099,24 @@ const LoginScreen = ({
 
 // --- MAIN APP ---
 
+const isTransientPostgrestError = (error: unknown): boolean => {
+    const candidate = (error || {}) as Record<string, unknown>;
+    const status = Number(candidate.status || candidate.statusCode || 0);
+    const code = String(candidate.code || '').toUpperCase();
+    const message = String(candidate.message || error || '').toLowerCase();
+    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504 ||
+        status === 520 || status === 521 || status === 522 || status === 523 || status === 524 ||
+        code === 'PGRST000' || code === 'PGRST002' ||
+        message.includes('bad gateway') ||
+        message.includes('service unavailable') ||
+        message.includes('schema cache') ||
+        message.includes('origin time-out') ||
+        message.includes('failed to fetch');
+};
+
+const getPostgrestRetryDelay = (failures: number): number =>
+    Math.min(2 * 60_000, 15_000 * (2 ** Math.max(0, Math.min(failures, 4) - 1)));
+
 const App: React.FC = () => {
     // Migration State
     const [showMigrationPanel, setShowMigrationPanel] = useState(false);
@@ -3203,6 +3221,10 @@ const App: React.FC = () => {
     const [completedAuditAreaFilter, setCompletedAuditAreaFilter] = useState<string>('all');
     const auditCrossLoadScheduledRef = useRef(false);
     const dashboardAuditLoadScheduledRef = useRef(false);
+    const dashboardOpenAuditRequestRef = useRef<Promise<void> | null>(null);
+    const dashboardCompletedAuditRequestRef = useRef<Promise<void> | null>(null);
+    const dashboardAuditBackoffRef = useRef({ failures: 0, retryAt: 0, lastLoggedAt: 0 });
+    const [dashboardAuditRetryAt, setDashboardAuditRetryAt] = useState(0);
     const [dashboardClockMinute, setDashboardClockMinute] = useState(() => Date.now());
     const [areaPartialActionLoading, setAreaPartialActionLoading] = useState<string | null>(null);
     const [areaPartialDialog, setAreaPartialDialog] = useState<{
@@ -3300,6 +3322,7 @@ const App: React.FC = () => {
     const [profilePhoneError, setProfilePhoneError] = useState('');
     const [syncStatus, setSyncStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
     const saveDraftAbortControllerRef = useRef<AbortController | null>(null);
+    const draftRemoteSyncInFlightRef = useRef(false);
     const clientIdRef = useRef<string>(Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
     const foregroundQuietUntilRef = useRef(0);
 
@@ -3328,9 +3351,10 @@ const App: React.FC = () => {
     // User Activity
     const [lastUserActivity, setLastUserActivity] = useState<number>(Date.now());
     const ACTIVITY_TIMEOUT = 5000;
-    const SESSION_COMMAND_POLL_MS = 5000;
-    const USER_APPROVAL_POLL_MS = 15000;
-    const MASTER_SESSIONS_POLL_MS = 15000;
+    const DRAFT_REMOTE_SYNC_POLL_MS = 60_000;
+    const HEARTBEAT_INTERVAL_MS = 30_000;
+    const USER_APPROVAL_POLL_MS = 30_000;
+    const MASTER_SESSIONS_POLL_MS = 30_000;
     const MASTER_FORCE_LOGOUT_SWEEP_MS = 5000;
     const viewStartRef = useRef<{ view: string; startedAt: number } | null>(null);
     const autoLoginLoggedRef = useRef(false);
@@ -3341,6 +3365,7 @@ const App: React.FC = () => {
     const [isOnline, setIsOnline] = useState(navigator.onLine);
     const [activeSessions, setActiveSessions] = useState<SupabaseService.DbActiveSession[]>([]);
     const [isLoadingSessions, setIsLoadingSessions] = useState(false);
+    const activeSessionsLoadInFlightRef = useRef(false);
     const [isBulkSessionActionRunning, setIsBulkSessionActionRunning] = useState(false);
     const [pendingSessionCommands, setPendingSessionCommands] = useState<Record<string, { command: 'FORCE_LOGOUT' | 'RELOAD'; startedAt: number }>>({});
     const forcedSessionCleanupRef = useRef<Set<string>>(new Set());
@@ -3937,18 +3962,18 @@ const App: React.FC = () => {
         const refreshCoreData = async () => {
             await Promise.allSettled([
                 refreshUsersIfChanged(applyDeferred(applyUsers)),
-                CacheService.fetchWithCache(CACHE_KEY_CONFIG, SupabaseService.fetchConfig, applyDeferred(applyConfig), {
+                CacheService.fetchWithCache(CACHE_KEY_CONFIG, () => SupabaseService.fetchConfig(true), applyDeferred(applyConfig), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 6000
                 }),
-                CacheService.fetchWithCache(CACHE_KEY_COMPANIES, SupabaseService.fetchCompanies, applyDeferred(applyCompanies), {
+                CacheService.fetchWithCache(CACHE_KEY_COMPANIES, () => SupabaseService.fetchCompanies(true), applyDeferred(applyCompanies), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 8000,
                     compare: (cached, remote) => getCompanyAreasSignature(cached) !== getCompanyAreasSignature(remote)
                 }),
-                CacheService.fetchWithCache(CACHE_KEY_ACCESS, SupabaseService.fetchAccessMatrix, applyDeferred(applyAccessMatrix), {
+                CacheService.fetchWithCache(CACHE_KEY_ACCESS, () => SupabaseService.fetchAccessMatrix(true), applyDeferred(applyAccessMatrix), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 8000
@@ -3958,17 +3983,17 @@ const App: React.FC = () => {
 
         const preloadSecondaryData = async () => {
             await Promise.allSettled([
-                CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE), applyDeferred(applyReports), {
+                CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, true), applyDeferred(applyReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 10000
                 }),
-                CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE), applyDeferred(applyStockReports), {
+                CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, true), applyDeferred(applyStockReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
                     revalidate: 'stale',
                     timeoutMs: 10000
                 }),
-                CacheService.fetchWithCache(CACHE_KEY_TICKETS, SupabaseService.fetchTickets, (data) => {
+                CacheService.fetchWithCache(CACHE_KEY_TICKETS, () => SupabaseService.fetchTickets(true), (data) => {
                     if (!cancelled) startTransition(() => setTickets(data || []));
                 }, {
                     maxAgeMs: 60 * 1000,
@@ -4044,7 +4069,7 @@ const App: React.FC = () => {
             setChecklists([...ordered, ...extras]);
         };
 
-        CacheService.fetchWithCache(CACHE_KEY_CHECKLIST_DEFS, SupabaseService.fetchChecklistDefinitions, applyChecklistDefinitions, {
+        CacheService.fetchWithCache(CACHE_KEY_CHECKLIST_DEFS, () => SupabaseService.fetchChecklistDefinitions(true), applyChecklistDefinitions, {
             maxAgeMs: STATIC_REFERENCE_CACHE_MS,
             revalidate: 'stale',
             timeoutMs: 8000
@@ -4060,7 +4085,7 @@ const App: React.FC = () => {
     useEffect(() => {
         if (currentView !== 'support') return;
         let cancelled = false;
-        CacheService.fetchWithCache(CACHE_KEY_TICKETS, SupabaseService.fetchTickets, (data) => {
+        CacheService.fetchWithCache(CACHE_KEY_TICKETS, () => SupabaseService.fetchTickets(true), (data) => {
             if (!cancelled) setTickets(data || []);
         }, {
             maxAgeMs: 15 * 1000,
@@ -4098,12 +4123,12 @@ const App: React.FC = () => {
         };
 
         Promise.allSettled([
-            CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE), applyReports, {
+            CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, true), applyReports, {
                 maxAgeMs: 30 * 1000,
                 revalidate: 'stale',
                 timeoutMs: 10000
             }).then(applyReports),
-            CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE), applyStockReports, {
+            CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, true), applyStockReports, {
                 maxAgeMs: 30 * 1000,
                 revalidate: 'stale',
                 timeoutMs: 10000
@@ -4393,7 +4418,7 @@ const App: React.FC = () => {
         try {
             const files = await CacheService.fetchWithCache(
                 cacheKey,
-                () => SupabaseService.fetchGlobalBaseFilesMeta(currentUser.company_id!),
+                () => SupabaseService.fetchGlobalBaseFilesMeta(currentUser.company_id!, true),
                 (fresh) => setGlobalBaseFiles(fresh || []),
                 {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
@@ -4547,7 +4572,9 @@ const App: React.FC = () => {
     useEffect(() => {
         if (!currentUser || !draftLoaded) return;
 
-        const syncInterval = setInterval(async () => {
+        const syncRemoteDraft = async () => {
+            if (draftRemoteSyncInFlightRef.current) return;
+            if (document.hidden || !navigator.onLine || isForegroundSettling()) return;
             const timeSinceActivity = Date.now() - lastUserActivity;
 
             // Pausar sync se usuário está digitando/editando (ativo nos últimos 5 segundos)
@@ -4558,6 +4585,7 @@ const App: React.FC = () => {
 
             if (isSavingRef.current) return; // Não sincronizar durante salvamento
 
+            draftRemoteSyncInFlightRef.current = true;
             try {
                 // PRIMEIRO: Verifica apenas metadados para economizar transferência
                 const meta = await SupabaseService.fetchDraftMetadata(currentUser.email);
@@ -4586,11 +4614,15 @@ const App: React.FC = () => {
                 }
             } catch (error) {
                 console.error('❌ Erro na sincronização:', error);
+            } finally {
+                draftRemoteSyncInFlightRef.current = false;
             }
-        }, 15000); // Aumentado de 3s para 15s para reduzir carga drastically
+        };
+
+        const syncInterval = setInterval(syncRemoteDraft, DRAFT_REMOTE_SYNC_POLL_MS);
 
         return () => clearInterval(syncInterval);
-    }, [currentUser, draftLoaded, formData, images, signatures, lastUserActivity]);
+    }, [currentUser, draftLoaded, formData, images, signatures, lastUserActivity, isForegroundSettling, DRAFT_REMOTE_SYNC_POLL_MS]);
 
     // Auto-Save com debounce de 1 segundo (aumentado de 300ms)
     useEffect(() => {
@@ -4958,12 +4990,16 @@ const App: React.FC = () => {
     // --- SESSION MANAGEMENT & HEARTBEAT ---
     useEffect(() => {
         if (!currentUser) return;
+        let heartbeatInFlight = false;
 
         const performHeartbeat = async () => {
+            if (heartbeatInFlight) return;
+            if (document.hidden || !navigator.onLine) return;
             if (remoteForceLogoutDeadline) return;
             if (isForegroundSettling()) return;
+            heartbeatInFlight = true;
             try {
-                await SupabaseService.upsertActiveSession({
+                const activeSession = await SupabaseService.upsertActiveSession({
                     client_id: clientIdRef.current,
                     user_email: currentUser.email,
                     user_name: currentUser.name || null,
@@ -4972,13 +5008,25 @@ const App: React.FC = () => {
                     current_view: mapViewToAppName(currentViewRef.current),
                     last_ping: new Date().toISOString()
                 });
+
+                if (activeSession?.command === 'FORCE_LOGOUT') {
+                    if (!remoteForceLogoutDeadline) {
+                        setRemoteForceLogoutDeadline(Date.now() + 10000);
+                        setRemoteForceLogoutTick(0);
+                    }
+                } else if (activeSession?.command === 'RELOAD') {
+                    await SupabaseService.sendSessionCommand(clientIdRef.current, null);
+                    window.location.reload();
+                }
             } catch (err) {
                 console.error('Heartbeat error:', err);
+            } finally {
+                heartbeatInFlight = false;
             }
         };
 
         performHeartbeat();
-        const interval = setInterval(performHeartbeat, 20000);
+        const interval = setInterval(performHeartbeat, HEARTBEAT_INTERVAL_MS);
         let wakeHeartbeatTimer: number | null = null;
         const handleWakeHeartbeat = () => {
             if (document.hidden) return;
@@ -5001,7 +5049,7 @@ const App: React.FC = () => {
             window.removeEventListener('focus', handleWakeHeartbeat);
             SupabaseService.deleteActiveSession(clientIdRef.current).catch(() => { });
         };
-    }, [currentUser?.email, currentUser?.name, currentUser?.filial, currentUser?.area, remoteForceLogoutDeadline, isForegroundSettling]);
+    }, [currentUser?.email, currentUser?.name, currentUser?.filial, currentUser?.area, remoteForceLogoutDeadline, isForegroundSettling, HEARTBEAT_INTERVAL_MS]);
 
     useEffect(() => {
         if (!currentUser || !remoteForceLogoutDeadline) return;
@@ -5015,58 +5063,6 @@ const App: React.FC = () => {
         }, 250);
         return () => clearInterval(timer);
     }, [currentUser?.email, remoteForceLogoutDeadline, handleRemoteForceLogoutNow]);
-
-    useEffect(() => {
-        if (!currentUser) return;
-        let isCheckingCommand = false;
-        const checkSessionCommand = async () => {
-            if (isCheckingCommand) return;
-            if (document.hidden) return;
-            if (isForegroundSettling()) return;
-            isCheckingCommand = true;
-            try {
-                const mySession = await SupabaseService.fetchActiveSessionByClientId(clientIdRef.current);
-
-                if (mySession?.command === 'FORCE_LOGOUT') {
-                    if (!remoteForceLogoutDeadline) {
-                        setRemoteForceLogoutDeadline(Date.now() + 10000);
-                        setRemoteForceLogoutTick(0);
-                    }
-                } else if (mySession?.command === 'RELOAD') {
-                    await SupabaseService.sendSessionCommand(clientIdRef.current, null);
-                    window.location.reload();
-                }
-            } catch (error) {
-                console.error('Error checking session commands:', error);
-            } finally {
-                isCheckingCommand = false;
-            }
-        };
-
-        checkSessionCommand();
-        const commandInterval = setInterval(checkSessionCommand, SESSION_COMMAND_POLL_MS);
-        let wakeCommandTimer: number | null = null;
-        const handleWakeCommandCheck = () => {
-            if (document.hidden) return;
-            if (wakeCommandTimer !== null) window.clearTimeout(wakeCommandTimer);
-            const delay = Math.max(700, foregroundQuietUntilRef.current - Date.now() + 650);
-            wakeCommandTimer = window.setTimeout(() => {
-                wakeCommandTimer = null;
-                scheduleBackgroundTask(() => {
-                    if (!document.hidden) void checkSessionCommand();
-                }, 5500);
-            }, delay);
-        };
-        document.addEventListener('visibilitychange', handleWakeCommandCheck);
-        window.addEventListener('focus', handleWakeCommandCheck);
-
-        return () => {
-            clearInterval(commandInterval);
-            if (wakeCommandTimer !== null) window.clearTimeout(wakeCommandTimer);
-            document.removeEventListener('visibilitychange', handleWakeCommandCheck);
-            window.removeEventListener('focus', handleWakeCommandCheck);
-        };
-    }, [currentUser?.email, handleLogout, remoteForceLogoutDeadline, SESSION_COMMAND_POLL_MS, isForegroundSettling]);
 
     // Polling curto para fila de aprovação de usuários (evita atraso para aparecer novos cadastros).
     useEffect(() => {
@@ -7294,9 +7290,11 @@ const App: React.FC = () => {
     }, [currentView, currentUser?.company_id, currentUser?.filial, currentUser?.role, logsDateRange]);
 
     const refreshActiveSessions = useCallback(async () => {
+        if (activeSessionsLoadInFlightRef.current || document.hidden || !navigator.onLine) return;
+        activeSessionsLoadInFlightRef.current = true;
         setIsLoadingSessions(true);
         try {
-            const sessions = await SupabaseService.fetchActiveSessions();
+            const sessions = await SupabaseService.fetchActiveSessions(true);
             setActiveSessions(sessions);
             const activeClientIds = new Set((sessions || []).map(s => s.client_id));
             setPendingSessionCommands(prev => {
@@ -7318,6 +7316,7 @@ const App: React.FC = () => {
         } catch (error) {
             console.error('Error fetching active sessions:', error);
         } finally {
+            activeSessionsLoadInFlightRef.current = false;
             setIsLoadingSessions(false);
             setHasLoadedSessionsForMetrics(true);
         }
@@ -7757,12 +7756,35 @@ const App: React.FC = () => {
         return Array.from(set);
     }, [currentUser?.filial, currentUser?.role, currentUser?.area, scopedUsers, scopedCompanies]);
 
-    const loadDashboardAuditSessions = useCallback(async () => {
-        if (!currentUser) return;
-        setIsLoadingDashboardAudits(true);
-        setDashboardAuditsError(null);
-        try {
+    const loadDashboardAuditSessions = useCallback((force = false): Promise<void> => {
+        if (!currentUser) return Promise.resolve();
+        const existingRequest = dashboardOpenAuditRequestRef.current;
+        if (existingRequest) return existingRequest;
+
+        const request = (async () => {
             const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates)).filter(Boolean);
+            const dashboardCacheKey = buildAuditDashboardCacheKey('open', queryBranches);
+            const dashboardMetaKey = `${dashboardCacheKey}_meta`;
+            const cachedRows = CacheService.peek<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
+                || await CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey);
+
+            if (Array.isArray(cachedRows) && cachedRows.length > 0) {
+                startTransition(() => {
+                    setDashboardAuditSessions(previous => previous.length > 0 ? previous : cachedRows);
+                });
+            }
+
+            if (!force && Date.now() < dashboardAuditBackoffRef.current.retryAt) {
+                setDashboardAuditsError(
+                    Array.isArray(cachedRows) && cachedRows.length > 0
+                        ? 'Banco temporariamente indisponível. Exibindo a última sincronização salva.'
+                        : 'Banco temporariamente indisponível. Nova tentativa será feita automaticamente.'
+                );
+                return;
+            }
+
+            setIsLoadingDashboardAudits(true);
+            try {
             let metadataQuery = supabase
                 .from('audit_sessions')
                 .select('id, branch, audit_number, status, progress, user_email, created_at, updated_at')
@@ -7770,7 +7792,7 @@ const App: React.FC = () => {
                 .order('updated_at', { ascending: false })
                 .limit(300);
 
-            if (queryBranches.length > 0) {
+            if (currentUser.role !== 'MASTER' && queryBranches.length > 0) {
                 metadataQuery = metadataQuery.in('branch', queryBranches);
             }
 
@@ -7808,8 +7830,6 @@ const App: React.FC = () => {
 
             const latestMetadata = Array.from(latestByBranchAndNumber.values()).filter(s => !!s.id);
             const detailIds = latestMetadata.map(s => String(s.id));
-            const dashboardCacheKey = buildAuditDashboardCacheKey('open', queryBranches);
-            const dashboardMetaKey = `${dashboardCacheKey}_meta`;
             const metadataSignature = buildAuditMetadataSignature(latestMetadata);
 
             const [cachedSignature, cachedRows] = await Promise.all([
@@ -7823,6 +7843,9 @@ const App: React.FC = () => {
                 cachedRows.length === latestMetadata.length
             ) {
                 startTransition(() => setDashboardAuditSessions(cachedRows));
+                dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
+                setDashboardAuditRetryAt(0);
+                setDashboardAuditsError(null);
                 setDashboardAuditsFetchedAt(new Date().toISOString());
                 return;
             }
@@ -7831,6 +7854,9 @@ const App: React.FC = () => {
                 setDashboardAuditSessions([]);
                 await CacheService.set(dashboardMetaKey, metadataSignature);
                 await CacheService.set(dashboardCacheKey, []);
+                dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
+                setDashboardAuditRetryAt(0);
+                setDashboardAuditsError(null);
                 setDashboardAuditsFetchedAt(new Date().toISOString());
                 return;
             }
@@ -7859,22 +7885,73 @@ const App: React.FC = () => {
             startTransition(() => setDashboardAuditSessions(resolvedRows));
             await CacheService.set(dashboardMetaKey, metadataSignature);
             await CacheService.set(dashboardCacheKey, resolvedRows);
+            dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
+            setDashboardAuditRetryAt(0);
+            setDashboardAuditsError(null);
             setDashboardAuditsFetchedAt(new Date().toISOString());
-        } catch (error) {
-            console.error('Erro ao carregar sessões abertas de auditoria para o dashboard:', error);
-            setDashboardAuditSessions([]);
-            setDashboardAuditsError('Não foi possível carregar auditorias abertas agora.');
-        } finally {
-            setIsLoadingDashboardAudits(false);
-        }
+            } catch (error) {
+                const transient = isTransientPostgrestError(error);
+                if (transient) {
+                    const previous = dashboardAuditBackoffRef.current;
+                    const failures = Math.min(previous.failures + 1, 5);
+                    const now = Date.now();
+                    const retryAt = now + getPostgrestRetryDelay(failures);
+                    dashboardAuditBackoffRef.current = { failures, retryAt, lastLoggedAt: now };
+                    setDashboardAuditRetryAt(current => Math.max(current, retryAt));
+                    if (now - previous.lastLoggedAt > 10_000) {
+                        console.warn('PostgREST indisponível ao carregar auditorias abertas; usando cache local.', error);
+                    }
+                } else {
+                    console.error('Erro ao carregar sessões abertas de auditoria para o dashboard:', error);
+                }
+                setDashboardAuditsError(
+                    Array.isArray(cachedRows) && cachedRows.length > 0
+                        ? 'Banco temporariamente indisponível. Exibindo a última sincronização salva.'
+                        : 'Não foi possível sincronizar auditorias abertas agora.'
+                );
+            } finally {
+                setIsLoadingDashboardAudits(false);
+            }
+        })();
+
+        dashboardOpenAuditRequestRef.current = request;
+        void request.finally(() => {
+            if (dashboardOpenAuditRequestRef.current === request) {
+                dashboardOpenAuditRequestRef.current = null;
+            }
+        });
+        return request;
     }, [currentUser, dashboardAuditBranchCandidates]);
 
-    const loadCompletedDashboardAuditSessions = useCallback(async () => {
-        if (!currentUser) return;
-        setIsLoadingCompletedDashboardAudits(true);
-        setCompletedDashboardAuditsError(null);
-        try {
+    const loadCompletedDashboardAuditSessions = useCallback((force = false): Promise<void> => {
+        if (!currentUser) return Promise.resolve();
+        const existingRequest = dashboardCompletedAuditRequestRef.current;
+        if (existingRequest) return existingRequest;
+
+        const request = (async () => {
             const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates)).filter(Boolean);
+            const dashboardCacheKey = buildAuditDashboardCacheKey('completed', queryBranches);
+            const dashboardMetaKey = `${dashboardCacheKey}_meta`;
+            const cachedRows = CacheService.peek<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
+                || await CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey);
+
+            if (Array.isArray(cachedRows) && cachedRows.length > 0) {
+                startTransition(() => {
+                    setDashboardCompletedAuditSessions(previous => previous.length > 0 ? previous : cachedRows);
+                });
+            }
+
+            if (!force && Date.now() < dashboardAuditBackoffRef.current.retryAt) {
+                setCompletedDashboardAuditsError(
+                    Array.isArray(cachedRows) && cachedRows.length > 0
+                        ? 'Banco temporariamente indisponível. Exibindo a última sincronização salva.'
+                        : 'Banco temporariamente indisponível. Nova tentativa será feita automaticamente.'
+                );
+                return;
+            }
+
+            setIsLoadingCompletedDashboardAudits(true);
+            try {
             let metadataQuery = supabase
                 .from('audit_sessions')
                 .select('id, branch, audit_number, status, progress, user_email, created_at, updated_at')
@@ -7882,7 +7959,7 @@ const App: React.FC = () => {
                 .order('updated_at', { ascending: false })
                 .limit(1000); // We might need a larger limit for completed audits
 
-            if (queryBranches.length > 0) {
+            if (currentUser.role !== 'MASTER' && queryBranches.length > 0) {
                 metadataQuery = metadataQuery.in('branch', queryBranches);
             }
 
@@ -7920,8 +7997,6 @@ const App: React.FC = () => {
 
             const latestMetadata = Array.from(latestByBranchAndNumber.values()).filter(s => !!s.id);
             const detailIds = latestMetadata.map(s => String(s.id));
-            const dashboardCacheKey = buildAuditDashboardCacheKey('completed', queryBranches);
-            const dashboardMetaKey = `${dashboardCacheKey}_meta`;
             const metadataSignature = buildAuditMetadataSignature(latestMetadata);
 
             const [cachedSignature, cachedRows] = await Promise.all([
@@ -7935,6 +8010,9 @@ const App: React.FC = () => {
                 cachedRows.length === latestMetadata.length
             ) {
                 startTransition(() => setDashboardCompletedAuditSessions(cachedRows));
+                dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
+                setDashboardAuditRetryAt(0);
+                setCompletedDashboardAuditsError(null);
                 setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
                 return;
             }
@@ -7943,6 +8021,9 @@ const App: React.FC = () => {
                 setDashboardCompletedAuditSessions([]);
                 await CacheService.set(dashboardMetaKey, metadataSignature);
                 await CacheService.set(dashboardCacheKey, []);
+                dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
+                setDashboardAuditRetryAt(0);
+                setCompletedDashboardAuditsError(null);
                 setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
                 return;
             }
@@ -7971,15 +8052,82 @@ const App: React.FC = () => {
             startTransition(() => setDashboardCompletedAuditSessions(resolvedRows));
             await CacheService.set(dashboardMetaKey, metadataSignature);
             await CacheService.set(dashboardCacheKey, resolvedRows);
+            dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
+            setDashboardAuditRetryAt(0);
+            setCompletedDashboardAuditsError(null);
             setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
-        } catch (error) {
-            console.error('Erro ao carregar sessões concluídas de auditoria para o dashboard:', error);
-            setDashboardCompletedAuditSessions([]);
-            setCompletedDashboardAuditsError('Não foi possível carregar auditorias concluídas agora.');
-        } finally {
-            setIsLoadingCompletedDashboardAudits(false);
-        }
+            } catch (error) {
+                const transient = isTransientPostgrestError(error);
+                if (transient) {
+                    const previous = dashboardAuditBackoffRef.current;
+                    const failures = Math.min(previous.failures + 1, 5);
+                    const now = Date.now();
+                    const retryAt = now + getPostgrestRetryDelay(failures);
+                    dashboardAuditBackoffRef.current = { failures, retryAt, lastLoggedAt: now };
+                    setDashboardAuditRetryAt(current => Math.max(current, retryAt));
+                    if (now - previous.lastLoggedAt > 10_000) {
+                        console.warn('PostgREST indisponível ao carregar auditorias concluídas; usando cache local.', error);
+                    }
+                } else {
+                    console.error('Erro ao carregar sessões concluídas de auditoria para o dashboard:', error);
+                }
+                setCompletedDashboardAuditsError(
+                    Array.isArray(cachedRows) && cachedRows.length > 0
+                        ? 'Banco temporariamente indisponível. Exibindo a última sincronização salva.'
+                        : 'Não foi possível sincronizar auditorias concluídas agora.'
+                );
+            } finally {
+                setIsLoadingCompletedDashboardAudits(false);
+            }
+        })();
+
+        dashboardCompletedAuditRequestRef.current = request;
+        void request.finally(() => {
+            if (dashboardCompletedAuditRequestRef.current === request) {
+                dashboardCompletedAuditRequestRef.current = null;
+            }
+        });
+        return request;
     }, [currentUser, dashboardAuditBranchCandidates]);
+
+    useEffect(() => {
+        if (
+            !currentUser ||
+            dashboardAuditRetryAt <= 0 ||
+            (currentView !== 'dashboard' && currentView !== 'audit')
+        ) return;
+
+        let timerId: number | null = null;
+        const retryIfReady = () => {
+            if (document.hidden || !navigator.onLine) return;
+            const remaining = dashboardAuditRetryAt - Date.now();
+            if (remaining > 0) {
+                if (timerId !== null) window.clearTimeout(timerId);
+                timerId = window.setTimeout(retryIfReady, remaining + 50);
+                return;
+            }
+            setDashboardAuditRetryAt(0);
+            void Promise.allSettled([
+                loadDashboardAuditSessions(),
+                loadCompletedDashboardAuditSessions()
+            ]);
+        };
+
+        timerId = window.setTimeout(retryIfReady, Math.max(100, dashboardAuditRetryAt - Date.now()));
+        window.addEventListener('online', retryIfReady);
+        document.addEventListener('visibilitychange', retryIfReady);
+        return () => {
+            if (timerId !== null) window.clearTimeout(timerId);
+            window.removeEventListener('online', retryIfReady);
+            document.removeEventListener('visibilitychange', retryIfReady);
+        };
+    }, [
+        currentUser,
+        currentView,
+        dashboardAuditRetryAt,
+        loadDashboardAuditSessions,
+        loadCompletedDashboardAuditSessions
+    ]);
 
 
     useEffect(() => {
@@ -10727,8 +10875,8 @@ const App: React.FC = () => {
                                         loading={isLoadingDashboardAudits || isLoadingCompletedDashboardAudits}
                                         onRefresh={() => {
                                             void Promise.allSettled([
-                                                loadDashboardAuditSessions(),
-                                                loadCompletedDashboardAuditSessions()
+                                                loadDashboardAuditSessions(true),
+                                                loadCompletedDashboardAuditSessions(true)
                                             ]);
                                         }}
                                         onExport={(status) => {
@@ -14414,7 +14562,7 @@ const App: React.FC = () => {
                                                 </span>
                                                 <button
                                                     type="button"
-                                                    onClick={() => void loadDashboardAuditSessions()}
+                                                    onClick={() => void loadDashboardAuditSessions(true)}
                                                     disabled={isLoadingDashboardAudits}
                                                     className="inline-flex h-10 cursor-pointer items-center gap-2 px-3 rounded-xl border border-gray-200 text-xs font-black uppercase tracking-widest text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
                                                 >

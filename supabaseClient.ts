@@ -26,9 +26,58 @@ const useDirectPostgrest =
 const stripAuthHeaders =
   import.meta.env.VITE_SUPABASE_STRIP_AUTH_HEADERS === 'true' || isLikelyLocalPostgrest;
 
+let postgrestCircuitOpenUntil = 0;
+let postgrestFailureStreak = 0;
+let postgrestNeedsRecoveryProbe = false;
+let postgrestRecoveryProbeInFlight = false;
+
+const TRANSIENT_POSTGREST_STATUS = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+
+const getRetryAfterMs = (response: Response): number => {
+  const raw = String(response.headers.get('retry-after') || '').trim();
+  if (raw) {
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+    const retryDate = Date.parse(raw);
+    if (Number.isFinite(retryDate)) return Math.max(0, retryDate - Date.now());
+  }
+  return Math.min(2 * 60_000, 15_000 * (2 ** Math.max(0, postgrestFailureStreak - 1)));
+};
+
+const openPostgrestCircuit = (response?: Response) => {
+  postgrestFailureStreak = Math.min(postgrestFailureStreak + 1, 5);
+  const retryMs = response ? getRetryAfterMs(response) : getRetryAfterMs(new Response());
+  postgrestCircuitOpenUntil = Math.max(postgrestCircuitOpenUntil, Date.now() + Math.max(5_000, retryMs));
+  postgrestNeedsRecoveryProbe = true;
+};
+
+const resetPostgrestCircuit = () => {
+  postgrestCircuitOpenUntil = 0;
+  postgrestFailureStreak = 0;
+  postgrestNeedsRecoveryProbe = false;
+};
+
+const createCircuitOpenResponse = () => {
+  const retrySeconds = Math.max(1, Math.ceil((postgrestCircuitOpenUntil - Date.now()) / 1000));
+  return new Response(JSON.stringify({
+    code: 'PGRST002',
+    details: null,
+    hint: null,
+    message: 'PostgREST temporariamente indisponível. Aguardando a próxima tentativa automática.'
+  }), {
+    status: 503,
+    statusText: 'Service Unavailable',
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'retry-after': String(retrySeconds),
+      'x-auditflow-circuit': 'open'
+    }
+  });
+};
+
 // When pointing Supabase JS directly to raw PostgREST (no /rest/v1 proxy),
 // rewrite REST calls so `from('table')` still works.
-const localPostgrestCompatFetch: typeof fetch = (input, init) => {
+const localPostgrestCompatFetch: typeof fetch = async (input, init) => {
   const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
   let rewrittenUrl = rawUrl;
 
@@ -56,17 +105,45 @@ const localPostgrestCompatFetch: typeof fetch = (input, init) => {
     headers.delete('apikey');
   }
 
-  if (typeof input === 'string' || input instanceof URL) {
-    return fetch(rewrittenUrl, {
+  const performFetch = () => {
+    if (typeof input === 'string' || input instanceof URL) {
+      return fetch(rewrittenUrl, {
+        ...init,
+        headers,
+      });
+    }
+
+    return fetch(new Request(rewrittenUrl, input), {
       ...init,
       headers,
     });
+  };
+
+  if (postgrestNeedsRecoveryProbe) {
+    if (Date.now() < postgrestCircuitOpenUntil || postgrestRecoveryProbeInFlight) {
+      return createCircuitOpenResponse();
+    }
+    postgrestRecoveryProbeInFlight = true;
   }
 
-  return fetch(new Request(rewrittenUrl, input), {
-    ...init,
-    headers,
-  });
+  const isRecoveryProbe = postgrestRecoveryProbeInFlight && postgrestNeedsRecoveryProbe;
+  try {
+    const response = await performFetch();
+    if (TRANSIENT_POSTGREST_STATUS.has(response.status)) {
+      openPostgrestCircuit(response);
+    } else if (isRecoveryProbe) {
+      resetPostgrestCircuit();
+    }
+    return response;
+  } catch (error) {
+    openPostgrestCircuit();
+    // A failed CORS preflight or an unreachable tunnel rejects fetch before a
+    // Response exists. Convert that first failure into the same controlled 503
+    // used while the circuit is open so callers do not immediately retry it.
+    return createCircuitOpenResponse();
+  } finally {
+    if (isRecoveryProbe) postgrestRecoveryProbeInFlight = false;
+  }
 };
 
 // Create Supabase client (will use placeholder values if env vars not set)

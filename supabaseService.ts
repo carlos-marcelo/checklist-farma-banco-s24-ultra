@@ -288,7 +288,7 @@ export interface DbChecklistDefinition {
   updated_at?: string;
 }
 
-export async function fetchChecklistDefinitions(): Promise<DbChecklistDefinition[]> {
+export async function fetchChecklistDefinitions(throwOnError = false): Promise<DbChecklistDefinition[]> {
   try {
     const { data, error } = await supabase
       .from('checklist_definitions')
@@ -298,6 +298,7 @@ export async function fetchChecklistDefinitions(): Promise<DbChecklistDefinition
     return data || [];
   } catch (error) {
     console.error('Error fetching checklist definitions:', error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -462,7 +463,7 @@ export async function deleteUser(email: string): Promise<boolean> {
 
 // ==================== COMPANIES ====================
 
-export async function fetchCompanies(): Promise<DbCompany[]> {
+export async function fetchCompanies(throwOnError = false): Promise<DbCompany[]> {
   try {
     const { data, error } = await supabase
       .from('companies')
@@ -473,6 +474,7 @@ export async function fetchCompanies(): Promise<DbCompany[]> {
     return data || [];
   } catch (error) {
     console.error('Error fetching companies:', error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -484,7 +486,7 @@ export interface DbAccessMatrix {
   updated_at?: string;
 }
 
-export async function fetchAccessMatrix(): Promise<DbAccessMatrix[]> {
+export async function fetchAccessMatrix(throwOnError = false): Promise<DbAccessMatrix[]> {
   try {
     const { data, error } = await supabase
       .from('access_matrix')
@@ -494,6 +496,7 @@ export async function fetchAccessMatrix(): Promise<DbAccessMatrix[]> {
     return data || [];
   } catch (error) {
     console.error('Error fetching access matrix:', error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -584,7 +587,7 @@ export async function updateCompany(id: string, updates: Partial<DbCompany>): Pr
   }
 }
 
-export async function fetchConfig(): Promise<DbConfig | null> {
+export async function fetchConfig(throwOnError = false): Promise<DbConfig | null> {
   try {
     const { data, error } = await supabase
       .from('configs')
@@ -597,6 +600,7 @@ export async function fetchConfig(): Promise<DbConfig | null> {
     return data;
   } catch (error) {
     console.error('Error fetching config:', error);
+    if (throwOnError) throw error;
     return null;
   }
 }
@@ -640,7 +644,11 @@ export async function saveConfig(config: DbConfig): Promise<boolean> {
 // ==================== REPORTS ====================
 
 // Retorna apenas metadados para listagem rápida
-export async function fetchReportsSummary(page: number = 0, pageSize: number = 20): Promise<Partial<DbReport>[]> {
+export async function fetchReportsSummary(
+  page: number = 0,
+  pageSize: number = 20,
+  throwOnError = false
+): Promise<Partial<DbReport>[]> {
   try {
     const from = page * pageSize;
     const to = from + pageSize - 1;
@@ -655,6 +663,7 @@ export async function fetchReportsSummary(page: number = 0, pageSize: number = 2
     return data || [];
   } catch (error) {
     console.error('Error fetching reports summary:', error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -783,7 +792,11 @@ export async function fetchStockConferenceReportsSummaryAll(pageSize: number = 2
 }
 
 // Paginated version: load page by page (lighter)
-export async function fetchStockConferenceReportsSummaryPage(page: number = 0, pageSize: number = 20): Promise<Partial<DbStockConferenceReport>[]> {
+export async function fetchStockConferenceReportsSummaryPage(
+  page: number = 0,
+  pageSize: number = 20,
+  throwOnError = false
+): Promise<Partial<DbStockConferenceReport>[]> {
   try {
     const from = page * pageSize;
     const to = from + pageSize - 1;
@@ -796,6 +809,7 @@ export async function fetchStockConferenceReportsSummaryPage(page: number = 0, p
     return data || [];
   } catch (error) {
     console.error('Error fetching stock conference reports summary page:', error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -2107,7 +2121,11 @@ export async function fetchGlobalBaseFiles(companyId: string): Promise<DbGlobalB
   }
 }
 
-export async function fetchGlobalBaseFileMeta(companyId: string, moduleKey: string): Promise<Partial<DbGlobalBaseFile> | null> {
+export async function fetchGlobalBaseFileMeta(
+  companyId: string,
+  moduleKey: string,
+  throwOnError = false
+): Promise<Partial<DbGlobalBaseFile> | null> {
   try {
     const { data, error } = await supabase
       .from('global_base_files')
@@ -2119,6 +2137,7 @@ export async function fetchGlobalBaseFileMeta(companyId: string, moduleKey: stri
     return data || null;
   } catch (error) {
     console.error('Error fetching global base file metadata:', error);
+    if (throwOnError) throw error;
     return null;
   }
 }
@@ -2160,7 +2179,7 @@ export async function fetchGlobalBaseFilesForModules(
   }
 }
 
-export async function fetchGlobalBaseFilesMeta(companyId: string): Promise<DbGlobalBaseFile[]> {
+export async function fetchGlobalBaseFilesMeta(companyId: string, throwOnError = false): Promise<DbGlobalBaseFile[]> {
   try {
     const { data, error } = await supabase
       .from('global_base_files')
@@ -2171,6 +2190,7 @@ export async function fetchGlobalBaseFilesMeta(companyId: string): Promise<DbGlo
     return data || [];
   } catch (error) {
     console.error('Error fetching global base files metadata:', error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -2698,7 +2718,7 @@ export interface DbTicket {
   updated_at?: string;
 }
 
-export async function fetchTickets(): Promise<DbTicket[]> {
+export async function fetchTickets(throwOnError = false): Promise<DbTicket[]> {
   try {
     const { data, error } = await supabase
       .from('tickets')
@@ -2708,6 +2728,7 @@ export async function fetchTickets(): Promise<DbTicket[]> {
     return data || [];
   } catch (error) {
     console.error('Error fetching tickets:', error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -2778,10 +2799,10 @@ export function exportLocalStorageBackup() {
 
 // --- ACTIVE SESSIONS & COMMANDS ---
 
-export async function upsertActiveSession(session: Partial<DbActiveSession>): Promise<boolean> {
+export async function upsertActiveSession(session: Partial<DbActiveSession>): Promise<DbActiveSession | null> {
   try {
     const clientId = session.client_id;
-    if (!clientId) return false;
+    if (!clientId) return null;
 
     // Heartbeat não deve sobrescrever "command" para evitar perder FORCE_LOGOUT/RELOAD
     const heartbeatPayload: Partial<DbActiveSession> = { ...session };
@@ -2792,19 +2813,21 @@ export async function upsertActiveSession(session: Partial<DbActiveSession>): Pr
       updated_at: new Date().toISOString()
     };
 
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('active_sessions')
-      .upsert(upsertPayload, { onConflict: 'client_id' });
+      .upsert(upsertPayload, { onConflict: 'client_id' })
+      .select('client_id,user_email,user_name,branch,area,current_view,last_ping,command,updated_at')
+      .single();
 
     if (error) throw error;
-    return true;
+    return data || null;
   } catch (error) {
     console.error('Error upserting active session:', error);
-    return false;
+    return null;
   }
 }
 
-export async function fetchActiveSessions(): Promise<DbActiveSession[]> {
+export async function fetchActiveSessions(throwOnError = false): Promise<DbActiveSession[]> {
   try {
     // Buscar sessões que deram ping nos últimos 5 minutos
     const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
@@ -2819,6 +2842,7 @@ export async function fetchActiveSessions(): Promise<DbActiveSession[]> {
     return data || [];
   } catch (error) {
     console.error('Error fetching active sessions:', error);
+    if (throwOnError) throw error;
     return [];
   }
 }

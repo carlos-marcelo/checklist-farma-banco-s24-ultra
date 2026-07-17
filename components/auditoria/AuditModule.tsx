@@ -3293,7 +3293,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }, delay);
         };
 
-        const getIntervalMs = () => (document.hidden ? 12000 : 5000);
+        const getIntervalMs = () => (document.hidden ? 60_000 : 15_000);
         let interval = setInterval(syncNow, getIntervalMs());
 
         const resetInterval = () => {
@@ -3467,7 +3467,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const stockModuleKey = buildSharedStockModuleKey(branch);
         stockBaseRefreshInFlightRef.current = true;
         try {
-            const remoteMeta = await fetchGlobalBaseFileMeta(companyId, stockModuleKey);
+            const remoteMeta = await fetchGlobalBaseFileMeta(companyId, stockModuleKey, true);
             if (activeFilialRef.current !== branch) return;
 
             const localMeta = globalBaseMetaRef.current.stock;
@@ -3703,7 +3703,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }, delay);
         };
 
-        const intervalId = window.setInterval(checkWhenVisible, 30_000);
+        const intervalId = window.setInterval(checkWhenVisible, 60_000);
         window.addEventListener('focus', checkWhenVisible);
         document.addEventListener('visibilitychange', checkWhenVisible);
 
@@ -11291,7 +11291,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             syncPostAuditAdjustmentSnapshot(data);
         };
         trySync();
-        const interval = window.setInterval(trySync, 5000);
+        const interval = window.setInterval(trySync, 30_000);
         window.addEventListener('online', trySync);
         return () => {
             window.clearInterval(interval);
