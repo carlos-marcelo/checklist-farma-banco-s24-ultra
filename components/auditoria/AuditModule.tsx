@@ -2732,13 +2732,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const isStaleRequest = () => activeFilialRef.current !== requestedFilial;
         try {
             let polledMeta: Awaited<ReturnType<typeof fetchLatestAuditMetadata>> = null;
+            const hasPendingClientSync = !!dataRef.current?.pendingSync;
             // Se for polling silencioso, busca apenas metadados para economizar banda e processamento
             if (silent) {
                 polledMeta = await fetchLatestAuditMetadata(selectedFilial);
                 if (!polledMeta || isStaleRequest()) return;
 
-                // Se a data de atualização for a mesma, não faz nada
-                if (lastAuditUpdateRef.current === polledMeta.updated_at) {
+                // Sem alterações locais, metadado igual evita baixar o snapshot completo.
+                // Com PEND local, precisamos prosseguir para enviar a fila ao banco.
+                if (!hasPendingClientSync && lastAuditUpdateRef.current === polledMeta.updated_at) {
                     return;
                 }
             }
@@ -2759,9 +2761,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             // Se temos dados pendentes localmente e estamos online, tentamos sincronizar antes de carregar.
             // Nunca cria um novo inventário nesse fluxo: criação deve passar pelo botão de iniciar/carregar.
-            if (hasPendingSync && typeof navigator !== 'undefined' && navigator.onLine && localData && !silent) {
+            if (hasPendingSync && typeof navigator !== 'undefined' && navigator.onLine && localData) {
                 try {
-                    setIsSyncing(true);
+                    if (!silent) setIsSyncing(true);
                     const localBranch = toAuditBranchValue(localData.filial || selectedFilial || '');
                     if (localBranch && localBranch !== requestedFilial) {
                         console.warn(
@@ -2814,7 +2816,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 } catch (e) {
                     console.error("Falha na sincronização automática inicial:", e);
                 } finally {
-                    setIsSyncing(false);
+                    if (!silent) setIsSyncing(false);
                 }
             }
 
@@ -5198,9 +5200,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         const sourceFiles = ((data as any).sourceFiles || {}) as any;
         const hasPendingGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
-        // Uma auditoria em andamento recebe somente os novos saldos. Mudanças nos
-        // cadastros estruturais não devem reconstruir grupos/departamentos/categorias.
-        if (!hasPendingGlobalStock) return;
+        const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(
+            sourceFiles,
+            globalGroupMeta,
+            globalDeptIdsMeta,
+            globalCatIdsMeta
+        );
+        const hasPendingGlobalBase = hasPendingGlobalStock || hasPendingGlobalStructure;
+        if (!hasPendingGlobalBase) return;
 
         const syncKey = `${dbSessionId || 'no_session'}|${selectedFilial}|${globalStockMeta.module_key}|${globalTs}|${globalStructureBaseSignature}`;
         if (lastAutoStockSyncKeyRef.current === syncKey) {
@@ -5214,7 +5221,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             stockTsRaw: globalTsRaw,
             syncKey,
             showAlert: true,
-            reason: 'stock'
+            reason: hasPendingGlobalStock ? 'stock' : 'structure'
         });
     }, [
         selectedFilial,
@@ -5224,6 +5231,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         canUseAuditMasterTools,
         globalStockFile,
         globalStockMeta,
+        globalGroupMeta,
+        globalDeptIdsMeta,
+        globalCatIdsMeta,
         globalStructureBaseSignature,
         dbSessionId,
         isReadOnlyCompletedView,
@@ -5255,9 +5265,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             globalDeptIdsMeta,
             globalCatIdsMeta
         );
-        // A tela "Atualizar Somente Saldos" nunca reconstrói a estrutura. Uma
-        // reclassificação estrutural precisa ser um fluxo deliberado e separado.
-        const shouldReclassifyOpen = hasOpenStructure && hasStructureFiles && hasPendingGlobalStructure && !isUpdatingStock;
+        // Em auditoria aberta, uma base nova precisa reclassificar os itens ainda
+        // abertos para incluir/remover produtos, preservando tudo que já foi concluído.
+        const shouldReclassifyOpen = hasOpenStructure && hasStructureFiles && (
+            isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta) ||
+            hasPendingGlobalStructure
+        );
         const mergePreservingDone = (
             baseData: AuditData,
             rebuiltData: AuditData
@@ -6078,31 +6091,57 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 basePersistedData,
                 shouldReclassifyOpen ? safePartialStarts : []
             );
-            const progress = calculateProgress(finalData);
+            const progress = calculateProgress(persistedData as AuditData);
+            const currentAuditNumber = data
+                ? getAuditNumberFromInventoryLabel((data as any)?.inventoryNumber)
+                : null;
+            const targetAuditNumber = Number(
+                (shouldReclassifyOpen
+                    ? (currentAuditNumber || latestOpenAudit?.audit_number)
+                    : nextAuditNumber) || 1
+            );
+            const targetSessionId = shouldReclassifyOpen
+                ? (dbSessionId || (
+                    latestOpenAudit && Number(latestOpenAudit.audit_number || 0) === targetAuditNumber
+                        ? latestOpenAudit.id
+                        : undefined
+                ))
+                : dbSessionId;
             const savedSession = await persistAuditSession({
-                id: dbSessionId,
+                id: targetSessionId,
                 branch: selectedFilial,
-                audit_number: nextAuditNumber,
+                audit_number: targetAuditNumber,
                 status: 'open',
                 data: persistedData,
                 progress: progress,
                 user_email: userEmail
             }, { allowProgressRegression: !!shouldReclassifyOpen, allowCreate: !shouldReclassifyOpen });
             if (!savedSession) {
-                throw new Error("Falha ao salvar auditoria inicial no Banco de Dados.");
+                throw new Error(shouldReclassifyOpen
+                    ? "Falha ao salvar a reclassificação da auditoria aberta no Banco de Dados."
+                    : "Falha ao salvar auditoria inicial no Banco de Dados."
+                );
             }
 
-            setDbSessionId(savedSession.id);
+            if (savedSession.id) setDbSessionId(savedSession.id);
             setNextAuditNumber(savedSession.audit_number);
             setAllowActiveAuditAutoOpen(true);
             setTermDrafts(finalTermDrafts as any);
-            setData((savedSession.data as AuditData) || finalData);
+            const savedData = (savedSession.data as AuditData) || (persistedData as AuditData);
+            setData(savedData);
             setGroupFiles(createInitialGroupFiles());
             setFileDeptIds(null);
             setFileCatIds(null);
             setFileStock(null);
             setIsUpdatingStock(false);
             setView({ level: 'groups' });
+            if (shouldReclassifyOpen && savedData.pendingSync) {
+                alert(
+                    "Reclassificação concluída localmente. Os dados, termos e ajustes foram preservados e aguardam sincronização com o banco."
+                );
+            } else if (shouldReclassifyOpen) {
+                alert("Saldos reclassificados e sincronizados com sucesso.");
+            }
             if (mergeResult && (mergeResult.ignored.closedGroups > 0 || mergeResult.ignored.closedDepartments > 0)) {
                 alert(
                     `Reclassificação concluída com bloqueio de escopo finalizado.\n\n` +
@@ -12226,7 +12265,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 FILIAL <span className="hidden sm:inline">UNIDADE </span>F{data.filial}
                             </span>
                         </div>
-                        <div className="ml-3 md:ml-6 flex flex-col items-center shrink-0 min-w-[32px]">
+                        <div
+                            className="ml-3 md:ml-6 flex flex-col items-center shrink-0 min-w-[32px]"
+                            title={
+                                !isOnline
+                                    ? 'Sem conexão: alterações permanecem protegidas neste dispositivo.'
+                                    : isSyncing
+                                        ? 'Sincronizando alterações com o banco de dados.'
+                                        : data?.pendingSync
+                                            ? 'Pendente: alterações salvas localmente aguardando confirmação do banco.'
+                                            : 'Conectado: dados sincronizados com o banco.'
+                            }
+                        >
                             <div className={`w-3 h-3 rounded-full transition-all duration-500 ${
                                 !isOnline ? 'bg-red-500 shadow-[0_0_10px_#ef4444]' :
                                 isSyncing ? 'bg-blue-400 animate-spin shadow-[0_0_10px_#60a5fa]' : 
