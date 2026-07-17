@@ -30,6 +30,8 @@ interface SalesGroupData {
     estoque: number;
     volumeVend: number;
     vlrCusto: number;
+    vlrBruto: number;
+    vlrVenda: number;
     ticket: number;
     ticketCount: number; // to rebuild average
     rentabilidade: number; 
@@ -42,7 +44,7 @@ interface RawDataState {
     error: string | null;
     rawLinesVendas: SalesGroupData[];
     rawLinesEcom: { branchName: string, valor: number }[];
-    rawBranchTickets: Record<string, number>;
+    rawBranchTickets: Record<string, { tkt: number; count: number }>;
     rawBranchDevols?: Record<string, number>;
     vendasUpdatedAt?: string;
 }
@@ -424,7 +426,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                     rawLinesEcom: parsedEcom,
                     rawBranchTickets: rawBranchTickets,
                     rawBranchDevols: rawBranchDevols,
-                    vendasUpdatedAt: String(vendasFileMeta.updated_at || vendasFileMeta.created_at || '')
+                    vendasUpdatedAt: String(vendasFileMeta.updated_at || vendasFileMeta.uploaded_at || '')
                 };
 
                 void CacheService.set<AnalysisParsedCache>(cacheKey, {

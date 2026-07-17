@@ -1917,7 +1917,7 @@ const PreVencidosManager: React.FC<PreVencidosManagerProps> = ({
 
     return buildAnalysisReportPayload({
       pvRecords,
-      effectiveSalesRecords,
+      salesRecords: effectiveSalesRecords,
       periodLabel: normalizedPeriod,
       finalizedCodes,
       meta: {

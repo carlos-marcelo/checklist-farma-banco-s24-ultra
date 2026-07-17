@@ -1114,7 +1114,7 @@ export interface DbAuditSession {
   branch: string;
   audit_number: number;
   status: 'open' | 'completed';
-  data: any; // Full AuditData JSON
+  data?: any; // Full AuditData JSON; omitted by metadata-only queries
   progress: number;
   user_email?: string;
   created_at?: string;

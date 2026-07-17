@@ -621,7 +621,7 @@ const findBarcodeInRow = (row: any[]): string => {
 
 const isDoneStatus = (status?: AuditStatus | string) => normalizeAuditStatus(status) === AuditStatus.DONE;
 const isInProgressStatus = (status?: AuditStatus | string) => normalizeAuditStatus(status) === AuditStatus.IN_PROGRESS;
-const normalizeScopeId = (val?: string | number | null) => (val === undefined || val === null ? '' : String(val));
+const normalizeScopeId = (val?: unknown) => (val === undefined || val === null ? '' : String(val));
 const normalizeAuditDataStructure = (input?: AuditData | null): { data: AuditData | null; changed: boolean } => {
     if (!input || !Array.isArray(input.groups)) return { data: input || null, changed: false };
 
@@ -919,10 +919,10 @@ const scopeContainsPartial = (
 };
 
 type ActivePartialScope = {
-    startedAt?: string;
-    groupId?: string | number;
-    deptId?: string | number;
-    catId?: string | number;
+    startedAt: string;
+    groupId?: string;
+    deptId?: string;
+    catId?: string;
 };
 
 const getAuditDataScopeCategoriesForPartials = (
@@ -1522,7 +1522,7 @@ const stripGlobalUnifiedTermMetricsFromData = <T extends any>(sourceData: T): T 
     if (!sourceData || typeof sourceData !== 'object') return sourceData;
 
     let changed = false;
-    const sourceDrafts = (sourceData.termDrafts || {}) as Record<string, TermForm>;
+    const sourceDrafts = ((sourceData as any).termDrafts || {}) as Record<string, TermForm>;
     const nextDrafts: Record<string, TermForm> = { ...sourceDrafts };
     Object.entries(sourceDrafts).forEach(([draftKey, draft]) => {
         if (!isGlobalUnifiedTermDraftKey(draftKey) || (!draft?.excelMetrics && !draft?.excelMetricsRemovedAt)) return;
@@ -1531,7 +1531,7 @@ const stripGlobalUnifiedTermMetricsFromData = <T extends any>(sourceData: T): T 
         changed = true;
     });
 
-    const sourceMetrics = (sourceData.termExcelMetricsByKey || {}) as Record<string, any>;
+    const sourceMetrics = ((sourceData as any).termExcelMetricsByKey || {}) as Record<string, any>;
     const nextMetrics = { ...sourceMetrics };
     Object.keys(nextMetrics).forEach(draftKey => {
         if (!isGlobalUnifiedTermDraftKey(draftKey)) return;
@@ -4820,9 +4820,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
     };
 
-    const normalizeText = (text?: string) => {
-        if (!text) return '';
-        return text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    const normalizeText = (text?: unknown) => {
+        if (text === undefined || text === null || text === '') return '';
+        return String(text).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
     };
 
     const parseDecimalCell = (val: any): number => {
@@ -9878,7 +9878,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 `R$ ${(p.countedCost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
                 `R$ ${(p.diffCost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
             ]);
-            const divFoot = [[
+            const divFoot: any[] = [[
                 { content: 'TOTAIS DAS DIVERGÊNCIAS', colSpan: 3, styles: { halign: 'right', fontStyle: 'bold' } },
                 Math.round(termMetricsForOutput.sysQty).toLocaleString(),
                 Math.round(termMetricsForOutput.countedQty).toLocaleString(),
@@ -9927,7 +9927,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 `R$ ${(p.cost || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
                 `R$ ${((p.cost || 0) * p.quantity).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
             ]);
-            const productFoot = [[
+            const productFoot: any[] = [[
                 { content: 'TOTAIS DOS ITENS CONFERIDOS', colSpan: 5, styles: { halign: 'right', fontStyle: 'bold' } },
                 Math.round(scopeInfo.products.reduce((acc, p) => acc + p.quantity, 0)).toLocaleString(),
                 '',
@@ -10090,14 +10090,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 event_meta: { reason: reason || 'manual', discarded_completed: discardCompleted }
             }).catch(() => { });
 
-            if (reason === 'expired' && !suppressExpiredAlert && !isUpdatingStock) {
-                if (sessionStorage.getItem(PARTIAL_EXPIRED_ALERT_KEY) !== '1') {
-                    sessionStorage.setItem(PARTIAL_EXPIRED_ALERT_KEY, '1');
-                    alert("Contagem parcial expirada. Inicie novamente para continuar.");
-                }
-            } else if (reason !== 'expired') {
-                sessionStorage.removeItem(PARTIAL_EXPIRED_ALERT_KEY);
-            }
+            sessionStorage.removeItem(PARTIAL_EXPIRED_ALERT_KEY);
         } catch (err) {
             console.error("Error clearing partial:", err);
         }
@@ -13843,11 +13836,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         {(() => {
                                             const termComparisonMetrics = termDisplayMetrics;
                                             if (!termComparisonMetrics) return null;
-                                            const scopeAuditedCost = Array.from((termScopeInfo?.categories as Map<string, any>)?.values() || []).reduce(
+                                            const scopeAuditedCost = (termScopeInfo?.categories || []).reduce(
                                                 (sum: number, cat: any) => sum + Number(cat.totalCost || 0),
                                                 0
                                             );
-                                            const scopeAuditedQty = Array.from((termScopeInfo?.categories as Map<string, any>)?.values() || []).reduce(
+                                            const scopeAuditedQty = (termScopeInfo?.categories || []).reduce(
                                                 (sum: number, cat: any) => sum + Number(cat.totalQuantity || 0),
                                                 0
                                             );

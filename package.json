@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "check:runtime": "node --max-old-space-size=3072 scripts/check-runtime-references.cjs",
+    "typecheck": "node --max-old-space-size=3072 node_modules/typescript/bin/tsc --noEmit --pretty false",
     "build": "vite build",
     "postbuild": "node scripts/postbuild.cjs",
     "deploy:ghpages": "git subtree push --prefix dist origin gh-pages",

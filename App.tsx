@@ -498,6 +498,27 @@ const auditScopeInputMatches = (input: string | undefined, values: unknown[]) =>
     });
 };
 
+const isPartialScopeMatch = (
+    partial: { groupId?: unknown; deptId?: unknown; catId?: unknown } | undefined,
+    groupId?: unknown,
+    deptId?: unknown,
+    catId?: unknown
+) => {
+    if (!partial) return false;
+    const dimensionMatches = (partialValue: unknown, requestedValue: unknown) => {
+        const partialValues = parseAuditScopeInputList(partialValue);
+        const requestedValues = parseAuditScopeInputList(requestedValue);
+        if (partialValues.length === 0 || requestedValues.length === 0) return true;
+        return requestedValues.some(value => auditScopeInputMatches(value, partialValues));
+    };
+
+    return (
+        dimensionMatches(partial.groupId, groupId) &&
+        dimensionMatches(partial.deptId, deptId) &&
+        dimensionMatches(partial.catId, catId)
+    );
+};
+
 const auditPartialScopeKey = (scope: { groupId?: unknown; deptId?: unknown; catId?: unknown }) =>
     [
         normalizeAuditScopeValue(scope.groupId),
@@ -7606,7 +7627,7 @@ const App: React.FC = () => {
 
         return (company.areas || [])
             .map((area: any) => {
-                const uniqueBranches = Array.from(new Set((area.branches || [])
+                const uniqueBranches = Array.from(new Set<string>((area.branches || [])
                     .map((branch: string) => String(branch || '').trim())
                     .filter(Boolean)));
                 const slots = uniqueBranches
@@ -7710,7 +7731,7 @@ const App: React.FC = () => {
     const scopedUsers = useMemo(() => {
         if (!currentUser) return [];
         if (currentUser.role === 'MASTER') return users;
-        if (currentUser.role !== 'MASTER' && currentUser.role !== 'ADMINISTRATIVO') {
+        if (currentUser.role !== 'ADMINISTRATIVO') {
             return users.filter(u => u.email === currentUser.email);
         }
         if (currentUser.company_id) {
@@ -8860,7 +8881,8 @@ const App: React.FC = () => {
             const pendingCost = roundAuditMoney(Math.max(0, totalCost - countedCost));
             // O progresso deve ser baseado em SKUs (como no AuditModule).
             // Para as auditorias "CONCLUIDA", o progresso real quando foram concluídas foi 100%.
-            const isCompleted = session.status === 'CONCLUIDA' || session.status === 'FECHADA';
+            const normalizedSessionStatus = String(session.status || '').trim().toLowerCase();
+            const isCompleted = ['completed', 'concluida', 'concluída', 'fechada'].includes(normalizedSessionStatus);
             const calculatedProgress = totalSkus > 0 ? (countedSkus / totalSkus) * 100 : Number(session.progress || 0);
             const progressPct = isCompleted ? 100 : calculatedProgress;
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
@@ -9491,7 +9513,8 @@ const App: React.FC = () => {
             const pendingCost = roundAuditMoney(Math.max(0, totalCost - countedCost));
             // O progresso deve ser baseado em SKUs (como no AuditModule).
             // Para as auditorias "CONCLUIDA", o progresso real quando foram concluídas foi 100%.
-            const isCompleted = session.status === 'CONCLUIDA' || session.status === 'FECHADA';
+            const normalizedSessionStatus = String(session.status || '').trim().toLowerCase();
+            const isCompleted = ['completed', 'concluida', 'concluída', 'fechada'].includes(normalizedSessionStatus);
             const calculatedProgress = totalSkus > 0 ? (countedSkus / totalSkus) * 100 : Number(session.progress || 0);
             const progressPct = isCompleted ? 100 : calculatedProgress;
             const divergencePct = countedCost > 0 ? (diffCost / countedCost) * 100 : 0;
@@ -10884,6 +10907,7 @@ const App: React.FC = () => {
                                                 void handleExportNetworkAuditsExcel(
                                                     dashboardCompletedAuditSessions,
                                                     'completed',
+                                                    'all',
                                                     'all'
                                                 );
                                                 return;
@@ -10891,6 +10915,7 @@ const App: React.FC = () => {
                                             void handleExportNetworkAuditsExcel(
                                                 dashboardAuditSessions,
                                                 'open',
+                                                'all',
                                                 'all'
                                             );
                                         }}
