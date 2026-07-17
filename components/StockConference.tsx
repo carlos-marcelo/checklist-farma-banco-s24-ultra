@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import { decodeStoredFilePayloadToFile } from '../src/filePayload';
 import {
   CheckCircle,
   AlertTriangle,
@@ -127,34 +128,14 @@ type StockSummaryPayload = {
 
 const GLOBAL_CADASTRO_MODULE_KEY = 'shared_cadastro_produtos';
 
-const decodeGlobalFileToBrowserFile = (file: SupabaseService.DbGlobalBaseFile): File | null => {
+const decodeGlobalFileToBrowserFile = async (file: SupabaseService.DbGlobalBaseFile): Promise<File | null> => {
   if ((file as any)._parsedFile) return (file as any)._parsedFile;
-
-  const raw = String(file?.file_data_base64 || '').trim();
-  if (!raw) return null;
-
-  let mimeType = file?.mime_type || 'application/octet-stream';
-  let base64 = raw;
-  const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.*)$/);
-  if (dataUrlMatch) {
-    mimeType = dataUrlMatch[1] || mimeType;
-    base64 = dataUrlMatch[2] || '';
-  }
-  if (!base64) return null;
-
   try {
-    const binary = window.atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-
     const originalName = file.file_name || `${file.module_key || 'base'}.xlsx`;
     const fileName = originalName.startsWith('[GLOBAL] ')
       ? originalName
       : `[GLOBAL] ${originalName}`;
-
-    return new File([bytes], fileName, { type: mimeType });
+    return await decodeStoredFilePayloadToFile(file.file_data_base64, fileName, file.mime_type);
   } catch (error) {
     console.error('Erro ao decodificar arquivo global de conferência:', error);
     return null;
@@ -1800,7 +1781,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
         if (cancelled) return;
         setGlobalProductMeta(globalCadastro);
         if (globalCadastro) {
-          const decoded = decodeGlobalFileToBrowserFile(globalCadastro);
+          const decoded = await decodeGlobalFileToBrowserFile(globalCadastro);
           setGlobalProductFile(decoded);
         } else {
           setGlobalProductFile(null);

@@ -1143,14 +1143,17 @@ const normalizeAuditAdjustmentList = (value: unknown): any[] => {
   if (!Array.isArray(value)) return [];
   return value
     .filter((item: any) => item && typeof item === 'object')
-    .map((item: any) => ({
-      ...item,
-      id: String(item.id || `${item.reducedCode || item.code || item.barcode || 'adj'}_${item.createdAt || ''}_${item.quantity || 0}_${item.totalCost || 0}`),
-      quantity: Number(item.quantity || 0),
-      unitCost: normalizeAuditAdjustmentNumber(item.unitCost),
-      totalCost: normalizeAuditAdjustmentNumber(item.totalCost),
-      createdAt: String(item.createdAt || new Date().toISOString())
-    }))
+    .map((item: any) => {
+      const { syncStatus: _syncStatus, syncToken: _syncToken, ...persistentItem } = item;
+      return {
+        ...persistentItem,
+        id: String(item.id || `${item.reducedCode || item.code || item.barcode || 'adj'}_${item.createdAt || ''}_${item.quantity || 0}_${item.totalCost || 0}`),
+        quantity: Number(item.quantity || 0),
+        unitCost: normalizeAuditAdjustmentNumber(item.unitCost),
+        totalCost: normalizeAuditAdjustmentNumber(item.totalCost),
+        createdAt: String(item.createdAt || new Date().toISOString())
+      };
+    })
     .filter((item: any) => Number.isFinite(Number(item.quantity)) && Math.abs(Number(item.quantity)) > 0);
 };
 
@@ -1158,7 +1161,15 @@ const mergeAuditPostAdjustments = (...lists: unknown[]): any[] => {
   const byId = new Map<string, any>();
   lists.forEach(list => {
     normalizeAuditAdjustmentList(list).forEach(item => {
-      byId.set(String(item.id), item);
+      const id = String(item.id);
+      const current = byId.get(id);
+      byId.set(id, {
+        ...current,
+        ...item,
+        trierAppliedAt: item.trierAppliedAt || current?.trierAppliedAt,
+        trierAppliedBy: item.trierAppliedBy || current?.trierAppliedBy,
+        trierAppliedByName: item.trierAppliedByName || current?.trierAppliedByName
+      });
     });
   });
   return Array.from(byId.values()).sort((a: any, b: any) =>
@@ -1231,8 +1242,18 @@ export async function upsertAuditSession(session: DbAuditSession): Promise<DbAud
   try {
     let safeData = session.data ? JSON.parse(JSON.stringify(session.data)) : null;
     const replacePostAuditAdjustments = !!safeData?.[POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG];
+    const deletedPostAuditAdjustmentIds = new Set<string>(
+      Array.isArray(safeData?.postAuditAdjustmentDeletedIds)
+        ? safeData.postAuditAdjustmentDeletedIds.map((id: unknown) => String(id))
+        : []
+    );
     if (safeData && Object.prototype.hasOwnProperty.call(safeData, POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG)) {
       delete safeData[POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG];
+    }
+    if (safeData) {
+      delete safeData.postAuditAdjustmentsPending;
+      delete safeData.postAuditAdjustmentsSyncToken;
+      delete safeData.postAuditAdjustmentDeletedIds;
     }
 
     if (safeData) {
@@ -1250,6 +1271,10 @@ export async function upsertAuditSession(session: DbAuditSession): Promise<DbAud
           existing?.data?.postAuditAdjustments,
           safeData.postAuditAdjustments
         );
+      }
+      if (deletedPostAuditAdjustmentIds.size > 0) {
+        safeData.postAuditAdjustments = normalizeAuditAdjustmentList(safeData.postAuditAdjustments)
+          .filter((item: any) => !deletedPostAuditAdjustmentIds.has(String(item.id)));
       }
     }
 
@@ -1278,6 +1303,55 @@ export async function upsertAuditSession(session: DbAuditSession): Promise<DbAud
     return data;
   } catch (error) {
     console.error('Error upserting audit session:', error);
+    return null;
+  }
+}
+
+export async function replaceAuditPostAdjustments(params: {
+  branch: string;
+  auditNumber: number;
+  adjustments: any[];
+  deletedAdjustmentIds?: string[];
+  userEmail?: string;
+}): Promise<DbAuditSession | null> {
+  const branch = String(params.branch || '').trim();
+  const auditNumber = Number(params.auditNumber || 0);
+  if (!branch || !auditNumber) return null;
+
+  try {
+    const existing = await fetchAuditSession(branch, auditNumber);
+    if (!existing || existing.status === 'completed' || !existing.data) return null;
+
+    const mergedById = new Map<string, any>();
+    normalizeAuditAdjustmentList(existing.data.postAuditAdjustments).forEach(item => {
+      mergedById.set(String(item.id), item);
+    });
+    normalizeAuditAdjustmentList(params.adjustments).forEach(item => {
+      const current = mergedById.get(String(item.id));
+      mergedById.set(String(item.id), {
+        ...current,
+        ...item,
+        trierAppliedAt: item.trierAppliedAt || current?.trierAppliedAt,
+        trierAppliedBy: item.trierAppliedBy || current?.trierAppliedBy,
+        trierAppliedByName: item.trierAppliedByName || current?.trierAppliedByName
+      });
+    });
+    (params.deletedAdjustmentIds || []).forEach(id => mergedById.delete(String(id)));
+
+    return await upsertAuditSession({
+      ...existing,
+      branch,
+      audit_number: auditNumber,
+      data: {
+        ...existing.data,
+        postAuditAdjustments: Array.from(mergedById.values()),
+        [POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG]: true
+      },
+      user_email: params.userEmail || existing.user_email,
+      updated_at: existing.updated_at
+    });
+  } catch (error) {
+    console.error('Error replacing post-audit adjustments:', error);
     return null;
   }
 }
@@ -2117,7 +2191,9 @@ export async function upsertGlobalBaseFile(file: DbGlobalBaseFile): Promise<DbGl
     const { data, error } = await supabase
       .from('global_base_files')
       .upsert(payload, { onConflict: 'company_id,module_key' })
-      .select()
+      // Não devolve o Base64 recém-enviado: isso duplicava o tráfego e a memória
+      // no upload de arquivos grandes sem trazer informação adicional à tela.
+      .select('id,company_id,module_key,file_name,mime_type,file_size,uploaded_by,uploaded_at,updated_at')
       .single();
     if (error) throw error;
     return data || null;

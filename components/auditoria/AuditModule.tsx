@@ -20,11 +20,13 @@ import {
     insertAppEventLog,
     fetchLatestAuditMetadata,
     fetchGlobalBaseFileMeta,
+    replaceAuditPostAdjustments,
     type DbGlobalBaseFile,
     type DbAuditSession
 } from '../../supabaseService';
 import { CadastrosBaseService } from '../../src/cadastrosBase/cadastrosBaseService';
 import { CacheService } from '../../src/cacheService';
+import { decodeStoredFilePayloadToFile } from '../../src/filePayload';
 import * as AuditStorage from '../../src/auditoria/storage';
 import ProgressBar from './ProgressBar';
 import Breadcrumbs from './Breadcrumbs';
@@ -399,30 +401,12 @@ const createInitialGroupMeta = (): Record<GroupUploadId, DbGlobalBaseFile | null
     "67": null
 });
 
-const decodeGlobalFileToBrowserFile = (file: DbGlobalBaseFile): File | null => {
+const decodeGlobalFileToBrowserFile = async (file: DbGlobalBaseFile): Promise<File | null> => {
     if ((file as any)._parsedFile) return (file as any)._parsedFile;
-
-    const raw = String(file?.file_data_base64 || '').trim();
-    if (!raw) return null;
-
-    let mimeType = file?.mime_type || 'application/octet-stream';
-    let base64 = raw;
-    const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.*)$/);
-    if (dataUrlMatch) {
-        mimeType = dataUrlMatch[1] || mimeType;
-        base64 = dataUrlMatch[2] || '';
-    }
-    if (!base64) return null;
-
     try {
-        const binary = window.atob(base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
-        }
         const originalName = file.file_name || `${file.module_key || 'base'}.xlsx`;
         const fileName = originalName.startsWith('[GLOBAL] ') ? originalName : `[GLOBAL] ${originalName}`;
-        return new File([bytes], fileName, { type: mimeType });
+        return await decodeStoredFilePayloadToFile(file.file_data_base64, fileName, file.mime_type);
     } catch (error) {
         console.error('Erro ao decodificar arquivo global da auditoria:', error);
         return null;
@@ -542,7 +526,12 @@ const normalizePostAuditAdjustments = (value: unknown): PostAuditAdjustment[] =>
                 note: item?.note ? String(item.note) : undefined,
                 createdAt: String(item?.createdAt || new Date().toISOString()),
                 createdBy: item?.createdBy ? String(item.createdBy) : undefined,
-                createdByName: item?.createdByName ? String(item.createdByName) : undefined
+                createdByName: item?.createdByName ? String(item.createdByName) : undefined,
+                trierAppliedAt: item?.trierAppliedAt ? String(item.trierAppliedAt) : undefined,
+                trierAppliedBy: item?.trierAppliedBy ? String(item.trierAppliedBy) : undefined,
+                trierAppliedByName: item?.trierAppliedByName ? String(item.trierAppliedByName) : undefined,
+                syncStatus: item?.syncStatus === 'pending' ? 'pending' : undefined,
+                syncToken: item?.syncToken ? String(item.syncToken) : undefined
             };
         })
         .filter((item): item is PostAuditAdjustment => !!item);
@@ -2299,6 +2288,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const canUseAuditMasterTools = isMaster || isAdmin;
     const canManageAuditLifecycle = canUseAuditMasterTools;
     const [data, setData] = useState<AuditData | null>(null);
+    const dataRef = useRef<AuditData | null>(null);
     const [view, setView] = useState<ViewState>({ level: 'groups' });
     const [isProcessing, setIsProcessing] = useState(false);
     const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
@@ -2388,11 +2378,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [postAdjustmentMode, setPostAdjustmentMode] = useState<'delta' | 'replace'>('replace');
     const [postAdjustmentError, setPostAdjustmentError] = useState<string | null>(null);
     const [isSavingPostAdjustment, setIsSavingPostAdjustment] = useState(false);
+    const postAuditAdjustmentsRef = useRef<PostAuditAdjustment[]>([]);
+    const postAdjustmentSyncQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const postAdjustmentQueuedTokensRef = useRef<Set<string>>(new Set());
     const lastAutoPostAdjustmentNoteRef = useRef('');
     const auditLookupInputRef = useRef<HTMLInputElement | null>(null);
     const postAdjustmentCodeInputRef = useRef<HTMLInputElement | null>(null);
     const postAdjustmentQtyInputRef = useRef<HTMLInputElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
+    useEffect(() => { dataRef.current = data; }, [data]);
     const [selectedEmpresa, setSelectedEmpresa] = useState(() => String(initialCompanyName || "Drogaria Cidade"));
     const [selectedFilial, setSelectedFilial] = useState(() => {
         const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
@@ -3261,7 +3255,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (Date.now() < foregroundQuietUntilRef.current) return;
             // Suspende polling caso alguma operação de salvamento em segundo plano esteja em andamento,
             // evitando sobrescrever o estado otimista da UI com dados antigos do banco (ex: Concluir Ativas).
-            if (partialFinalizeInFlightRef.current || isSavingTerm || isSavingPostAdjustment) return;
+            if (
+                partialFinalizeInFlightRef.current ||
+                isSavingTerm ||
+                isSavingPostAdjustment ||
+                dataRef.current?.postAuditAdjustmentsPending
+            ) return;
             void loadAuditNum(true);
         };
         const cancelWakeSync = () => {
@@ -3386,7 +3385,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const updateOnlineStatus = () => {
             const online = navigator.onLine;
             setIsOnline(online);
-            if (online) {
+            if (online && !dataRef.current?.postAuditAdjustmentsPending) {
                 void loadAuditNum(true);
             }
         };
@@ -3488,8 +3487,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const fullRemoteStock = await CadastrosBaseService.getGlobalBaseFileCached(companyId, stockModuleKey, { preferRemote: true });
             if (activeFilialRef.current !== branch) return;
 
+            const decodedStock = fullRemoteStock
+                ? await decodeGlobalFileToBrowserFile(fullRemoteStock as DbGlobalBaseFile)
+                : null;
             setGlobalStockMeta(fullRemoteStock as DbGlobalBaseFile | null);
-            setGlobalStockFile(fullRemoteStock ? decodeGlobalFileToBrowserFile(fullRemoteStock as DbGlobalBaseFile) : null);
+            setGlobalStockFile(decodedStock);
         } catch (error) {
             console.warn('[AuditFlow] Falha ao verificar estoque atualizado no Cadastro Base:', error);
         } finally {
@@ -3568,21 +3570,27 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     const moduleKey = GROUP_GLOBAL_BASE_KEYS[groupId];
                     const globalFile = byKey.get(moduleKey) || null;
                     nextGroupMeta[groupId] = globalFile;
-                    if (globalFile) {
-                        nextGroupFiles[groupId] = decodeGlobalFileToBrowserFile(globalFile);
-                    }
                 });
+
+                await Promise.all(GROUP_UPLOAD_IDS.map(async groupId => {
+                    const globalFile = nextGroupMeta[groupId];
+                    if (globalFile) nextGroupFiles[groupId] = await decodeGlobalFileToBrowserFile(globalFile);
+                }));
 
                 const deptMeta = byKey.get(AUDIT_DEPT_IDS_GLOBAL_KEY) || null;
                 const catMeta = byKey.get(AUDIT_CAT_IDS_GLOBAL_KEY) || null;
+                const [deptFile, catFile] = await Promise.all([
+                    deptMeta ? decodeGlobalFileToBrowserFile(deptMeta) : Promise.resolve(null),
+                    catMeta ? decodeGlobalFileToBrowserFile(catMeta) : Promise.resolve(null)
+                ]);
 
                 startTransition(() => {
                     setGlobalGroupFiles(nextGroupFiles);
                     setGlobalGroupMeta(nextGroupMeta);
                     setGlobalDeptIdsMeta(deptMeta);
                     setGlobalCatIdsMeta(catMeta);
-                    setGlobalDeptIdsFile(deptMeta ? decodeGlobalFileToBrowserFile(deptMeta) : null);
-                    setGlobalCatIdsFile(catMeta ? decodeGlobalFileToBrowserFile(catMeta) : null);
+                    setGlobalDeptIdsFile(deptFile);
+                    setGlobalCatIdsFile(catFile);
                 });
             } catch (error) {
                 console.error('Erro ao carregar bases estruturais globais da auditoria:', error);
@@ -3626,9 +3634,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     { forceFresh: true }
                 );
                 if (cancelled || activeFilialRef.current !== requestedFilial) return;
+                const decodedStock = stockMeta
+                    ? await decodeGlobalFileToBrowserFile(stockMeta as DbGlobalBaseFile)
+                    : null;
+                if (cancelled || activeFilialRef.current !== requestedFilial) return;
                 startTransition(() => {
                     setGlobalStockMeta(stockMeta as DbGlobalBaseFile | null);
-                    setGlobalStockFile(stockMeta ? decodeGlobalFileToBrowserFile(stockMeta as DbGlobalBaseFile) : null);
+                    setGlobalStockFile(decodedStock);
                 });
             } catch (error) {
                 console.error('Erro ao carregar estoque global da filial:', error);
@@ -6684,6 +6696,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         () => normalizePostAuditAdjustments((data as any)?.postAuditAdjustments),
         [data]
     );
+    useEffect(() => {
+        postAuditAdjustmentsRef.current = postAuditAdjustments;
+    }, [postAuditAdjustments]);
 
     const postAuditAdjustmentTotals = useMemo(() => {
         return postAuditAdjustments.reduce((acc, item) => ({
@@ -10762,6 +10777,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 const adjustmentRows = postAuditAdjustments.map(item => ({
                     'Data/Hora': item.createdAt ? new Date(item.createdAt).toLocaleString('pt-BR', { hour12: false }) : '',
                     'Usuário': item.createdBy || '',
+                    'Nome do Usuário': item.createdByName || '',
                     'Código Reduzido': item.reducedCode || item.code,
                     'Código de Barras': item.barcode || '',
                     'Descrição': item.description,
@@ -10771,7 +10787,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     'Qtd Ajuste': item.quantity,
                     'Custo Unitário (R$)': item.unitCost,
                     'Impacto Financeiro (R$)': item.totalCost,
-                    'Observação': item.note || ''
+                    'Observação': item.note || '',
+                    'Alterado na Trier': item.trierAppliedAt ? 'SIM' : 'NÃO',
+                    'Trier - Data/Hora': item.trierAppliedAt
+                        ? new Date(item.trierAppliedAt).toLocaleString('pt-BR', { hour12: false })
+                        : '',
+                    'Trier - Usuário': item.trierAppliedBy || '',
+                    'Trier - Nome': item.trierAppliedByName || ''
                 }));
                 const wsAdjustments = XLSX.utils.json_to_sheet(adjustmentRows);
                 XLSX.utils.book_append_sheet(wb, wsAdjustments, "Ajustes Pos Auditoria");
@@ -11192,8 +11214,98 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setAuditLookup('');
         setAuditLookupOpen(false);
     }, []);
-    const persistPostAuditAdjustments = useCallback(async (nextAdjustmentsRaw: PostAuditAdjustment[]) => {
-        if (!data || isReadOnlyCompletedView) return false;
+    const syncPostAuditAdjustmentSnapshot = useCallback((snapshot: AuditData) => {
+        const branch = toAuditBranchValue(snapshot.filial || '');
+        const auditNumber = getAuditNumberFromInventoryLabel(snapshot.inventoryNumber) || nextAuditNumber;
+        const syncToken = String(snapshot.postAuditAdjustmentsSyncToken || '');
+        if (!branch || !auditNumber || !syncToken || !snapshot.postAuditAdjustmentsPending) return;
+
+        const queueKey = `${branch}:${auditNumber}:${syncToken}`;
+        if (postAdjustmentQueuedTokensRef.current.has(queueKey)) return;
+        postAdjustmentQueuedTokensRef.current.add(queueKey);
+
+        const runSync = async () => {
+            if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+
+            const saved = await replaceAuditPostAdjustments({
+                branch,
+                auditNumber,
+                adjustments: normalizePostAuditAdjustments(snapshot.postAuditAdjustments),
+                deletedAdjustmentIds: snapshot.postAuditAdjustmentDeletedIds || [],
+                userEmail
+            });
+            if (!saved) return;
+
+            if (activeFilialRef.current === branch) {
+                setDbSessionId(saved.id);
+                setNextAuditNumber(saved.audit_number);
+                lastAuditUpdateRef.current = saved.updated_at || lastAuditUpdateRef.current;
+            }
+
+            const current = dataRef.current;
+            const currentBranch = toAuditBranchValue(current?.filial || '');
+            const currentAuditNumber = getAuditNumberFromInventoryLabel(current?.inventoryNumber) || nextAuditNumber;
+            if (
+                !current ||
+                currentBranch !== branch ||
+                currentAuditNumber !== auditNumber ||
+                current.postAuditAdjustmentsSyncToken !== syncToken
+            ) {
+                return;
+            }
+
+            const syncedAdjustments = normalizePostAuditAdjustments(current.postAuditAdjustments).map(item => {
+                const { syncStatus: _syncStatus, syncToken: _syncToken, ...persistentItem } = item;
+                return persistentItem as PostAuditAdjustment;
+            });
+            const syncedData: AuditData = {
+                ...current,
+                postAuditAdjustments: syncedAdjustments,
+                postAuditAdjustmentsPending: false,
+                postAuditAdjustmentsSyncToken: undefined,
+                postAuditAdjustmentDeletedIds: [],
+                pendingSync: false
+            };
+            dataRef.current = syncedData;
+            postAuditAdjustmentsRef.current = syncedAdjustments;
+            setData(syncedData);
+            await AuditStorage.saveLocalAuditSession(syncedData, false);
+        };
+
+        postAdjustmentSyncQueueRef.current = postAdjustmentSyncQueueRef.current
+            .catch(() => undefined)
+            .then(runSync)
+            .catch(error => {
+                console.error('[AuditFlow] Falha ao sincronizar ajustes após auditoria:', error);
+            })
+            .finally(() => {
+                postAdjustmentQueuedTokensRef.current.delete(queueKey);
+            });
+    }, [nextAuditNumber, userEmail]);
+
+    useEffect(() => {
+        if (!data?.postAuditAdjustmentsPending || !data.postAuditAdjustmentsSyncToken) return;
+
+        const trySync = () => {
+            if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+            syncPostAuditAdjustmentSnapshot(data);
+        };
+        trySync();
+        const interval = window.setInterval(trySync, 5000);
+        window.addEventListener('online', trySync);
+        return () => {
+            window.clearInterval(interval);
+            window.removeEventListener('online', trySync);
+        };
+    }, [data?.postAuditAdjustmentsPending, data?.postAuditAdjustmentsSyncToken, syncPostAuditAdjustmentSnapshot]);
+
+    const persistPostAuditAdjustments = useCallback(async (
+        nextAdjustmentsRaw: PostAuditAdjustment[],
+        changedAdjustmentIds?: string[],
+        deletedAdjustmentIds?: string[]
+    ) => {
+        const currentData = dataRef.current || data;
+        if (!currentData || isReadOnlyCompletedView) return false;
         const nextAdjustments = normalizePostAuditAdjustments(nextAdjustmentsRaw);
         const expectedBranch = toAuditBranchValue(selectedFilial);
         const expectedAuditNumber = Number(nextAuditNumber || 0);
@@ -11214,36 +11326,33 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setPostAdjustmentError('Ajuste bloqueado: os dados pertencem a outra filial ou auditoria. Reabra a filial correta antes de salvar.');
             return false;
         }
+        const syncToken = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+            ? crypto.randomUUID()
+            : `adj_sync_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const changedIds = new Set(changedAdjustmentIds || nextAdjustments.map(item => item.id));
+        const pendingAdjustments = nextAdjustments.map(item => changedIds.has(item.id)
+            ? { ...item, syncStatus: 'pending' as const, syncToken }
+            : item
+        );
         const nextData = {
-            ...data,
-            postAuditAdjustments: nextAdjustments,
-            termDrafts: composeTermDraftsForPersist(((data as any).termDrafts || {}) as Record<string, TermForm>, termDrafts)
+            ...currentData,
+            postAuditAdjustments: pendingAdjustments,
+            postAuditAdjustmentsPending: true,
+            postAuditAdjustmentsSyncToken: syncToken,
+            postAuditAdjustmentDeletedIds: Array.from(new Set([
+                ...(currentData.postAuditAdjustmentDeletedIds || []),
+                ...(deletedAdjustmentIds || [])
+            ])),
+            pendingSync: true,
+            termDrafts: composeTermDraftsForPersist(((currentData as any).termDrafts || {}) as Record<string, TermForm>, termDrafts)
         } as AuditData;
-        const dataToPersist = {
-            ...nextData,
-            __replacePostAuditAdjustments: true
-        } as any;
+        dataRef.current = nextData;
+        postAuditAdjustmentsRef.current = pendingAdjustments;
         setData(nextData);
-        const progress = calculateProgress(nextData);
-        const savedSession = await persistAuditSession({
-            id: dbSessionId,
-            branch: selectedFilial,
-            audit_number: nextAuditNumber,
-            status: 'open',
-            data: dataToPersist,
-            progress,
-            user_email: userEmail,
-            updated_at: lastAuditUpdateRef.current || undefined
-        });
-        if (!savedSession) {
-            setData(data);
-            return false;
-        }
-        setDbSessionId(savedSession.id);
-        setNextAuditNumber(savedSession.audit_number);
-        setData((savedSession.data as AuditData) || nextData);
+        AuditStorage.scheduleLocalAuditSessionSave(nextData, true);
+        syncPostAuditAdjustmentSnapshot(nextData);
         return true;
-    }, [data, isReadOnlyCompletedView, composeTermDraftsForPersist, termDrafts, calculateProgress, persistAuditSession, dbSessionId, selectedFilial, nextAuditNumber, userEmail]);
+    }, [data, isReadOnlyCompletedView, composeTermDraftsForPersist, termDrafts, selectedFilial, nextAuditNumber, syncPostAuditAdjustmentSnapshot]);
 
     const addPostAuditAdjustment = useCallback(async () => {
         if (isReadOnlyCompletedView) return;
@@ -11318,9 +11427,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             createdBy: userEmail,
             createdByName: userName || undefined
         };
-        setIsSavingPostAdjustment(true);
         try {
-            const saved = await persistPostAuditAdjustments([...postAuditAdjustments, adjustment]);
+            const saved = await persistPostAuditAdjustments([...postAuditAdjustmentsRef.current, adjustment], [adjustment.id]);
             if (saved) {
                 void insertAppEventLog({
                     company_id: selectedCompany?.id || null,
@@ -11357,15 +11465,25 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } finally {
             setIsSavingPostAdjustment(false);
         }
-    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentQty, postAdjustmentCode, postAdjustmentNote, postAdjustmentMode, postAdjustmentAuditedSnapshot, userEmail, userName, selectedCompany?.id, persistPostAuditAdjustments, postAuditAdjustments, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
+    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentQty, postAdjustmentCode, postAdjustmentNote, postAdjustmentMode, postAdjustmentAuditedSnapshot, userEmail, userName, selectedCompany?.id, persistPostAuditAdjustments, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
 
     const removePostAuditAdjustment = useCallback(async (id: string) => {
         if (isReadOnlyCompletedView) return;
-        const removedAdjustment = postAuditAdjustments.find(item => item.id === id);
-        setIsSavingPostAdjustment(true);
+        const currentAdjustments = postAuditAdjustmentsRef.current;
+        const removedAdjustment = currentAdjustments.find(item => item.id === id);
+        if (!removedAdjustment) return;
+        if (removedAdjustment.trierAppliedAt && !canUseAuditMasterTools) {
+            setPostAdjustmentError('Ajuste já marcado como lançado na Trier. Somente ADM ou Master pode excluí-lo.');
+            return;
+        }
+        const confirmed = window.confirm(
+            `${removedAdjustment.trierAppliedAt ? 'Este ajuste está marcado como lançado na Trier. ' : ''}` +
+            `A exclusão aqui NÃO desfaz nem altera dados na Trier.\n\nTem certeza de que deseja excluir este ajuste?`
+        );
+        if (!confirmed) return;
         setPostAdjustmentError(null);
         try {
-            const saved = await persistPostAuditAdjustments(postAuditAdjustments.filter(item => item.id !== id));
+            const saved = await persistPostAuditAdjustments(currentAdjustments.filter(item => item.id !== id), [], [id]);
             if (!saved) {
                 setPostAdjustmentError('Não foi possível remover o ajuste.');
             } else if (removedAdjustment) {
@@ -11396,7 +11514,55 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } finally {
             setIsSavingPostAdjustment(false);
         }
-    }, [isReadOnlyCompletedView, persistPostAuditAdjustments, postAuditAdjustments, selectedCompany?.id, selectedFilial, userEmail, userName, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
+    }, [isReadOnlyCompletedView, canUseAuditMasterTools, persistPostAuditAdjustments, selectedCompany?.id, selectedFilial, userEmail, userName, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
+
+    const confirmPostAuditAdjustmentInTrier = useCallback(async (id: string) => {
+        if (isReadOnlyCompletedView || !canUseAuditMasterTools) return;
+        const currentAdjustments = postAuditAdjustmentsRef.current;
+        const target = currentAdjustments.find(item => item.id === id);
+        if (!target || target.trierAppliedAt) return;
+        if (!window.confirm('Confirmar que este ajuste já foi realizado na Trier?')) return;
+
+        const confirmedAt = new Date().toISOString();
+        const nextAdjustments = currentAdjustments.map(item => item.id === id
+            ? {
+                ...item,
+                trierAppliedAt: confirmedAt,
+                trierAppliedBy: userEmail,
+                trierAppliedByName: userName || undefined
+            }
+            : item
+        );
+        setPostAdjustmentError(null);
+        const saved = await persistPostAuditAdjustments(nextAdjustments, [id]);
+        if (!saved) {
+            setPostAdjustmentError('Não foi possível registrar a confirmação da Trier.');
+            return;
+        }
+
+        void insertAppEventLog({
+            company_id: selectedCompany?.id || null,
+            branch: toAuditBranchValue(selectedFilial) || null,
+            area: null,
+            user_email: userEmail,
+            user_name: userName || null,
+            app: 'auditoria',
+            event_type: 'post_audit_adjustment_trier_confirmed',
+            entity_type: 'audit_adjustment',
+            entity_id: id,
+            status: 'success',
+            success: true,
+            source: 'web',
+            event_meta: {
+                auditNumber: nextAuditNumber,
+                inventoryNumber: target.inventoryNumber || data?.inventoryNumber || inventoryNumber,
+                reducedCode: target.reducedCode || target.code,
+                quantity: target.quantity,
+                totalCost: target.totalCost,
+                confirmedAt
+            }
+        }).catch(() => { });
+    }, [isReadOnlyCompletedView, canUseAuditMasterTools, userEmail, userName, persistPostAuditAdjustments, selectedCompany?.id, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
     const termScopeInfo = useMemo(() => (termModal ? buildTermScopeInfo(termModal) : null), [termModal, data]);
     const canEditTerm = canUseAuditMasterTools && !isReadOnlyCompletedView;
     const canFillTermSignatures = !isReadOnlyCompletedView;
@@ -12598,20 +12764,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     </div>
                                 </div>
 
-                                <div className="grid grid-cols-3 gap-2 mb-5">
+                                <div className="grid grid-cols-[0.75fr_0.85fr_1.4fr] gap-2 mb-5">
                                     <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 min-w-0">
                                         <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Itens</p>
                                         <p className="text-lg font-black text-slate-800 tabular-nums">{postAuditAdjustments.length}</p>
                                     </div>
                                     <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 min-w-0">
                                         <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Qtd</p>
-                                        <p className={`text-lg font-black tabular-nums whitespace-nowrap ${postAuditAdjustmentTotals.quantity < 0 ? 'text-red-600' : postAuditAdjustmentTotals.quantity > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
+                                        <p className={`text-base font-black tabular-nums whitespace-nowrap ${postAuditAdjustmentTotals.quantity < 0 ? 'text-red-600' : postAuditAdjustmentTotals.quantity > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
                                             {postAuditAdjustmentTotals.quantity > 0 ? '+' : ''}{postAuditAdjustmentTotals.quantity.toLocaleString('pt-BR')}
                                         </p>
                                     </div>
                                     <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 min-w-0">
                                         <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Valor</p>
-                                        <p className={`text-sm sm:text-base font-black tabular-nums leading-tight whitespace-nowrap ${postAuditAdjustmentTotals.cost < 0 ? 'text-red-600' : postAuditAdjustmentTotals.cost > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
+                                        <p className={`text-[13px] sm:text-sm font-black tabular-nums leading-tight whitespace-nowrap ${postAuditAdjustmentTotals.cost < 0 ? 'text-red-600' : postAuditAdjustmentTotals.cost > 0 ? 'text-emerald-600' : 'text-slate-800'}`}>
                                             {postAuditAdjustmentTotals.cost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
                                         </p>
                                     </div>
@@ -12758,8 +12924,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             </p>
                                         </div>
                                     ) : (
-                                        postAuditAdjustments.map(adjustment => (
-                                            <div key={adjustment.id} className="rounded-2xl border border-slate-100 bg-slate-50/80 p-3">
+                                        postAuditAdjustments.map(adjustment => {
+                                            const isPendingSync = adjustment.syncStatus === 'pending';
+                                            const isAppliedInTrier = !!adjustment.trierAppliedAt;
+                                            return (
+                                            <div
+                                                key={adjustment.id}
+                                                className={`rounded-2xl border p-3 transition-colors ${isPendingSync
+                                                    ? 'border-amber-300 bg-amber-50'
+                                                    : isAppliedInTrier
+                                                        ? 'border-emerald-400 bg-emerald-50'
+                                                        : 'border-slate-100 bg-slate-50/80'}`}
+                                            >
                                                 <div className="flex items-start justify-between gap-3">
                                                     <div className="min-w-0">
                                                         <p className="text-[11px] font-black uppercase text-slate-800 leading-tight break-words">{adjustment.description}</p>
@@ -12774,6 +12950,28 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                         {adjustment.note && (
                                                             <p className="mt-1 text-[10px] font-semibold text-slate-500 break-words">{adjustment.note}</p>
                                                         )}
+                                                        {isPendingSync && (
+                                                            <p className="mt-2 inline-flex items-center gap-1.5 text-[9px] font-black uppercase tracking-widest text-amber-700">
+                                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                                                Sincronizando com o banco
+                                                            </p>
+                                                        )}
+                                                        {isAppliedInTrier && (
+                                                            <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-100/70 px-2 py-1.5 text-[9px] font-bold leading-relaxed text-emerald-800">
+                                                                <p className="flex items-center gap-1 font-black uppercase tracking-wider">
+                                                                    <CheckCircle2 className="h-3.5 w-3.5" /> Alterado na Trier
+                                                                </p>
+                                                                <p className="mt-0.5 break-all">
+                                                                    Confirmado por: {adjustment.trierAppliedByName || adjustment.trierAppliedBy || 'Usuário não informado'}
+                                                                    {adjustment.trierAppliedByName && adjustment.trierAppliedBy ? ` (${adjustment.trierAppliedBy})` : ''}
+                                                                </p>
+                                                                <p>
+                                                                    {Number.isFinite(Date.parse(adjustment.trierAppliedAt || ''))
+                                                                        ? new Date(adjustment.trierAppliedAt!).toLocaleString('pt-BR', { hour12: false })
+                                                                        : 'Data não informada'}
+                                                                </p>
+                                                            </div>
+                                                        )}
                                                         <div className="mt-2 border-t border-slate-200/80 pt-2 text-[9px] font-bold leading-relaxed text-slate-500">
                                                             <p className="break-all">
                                                                 Lançado por: <span className="font-black text-slate-700">{adjustment.createdByName || adjustment.createdBy || 'Usuário não informado'}</span>
@@ -12786,14 +12984,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                             </p>
                                                         </div>
                                                     </div>
-                                                    <button
-                                                        onClick={() => void removePostAuditAdjustment(adjustment.id)}
-                                                        disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
-                                                        className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-400 hover:bg-red-50 hover:text-red-600 hover:border-red-200 disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center shrink-0"
-                                                        title="Remover ajuste"
-                                                    >
-                                                        <Trash2 className="w-4 h-4" />
-                                                    </button>
+                                                    <div className="flex shrink-0 items-center gap-1.5">
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => void confirmPostAuditAdjustmentInTrier(adjustment.id)}
+                                                            disabled={isReadOnlyCompletedView || !canUseAuditMasterTools || isAppliedInTrier}
+                                                            className={`w-8 h-8 rounded-lg border flex items-center justify-center transition-colors disabled:cursor-not-allowed ${isAppliedInTrier
+                                                                ? 'border-emerald-300 bg-emerald-600 text-white disabled:opacity-100'
+                                                                : 'border-slate-200 bg-white text-slate-400 hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-600 disabled:opacity-40'}`}
+                                                            title={isAppliedInTrier
+                                                                ? 'Ajuste já confirmado na Trier'
+                                                                : canUseAuditMasterTools
+                                                                    ? 'Marcar como alterado na Trier'
+                                                                    : 'Somente ADM ou Master pode confirmar a alteração na Trier'}
+                                                        >
+                                                            <CheckCircle2 className="w-4 h-4" />
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => void removePostAuditAdjustment(adjustment.id)}
+                                                            disabled={isReadOnlyCompletedView || isSavingPostAdjustment || (isAppliedInTrier && !canUseAuditMasterTools)}
+                                                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-400 hover:bg-red-50 hover:text-red-600 hover:border-red-200 disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center"
+                                                            title={isAppliedInTrier && !canUseAuditMasterTools
+                                                                ? 'Somente ADM ou Master pode excluir um ajuste confirmado na Trier'
+                                                                : 'Remover ajuste (não altera a Trier)'}
+                                                        >
+                                                            <Trash2 className="w-4 h-4" />
+                                                        </button>
+                                                    </div>
                                                 </div>
                                                 <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] font-black">
                                                     <div className="rounded-lg bg-white border border-slate-100 px-2 py-1">
@@ -12814,7 +13032,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                     </div>
                                                 </div>
                                             </div>
-                                        ))
+                                            );
+                                        })
                                     )}
                                 </div>
                             </div>

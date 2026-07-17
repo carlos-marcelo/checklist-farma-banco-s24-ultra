@@ -40,6 +40,11 @@ export interface PostAuditAdjustment {
     createdAt: string;
     createdBy?: string;
     createdByName?: string;
+    trierAppliedAt?: string;
+    trierAppliedBy?: string;
+    trierAppliedByName?: string;
+    syncStatus?: 'pending';
+    syncToken?: string;
 }
 
 export interface Category {
@@ -87,6 +92,9 @@ export interface AuditData {
         catId?: string;
     }>;
     postAuditAdjustments?: PostAuditAdjustment[];
+    postAuditAdjustmentsPending?: boolean;
+    postAuditAdjustmentsSyncToken?: string;
+    postAuditAdjustmentDeletedIds?: string[];
     lastPartialBatchId?: string;
     sharedExcelMetrics?: any;
     sharedGroupExcelMetrics?: Record<string, any>;

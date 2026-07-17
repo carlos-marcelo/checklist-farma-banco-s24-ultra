@@ -15,6 +15,7 @@ import {
     resolveBranchCity,
     stabilizeCompanyAreas
 } from '../../src/branchDirectory';
+import { decodeStoredFilePayloadToArrayBuffer } from '../../src/filePayload';
 
 interface AnaliseDashboardProps {
     currentUser: User;
@@ -223,8 +224,11 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 if (cancelled) return;
 
                 // 1. Parse Vendas Totais
-                const vendasRes = await fetch(vendasFileMeta.file_data_base64);
-                const vendasBuffer = await vendasRes.arrayBuffer();
+                const vendasBuffer = await decodeStoredFilePayloadToArrayBuffer(
+                    vendasFileMeta.file_data_base64,
+                    vendasFileMeta.mime_type
+                );
+                if (!vendasBuffer) throw new Error("Arquivo de 'Vendas Totais' vazio ou inválido.");
                 if (cancelled) return;
                 await yieldAnalysisFrame();
                 const vendasWb = XLSX.read(vendasBuffer, { type: 'array' });
@@ -363,8 +367,11 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 let parsedEcom: {branchName: string, valor: number}[] = [];
                 if (pedidosFileMeta?.file_data_base64) {
                     try {
-                        const pedRes = await fetch(pedidosFileMeta.file_data_base64);
-                        const pedBuffer = await pedRes.arrayBuffer();
+                        const pedBuffer = await decodeStoredFilePayloadToArrayBuffer(
+                            pedidosFileMeta.file_data_base64,
+                            pedidosFileMeta.mime_type
+                        );
+                        if (!pedBuffer) throw new Error("Arquivo de 'Pedidos' vazio ou inválido.");
                         if (cancelled) return;
                         await yieldAnalysisFrame();
                         const pedWb = XLSX.read(pedBuffer, { type: 'array' });

@@ -1,6 +1,7 @@
 import localforage from 'localforage';
 import * as SupabaseService from '../../supabaseService';
 import type { DbGlobalBaseFile } from '../../supabaseService';
+import { decodeStoredFilePayloadToBlob } from '../filePayload';
 
 // Configura o banco de dados IndexedDB via localforage
 localforage.config({
@@ -46,34 +47,14 @@ async function attachParsedFile(data: DbGlobalBaseFile & { _blob?: Blob, _parsed
   try {
     let blob = data._blob;
     if (!blob && data.file_data_base64) {
-      // Decode base64 to blob reliably (fetch with huge data URIs hangs on some browsers)
-      const raw = data.file_data_base64;
-      let mimeType = data.mime_type || 'application/octet-stream';
-      let base64 = raw;
-      if (raw.startsWith('data:')) {
-        const parts = raw.split(',');
-        base64 = parts[1];
-        mimeType = parts[0].split(':')[1].split(';')[0];
-      }
-
-      const binary = window.atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      const chunkSize = 512 * 1024;
-      for (let offset = 0; offset < binary.length; offset += chunkSize) {
-        const end = Math.min(binary.length, offset + chunkSize);
-        for (let i = offset; i < end; i++) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        if (end < binary.length) {
-          await new Promise<void>(resolve => window.setTimeout(resolve, 0));
-        }
-      }
-      blob = new Blob([bytes], { type: mimeType });
-      data._blob = blob;
+      blob = await decodeStoredFilePayloadToBlob(data.file_data_base64, data.mime_type);
+      if (blob) data._blob = blob;
     }
 
     if (blob) {
-      data._parsedFile = new File([blob], data.file_name, { type: data.mime_type || 'application/octet-stream' });
+      data._parsedFile = new File([blob], data.file_name || `${data.module_key || 'base'}.xlsx`, {
+        type: blob.type || data.mime_type || 'application/octet-stream'
+      });
     }
   } catch (err) {
     console.error('Erro ao fazer parse assíncrono do arquivo:', err);
@@ -243,6 +224,15 @@ export const CadastrosBaseService = {
     } catch (err) {
       console.error(`[CadastrosBaseService] Erro no sync em background (${moduleKey}):`, err);
     }
+  },
+
+  /** Remove somente a base alterada, preservando os demais arquivos já aquecidos. */
+  async invalidateGlobalBaseFile(companyId: string, moduleKey: string) {
+    const cacheKey = `global_base_${companyId}_${moduleKey}`;
+    inMemoryCache.delete(cacheKey);
+    lastValidationAt.delete(cacheKey);
+    pendingRequests.delete(cacheKey);
+    await localforage.removeItem(cacheKey);
   },
 
   /**

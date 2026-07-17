@@ -60,6 +60,7 @@ import {
 } from '../../supabaseService';
 import { CadastrosBaseService } from '../../src/cadastrosBase/cadastrosBaseService';
 import { CacheService } from '../../src/cacheService';
+import { decodeStoredFilePayloadToFile, encodeFileForStorage } from '../../src/filePayload';
 import {
   loadLocalPVSession,
   saveLocalPVSession,
@@ -438,35 +439,17 @@ const PreVencidosManager: React.FC<PreVencidosManagerProps> = ({
     }
   }, [fetchPVBranchRecordsWithTimeout, mapDbRecordsToPV]);
 
-  const decodeGlobalFileToBrowserFile = useCallback((file: {
+  const decodeGlobalFileToBrowserFile = useCallback(async (file: {
     file_name: string;
     file_data_base64: string | null;
     mime_type: string | null;
     module_key?: string;
     _parsedFile?: File;
-  }): File | null => {
+  }): Promise<File | null> => {
     if (file._parsedFile) return file._parsedFile;
-
-    const raw = String(file?.file_data_base64 || '').trim();
-    if (!raw) return null;
-
-    let mimeType = file?.mime_type || 'application/octet-stream';
-    let base64 = raw;
-    const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.*)$/);
-    if (dataUrlMatch) {
-      mimeType = dataUrlMatch[1] || mimeType;
-      base64 = dataUrlMatch[2] || '';
-    }
-    if (!base64) return null;
-
     try {
-      const binary = window.atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
       const fileName = file?.file_name || `${file?.module_key || 'base'}.xlsx`;
-      return new File([bytes], fileName, { type: mimeType });
+      return await decodeStoredFilePayloadToFile(file?.file_data_base64, fileName, file?.mime_type);
     } catch (error) {
       console.error('Erro ao decodificar arquivo global:', error);
       return null;
@@ -529,7 +512,7 @@ const PreVencidosManager: React.FC<PreVencidosManagerProps> = ({
         (!Number.isNaN(globalUpdated) && globalUpdated > reportUpdated);
 
       if (shouldImportFromGlobal) {
-        const stockFile = decodeGlobalFileToBrowserFile(globalStock as any);
+        const stockFile = await decodeGlobalFileToBrowserFile(globalStock as any);
         if (stockFile) {
           const records = await parseInventoryXLSX(stockFile);
           const fromGlobal: DbPVInventoryReport = {
@@ -923,7 +906,7 @@ const PreVencidosManager: React.FC<PreVencidosManagerProps> = ({
               const dcbGlobal = fileByKey.get('pre_dcb_base');
 
               if (systemGlobal && (finalSystem.length === 0 || hasMissingCacheForLab)) {
-                const systemFile = decodeGlobalFileToBrowserFile(systemGlobal as any);
+                const systemFile = await decodeGlobalFileToBrowserFile(systemGlobal as any);
                 if (systemFile) {
                   const parsedSystem = await parseSystemProductsXLSX(systemFile);
                   if (parsedSystem.length > 0) {
@@ -958,7 +941,7 @@ const PreVencidosManager: React.FC<PreVencidosManagerProps> = ({
               const shouldRefreshDcbFromGlobal = !!dcbGlobal && (finalDcb.length === 0 || hasWeakDcbCoverage || isGlobalDcbNewer);
 
               if (shouldRefreshDcbFromGlobal) {
-                const dcbFile = decodeGlobalFileToBrowserFile(dcbGlobal as any);
+                const dcbFile = await decodeGlobalFileToBrowserFile(dcbGlobal as any);
                 if (dcbFile) {
                   const parsedDcb = await parseDCBProductsXLSX(dcbFile);
                   const parsedValid = countValidDcb(parsedDcb);
@@ -2804,22 +2787,20 @@ const PreVencidosManager: React.FC<PreVencidosManagerProps> = ({
 
         const saved = await upsertPVInventoryReport(report);
         try {
-          const dataUrl = await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(String(reader.result || ''));
-            reader.onerror = reject;
-            reader.readAsDataURL(file);
-          });
+          const encodedFile = await encodeFileForStorage(file);
           await upsertGlobalBaseFile({
             company_id: sessionInfo.companyId,
             module_key: buildSharedStockModuleKey(sessionInfo.filial),
             file_name: file.name,
             mime_type: file.type || 'application/octet-stream',
             file_size: file.size,
-            file_data_base64: dataUrl,
+            file_data_base64: encodedFile.dataUrl,
             uploaded_by: userEmail || null
           });
-          await CadastrosBaseService.clearCache();
+          await CadastrosBaseService.invalidateGlobalBaseFile(
+            sessionInfo.companyId,
+            buildSharedStockModuleKey(sessionInfo.filial)
+          );
           globalBaseCacheRef.current.clear();
         } catch (globalSyncError) {
           console.warn('Falha ao sincronizar estoque no Cadastros Base:', globalSyncError);
