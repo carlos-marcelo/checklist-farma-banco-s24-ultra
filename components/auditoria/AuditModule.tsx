@@ -3335,6 +3335,38 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
     }, [selectedFilial, loadAuditNum]);
 
+    // Enquanto houver uma gravação local pendente, revalida em uma janela curta.
+    // O intervalo existe apenas durante o PEND e não aumenta o polling em estado LIVE.
+    useEffect(() => {
+        if (
+            !selectedFilial ||
+            !data?.pendingSync ||
+            data.postAuditAdjustmentsPending
+        ) return;
+
+        let cancelled = false;
+        const tryPendingSync = () => {
+            if (cancelled || document.hidden) return;
+            if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+            void loadAuditNum(true);
+        };
+        const handleResume = () => tryPendingSync();
+
+        tryPendingSync();
+        const interval = window.setInterval(tryPendingSync, 5_000);
+        window.addEventListener('online', handleResume);
+        window.addEventListener('focus', handleResume);
+        document.addEventListener('visibilitychange', handleResume);
+
+        return () => {
+            cancelled = true;
+            window.clearInterval(interval);
+            window.removeEventListener('online', handleResume);
+            window.removeEventListener('focus', handleResume);
+            document.removeEventListener('visibilitychange', handleResume);
+        };
+    }, [selectedFilial, data?.pendingSync, data?.postAuditAdjustmentsPending, loadAuditNum]);
+
     // Carrega rascunho pendente ao abrir o modal de histórico
     useEffect(() => {
         if (showCompletedAuditsModal) {
@@ -11388,15 +11420,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (!data?.postAuditAdjustmentsPending || !data.postAuditAdjustmentsSyncToken) return;
 
         const trySync = () => {
+            if (document.hidden) return;
             if (typeof navigator !== 'undefined' && !navigator.onLine) return;
             syncPostAuditAdjustmentSnapshot(data);
         };
+        const handleResume = () => trySync();
         trySync();
-        const interval = window.setInterval(trySync, 30_000);
-        window.addEventListener('online', trySync);
+        const interval = window.setInterval(trySync, 5_000);
+        window.addEventListener('online', handleResume);
+        window.addEventListener('focus', handleResume);
+        document.addEventListener('visibilitychange', handleResume);
         return () => {
             window.clearInterval(interval);
-            window.removeEventListener('online', trySync);
+            window.removeEventListener('online', handleResume);
+            window.removeEventListener('focus', handleResume);
+            document.removeEventListener('visibilitychange', handleResume);
         };
     }, [data?.postAuditAdjustmentsPending, data?.postAuditAdjustmentsSyncToken, syncPostAuditAdjustmentSnapshot]);
 

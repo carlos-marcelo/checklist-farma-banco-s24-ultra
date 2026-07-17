@@ -32,22 +32,27 @@ let postgrestNeedsRecoveryProbe = false;
 let postgrestRecoveryProbeInFlight = false;
 
 const TRANSIENT_POSTGREST_STATUS = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+const POSTGREST_RETRY_BASE_MS = 3_000;
+const POSTGREST_RETRY_MAX_MS = 30_000;
+
+const capPostgrestRetryMs = (retryMs: number): number =>
+  Math.min(POSTGREST_RETRY_MAX_MS, Math.max(POSTGREST_RETRY_BASE_MS, retryMs));
 
 const getRetryAfterMs = (response: Response): number => {
   const raw = String(response.headers.get('retry-after') || '').trim();
   if (raw) {
     const seconds = Number(raw);
-    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+    if (Number.isFinite(seconds) && seconds > 0) return capPostgrestRetryMs(seconds * 1000);
     const retryDate = Date.parse(raw);
-    if (Number.isFinite(retryDate)) return Math.max(0, retryDate - Date.now());
+    if (Number.isFinite(retryDate)) return capPostgrestRetryMs(retryDate - Date.now());
   }
-  return Math.min(2 * 60_000, 15_000 * (2 ** Math.max(0, postgrestFailureStreak - 1)));
+  return capPostgrestRetryMs(POSTGREST_RETRY_BASE_MS * (2 ** Math.max(0, postgrestFailureStreak - 1)));
 };
 
 const openPostgrestCircuit = (response?: Response) => {
   postgrestFailureStreak = Math.min(postgrestFailureStreak + 1, 5);
   const retryMs = response ? getRetryAfterMs(response) : getRetryAfterMs(new Response());
-  postgrestCircuitOpenUntil = Math.max(postgrestCircuitOpenUntil, Date.now() + Math.max(5_000, retryMs));
+  postgrestCircuitOpenUntil = Math.max(postgrestCircuitOpenUntil, Date.now() + retryMs);
   postgrestNeedsRecoveryProbe = true;
 };
 
