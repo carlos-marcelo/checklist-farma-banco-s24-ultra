@@ -2839,7 +2839,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             // Na reentrada, um snapshot cuja versão coincide com o metadado remoto já é
             // autoritativo. Só baixa o JSON completo quando a versão realmente mudou.
-            const mustFetchFullSnapshot = silent || (!cachedMatchingMeta && (!cachedCurrent || !!latestMeta));
+            const mustFetchFullSnapshot = silent || !latestMeta || !cachedMatchingMeta;
             const latestFromDbRaw = mustFetchFullSnapshot
                 ? await fetchLatestAudit(selectedFilial)
                 : null;
@@ -2860,7 +2860,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 if (fallbackCandidates.length > 0) {
                     const safeFallbackCandidates = fallbackCandidates.filter(candidate => {
                         if (candidate.status === 'completed') return true;
-                        return isAuditSessionConfirmed(candidate.id);
+                        // Auditoria aberta só pode ser restaurada do cache depois que o
+                        // metadado remoto confirmar que o banco está respondendo.
+                        return !!latestMeta && isAuditSessionConfirmed(candidate.id);
                     });
                     const pool = safeFallbackCandidates.length > 0 ? safeFallbackCandidates : fallbackCandidates.filter(c => c.status === 'completed');
                     if (pool.length === 0) {
@@ -3142,36 +3144,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     // Carga Inicial
     useEffect(() => {
-        const cacheKey = selectedFilial ? `audit_session_${selectedFilial}` : '';
-        const backupKey = selectedFilial ? `audit_session_lastgood_${selectedFilial}` : '';
-        const hotCandidates = selectedFilial
-            ? [CacheService.peek<DbAuditSession>(cacheKey), CacheService.peek<DbAuditSession>(backupKey)]
-                .map(item => guardAuditSessionForBranch(item, selectedFilial, 'hot-cache'))
-                .filter((item): item is DbAuditSession => !!item)
-            : [];
-        const hotSession = hotCandidates.find(item =>
-            item.status !== 'completed' &&
-            !!item.data &&
-            (item as any)._clientNormalizedVersion === AUDIT_CLIENT_NORMALIZED_VERSION &&
-            isAuditSessionConfirmed(item.id)
-        ) || null;
-
-        if (hotSession?.data && selectedFilial) {
-            const hotData = withAuditDataBranch(hotSession.data as AuditData, selectedFilial);
-            const hotDrafts = (((hotData as any).termDrafts || {}) as Record<string, TermForm>);
-            setData(hotData);
-            setTermDrafts(hotDrafts);
-            termDraftsRef.current = hotDrafts;
-            setDbSessionId(hotSession.id);
-            setNextAuditNumber(hotSession.audit_number);
-            setAllowActiveAuditAutoOpen(true);
-            lastAuditUpdateRef.current = hotSession.updated_at || null;
-        } else {
-            setData(null);
-            setTermDrafts({});
-            termDraftsRef.current = {};
-            setDbSessionId(undefined);
-        }
+        // Não abre auditoria ativa apenas com cache local. O cache continua sendo
+        // reutilizado depois da confirmação leve de metadados feita por loadAuditNum.
+        setData(null);
+        setTermDrafts({});
+        termDraftsRef.current = {};
+        setDbSessionId(undefined);
         setIsUpdatingStock(false);
         setIsTermsPanelCollapsed(true);
         setTermModal(null);
@@ -3180,9 +3158,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         completedAuditConsultationRef.current = false;
         setIsReadOnlyCompletedView(false);
         setConsultingAuditNumber(null);
-        if (!hotSession) setAllowActiveAuditAutoOpen(false);
+        setAllowActiveAuditAutoOpen(false);
         removedExcelDraftKeysRef.current.clear();
-        if (!hotSession) lastAuditUpdateRef.current = null;
+        lastAuditUpdateRef.current = null;
         lastAutoStockSyncKeyRef.current = '';
         if (selectedFilial) {
             loadAuditNum();
@@ -3847,7 +3825,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
     const persistAuditSession = useCallback(async (
         session: DbAuditSession,
-        options?: { allowProgressRegression?: boolean; allowCreate?: boolean; allowReopen?: boolean }
+        options?: {
+            allowProgressRegression?: boolean;
+            allowCreate?: boolean;
+            allowReopen?: boolean;
+            requireRemote?: boolean;
+        }
     ): Promise<DbAuditSession | null> => {
         const branch = toAuditBranchValue(session.branch || '');
         if (!branch || !session.audit_number) return null;
@@ -3888,8 +3871,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             };
         };
 
-        // Se estiver offline ou a conexão cair, salvamos apenas localmente com flag.
+        // Operações estruturais (início/reclassificação) exigem confirmação remota.
+        // As demais edições continuam podendo usar a fila local protegida.
         if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            if (options?.requireRemote) return null;
             return persistLocally(!!options?.allowCreate && !session.id);
         }
 
@@ -4066,6 +4051,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             });
             if (!saved) {
                 if (session.status === 'completed') return null;
+                if (options?.requireRemote) return null;
                 return persistLocally(allowCreate && !session.id && !exactSession?.id);
             }
             let savedForClient = saved;
@@ -4108,6 +4094,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 throw err;
             }
 
+            if (options?.requireRemote) return null;
             return persistLocally(!!options?.allowCreate && !session.id);
         } finally {
             setIsSyncing(false);
@@ -5182,9 +5169,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             data: persistedData,
             progress: progress,
             user_email: userEmail
-        });
+        }, { requireRemote: true });
         if (!savedSession) {
-            throw new Error("Falha ao salvar atualização de saldos no Supabase.");
+            throw new Error("O banco não confirmou a atualização de saldos. A auditoria não foi alterada; tente novamente após restabelecer a conexão.");
         }
 
         if (savedSession.id) setDbSessionId(savedSession.id);
@@ -5199,10 +5186,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setIsUpdatingStock(false);
         setView({ level: 'groups' });
         if (shouldNotify) {
-            alert(savedData.pendingSync
-                ? "Saldos atualizados localmente. A sincronização com o banco será concluída automaticamente."
-                : "Estoques atualizados (apenas para itens não finalizados)."
-            );
+            alert("Estoques atualizados e confirmados no banco (apenas para itens não finalizados).");
         }
         return true;
     };
@@ -6147,7 +6131,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 data: persistedData,
                 progress: progress,
                 user_email: userEmail
-            }, { allowProgressRegression: !!shouldReclassifyOpen, allowCreate: !shouldReclassifyOpen });
+            }, {
+                allowProgressRegression: !!shouldReclassifyOpen,
+                allowCreate: !shouldReclassifyOpen,
+                requireRemote: true
+            });
             if (!savedSession) {
                 throw new Error(shouldReclassifyOpen
                     ? "Falha ao salvar a reclassificação da auditoria aberta no Banco de Dados."
@@ -6167,11 +6155,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setFileStock(null);
             setIsUpdatingStock(false);
             setView({ level: 'groups' });
-            if (shouldReclassifyOpen && savedData.pendingSync) {
-                alert(
-                    "Reclassificação concluída localmente. Os dados, termos e ajustes foram preservados e aguardam sincronização com o banco."
-                );
-            } else if (shouldReclassifyOpen) {
+            if (shouldReclassifyOpen) {
                 alert("Saldos reclassificados e sincronizados com sucesso.");
             }
             if (mergeResult && (mergeResult.ignored.closedGroups > 0 || mergeResult.ignored.closedDepartments > 0)) {
