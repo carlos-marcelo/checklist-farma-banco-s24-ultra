@@ -1268,6 +1268,9 @@ export async function upsertAuditSession(session: DbAuditSession): Promise<DbAud
       delete safeData.postAuditAdjustmentsPending;
       delete safeData.postAuditAdjustmentsSyncToken;
       delete safeData.postAuditAdjustmentDeletedIds;
+      delete safeData.pendingSync;
+      delete safeData.pendingCreate;
+      delete safeData.lastLocalUpdate;
     }
 
     if (safeData) {

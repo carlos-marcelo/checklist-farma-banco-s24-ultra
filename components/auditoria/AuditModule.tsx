@@ -2752,7 +2752,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 CacheService.get<DbAuditSession>(cacheKey),
                 CacheService.get<DbAuditSession>(backupKey)
             ]);
-            const localData = silent ? null : await AuditStorage.loadLocalAuditSession();
+            const shouldCheckPendingLocal = !silent || !!dataRef.current?.pendingSync;
+            const localData = shouldCheckPendingLocal ? await AuditStorage.loadLocalAuditSession() : null;
             const hasPendingSync = !!localData?.pendingSync;
             let pendingSyncCompleted = false;
 
@@ -2772,12 +2773,19 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         const existingTarget = localBranch
                             ? guardAuditSessionForBranch(await fetchAuditSession(localBranch, localAuditNumber), localBranch, 'pending-local-sync')
                             : null;
-                        if (!dbSessionId && (!existingTarget || existingTarget.status === 'completed')) {
+                        const pendingCreate = !!localData.pendingCreate;
+                        if (existingTarget?.status === 'completed') {
                             console.warn(
-                                `Sincronização local pendente ignorada: não há inventário aberto Nº ${localAuditNumber} na filial ${localBranch || selectedFilial}.`
+                                `Sincronização local pendente ignorada: o inventário Nº ${localAuditNumber} da filial ${localBranch || selectedFilial} já está concluído.`
                             );
-                            await AuditStorage.saveLocalAuditSession(localData, false);
+                            const clearedLocal = { ...localData, pendingSync: false, pendingCreate: false };
+                            await AuditStorage.saveLocalAuditSession(clearedLocal, false);
                             setLocalPendingAudit(null);
+                        } else if (!dbSessionId && !existingTarget && !pendingCreate) {
+                            console.warn(
+                                `Sincronização local pendente mantida: ainda não foi possível confirmar o inventário Nº ${localAuditNumber} na filial ${localBranch || selectedFilial}.`
+                            );
+                            setLocalPendingAudit(localData);
                         } else {
                             const synced = await upsertAuditSession({
                                 id: dbSessionId || existingTarget?.id,
@@ -2790,7 +2798,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                 updated_at: lastAuditUpdateRef.current || undefined
                             });
                             if (synced) {
-                                await AuditStorage.saveLocalAuditSession(localData, false);
+                                const syncedLocal = { ...localData, pendingSync: false, pendingCreate: false };
+                                await AuditStorage.saveLocalAuditSession(syncedLocal, false);
+                                if (activeFilialRef.current === (localBranch || selectedFilial)) {
+                                    dataRef.current = syncedLocal;
+                                    setData(syncedLocal);
+                                    setDbSessionId(synced.id);
+                                    lastAuditUpdateRef.current = synced.updated_at || lastAuditUpdateRef.current;
+                                }
                                 pendingSyncCompleted = true;
                                 console.log("Sincronização automática concluída com sucesso.");
                             }
@@ -3347,7 +3362,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }
 
             const existingTarget = await fetchAuditSession(branch, auditNum);
-            if (!dbSessionId && (!existingTarget || existingTarget.status === 'completed')) {
+            const pendingCreate = !!local.pendingCreate;
+            if (existingTarget?.status === 'completed') {
+                alert(`O inventário Nº ${auditNum} da filial ${branch} já está concluído e não pode receber este rascunho local.`);
+                return;
+            }
+            if (!dbSessionId && !existingTarget && !pendingCreate) {
                 alert(
                     `O rascunho local não foi enviado porque não existe inventário aberto Nº ${auditNum} na filial ${branch}.\n\n` +
                     `Isso evita criar uma cópia indevida de inventário concluído. Inicie ou reabra o inventário correto antes de sincronizar.`
@@ -3367,7 +3387,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             });
             
             if (synced) {
-                await AuditStorage.saveLocalAuditSession(local, false);
+                const syncedLocal = { ...local, pendingSync: false, pendingCreate: false };
+                await AuditStorage.saveLocalAuditSession(syncedLocal, false);
+                dataRef.current = syncedLocal;
+                setData(syncedLocal);
+                setDbSessionId(synced.id);
                 setLocalPendingAudit(null);
                 alert("Sincronização manual concluída com sucesso!");
                 void loadAuditNum(true);
@@ -3814,13 +3838,25 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const incomingStrength = getAuditDataStrength(incomingData);
         const incomingProgress = Number(session.progress || 0);
 
-        // Se estiver offline ou a conexão cair, salvamos apenas localmente com flag
-        if (typeof navigator !== 'undefined' && !navigator.onLine) {
-            if (incomingData) {
-                await AuditStorage.saveLocalAuditSession(incomingData, true);
-                setData(prev => prev ? { ...prev, pendingSync: true } : prev);
+        const persistLocally = async (pendingCreate: boolean): Promise<DbAuditSession> => {
+            const pendingData = incomingData
+                ? { ...incomingData, pendingSync: true, pendingCreate }
+                : null;
+            if (pendingData) {
+                dataRef.current = pendingData;
+                await AuditStorage.saveLocalAuditSession(pendingData, true);
+                setData(pendingData);
             }
-            return { ...session, updated_at: new Date().toISOString() };
+            return {
+                ...session,
+                data: (pendingData || session.data) as any,
+                updated_at: new Date().toISOString()
+            };
+        };
+
+        // Se estiver offline ou a conexão cair, salvamos apenas localmente com flag.
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            return persistLocally(!!options?.allowCreate && !session.id);
         }
 
         try {
@@ -3994,6 +4030,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     : incomingData) as any,
                 updated_at: baseUpdatedAt || undefined
             });
+            if (!saved) {
+                if (session.status === 'completed') return null;
+                return persistLocally(allowCreate && !session.id && !exactSession?.id);
+            }
             let savedForClient = saved;
             if (saved?.updated_at) {
                 lastAuditUpdateRef.current = saved.updated_at;
@@ -4028,18 +4068,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             return savedForClient;
         } catch (err) {
             console.error("Erro ao persistir sessão (possível queda de rede):", err);
-            if (incomingData) {
-                await AuditStorage.saveLocalAuditSession(incomingData, true);
-                setData(prev => prev ? { ...prev, pendingSync: true } : prev);
-            }
-            
+
             // Se for finalização ('completed'), não fingimos sucesso total
             if (session.status === 'completed') {
                 throw err;
             }
-            
-            // Retorna um objeto simulando sucesso parcial para não travar a UI durante a contagem
-            return { ...session, updated_at: new Date().toISOString() };
+
+            return persistLocally(!!options?.allowCreate && !session.id);
         } finally {
             setIsSyncing(false);
         }
@@ -4980,7 +5015,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (isReadOnlyCompletedView || consultingAuditNumber !== null) {
             setIsUpdatingStock(false);
             if (options?.notify !== false) {
-                alert("Inventário concluído em modo consulta não pode receber reclassificação de estoque.");
+                alert("Inventário concluído em modo consulta não pode receber atualização de saldos.");
             }
             return false;
         }
@@ -5014,7 +5049,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             };
         });
 
-        const newData = { ...data };
+        // O merge de saldos não pode alterar o objeto atualmente renderizado antes
+        // de a persistência terminar, nem reconstruir a classificação da auditoria.
+        const newData: AuditData = {
+            ...data,
+            groups: (data.groups || []).map(group => ({
+                ...group,
+                departments: (group.departments || []).map(department => ({
+                    ...department,
+                    categories: (department.categories || []).map(category => ({
+                        ...category,
+                        products: (category.products || []).map(product => ({ ...product }))
+                    }))
+                }))
+            }))
+        };
         let appliedUnits = 0;
         const matchedReduced = new Set<string>();
         newData.groups.forEach(g => {
@@ -5084,10 +5133,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         } as any;
         const persistedData = applyPartialScopes(basePersistedData, safePartialStarts);
         const progress = calculateProgress(persistedData as AuditData);
+        const inventoryAuditNumber = getAuditNumberFromInventoryLabel((data as any)?.inventoryNumber);
+        const targetAuditNumber = Number(inventoryAuditNumber || latestOpenAudit?.audit_number || nextAuditNumber || 1);
+        const targetSessionId = dbSessionId || (
+            latestOpenAudit && Number(latestOpenAudit.audit_number || 0) === targetAuditNumber
+                ? latestOpenAudit.id
+                : undefined
+        );
         const savedSession = await persistAuditSession({
-            id: dbSessionId,
+            id: targetSessionId,
             branch: selectedFilial,
-            audit_number: nextAuditNumber,
+            audit_number: targetAuditNumber,
             status: 'open',
             data: persistedData,
             progress: progress,
@@ -5097,10 +5153,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             throw new Error("Falha ao salvar atualização de saldos no Supabase.");
         }
 
-        setDbSessionId(savedSession.id);
+        if (savedSession.id) setDbSessionId(savedSession.id);
         setNextAuditNumber(savedSession.audit_number);
         setTermDrafts(preservedTermDrafts as any);
-        setData((savedSession.data as AuditData) || (persistedData as AuditData));
+        const savedData = (savedSession.data as AuditData) || (persistedData as AuditData);
+        setData(savedData);
         setGroupFiles(createInitialGroupFiles());
         setFileDeptIds(null);
         setFileCatIds(null);
@@ -5108,7 +5165,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setIsUpdatingStock(false);
         setView({ level: 'groups' });
         if (shouldNotify) {
-            alert("Estoques atualizados (apenas para itens não finalizados).");
+            alert(savedData.pendingSync
+                ? "Saldos atualizados localmente. A sincronização com o banco será concluída automaticamente."
+                : "Estoques atualizados (apenas para itens não finalizados)."
+            );
         }
         return true;
     };
@@ -5138,9 +5198,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
         const sourceFiles = ((data as any).sourceFiles || {}) as any;
         const hasPendingGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
-        const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(sourceFiles, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta);
-        const hasPendingGlobalBase = hasPendingGlobalStock || hasPendingGlobalStructure;
-        if (!hasPendingGlobalBase) return;
+        // Uma auditoria em andamento recebe somente os novos saldos. Mudanças nos
+        // cadastros estruturais não devem reconstruir grupos/departamentos/categorias.
+        if (!hasPendingGlobalStock) return;
 
         const syncKey = `${dbSessionId || 'no_session'}|${selectedFilial}|${globalStockMeta.module_key}|${globalTs}|${globalStructureBaseSignature}`;
         if (lastAutoStockSyncKeyRef.current === syncKey) {
@@ -5154,7 +5214,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             stockTsRaw: globalTsRaw,
             syncKey,
             showAlert: true,
-            reason: hasPendingGlobalStock ? 'stock' : 'structure'
+            reason: 'stock'
         });
     }, [
         selectedFilial,
@@ -5164,9 +5224,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         canUseAuditMasterTools,
         globalStockFile,
         globalStockMeta,
-        globalGroupMeta,
-        globalDeptIdsMeta,
-        globalCatIdsMeta,
         globalStructureBaseSignature,
         dbSessionId,
         isReadOnlyCompletedView,
@@ -5192,10 +5249,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const hasOpenStructure = !!(data && data.groups && data.groups.length > 0);
         const shouldMergeStockOnly = hasOpenStructure;
         const sourceFiles = ((data as any)?.sourceFiles || {}) as any;
-        const hasPendingGlobalBase =
-            isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta) ||
-            isGlobalAuditStructureDifferentFromApplied(sourceFiles, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta);
-        const shouldReclassifyOpen = hasOpenStructure && hasStructureFiles && hasPendingGlobalBase;
+        const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(
+            sourceFiles,
+            globalGroupMeta,
+            globalDeptIdsMeta,
+            globalCatIdsMeta
+        );
+        // A tela "Atualizar Somente Saldos" nunca reconstrói a estrutura. Uma
+        // reclassificação estrutural precisa ser um fluxo deliberado e separado.
+        const shouldReclassifyOpen = hasOpenStructure && hasStructureFiles && hasPendingGlobalStructure && !isUpdatingStock;
         const mergePreservingDone = (
             baseData: AuditData,
             rebuiltData: AuditData

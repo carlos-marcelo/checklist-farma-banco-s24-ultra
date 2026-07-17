@@ -99,6 +99,7 @@ export interface AuditData {
     sharedExcelMetrics?: any;
     sharedGroupExcelMetrics?: Record<string, any>;
     pendingSync?: boolean;
+    pendingCreate?: boolean;
     lastLocalUpdate?: string;
 }
 
