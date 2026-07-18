@@ -2378,15 +2378,38 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [postAdjustmentMode, setPostAdjustmentMode] = useState<'delta' | 'replace'>('replace');
     const [postAdjustmentError, setPostAdjustmentError] = useState<string | null>(null);
     const [isSavingPostAdjustment, setIsSavingPostAdjustment] = useState(false);
-    // Produto externo (não encontrado na base auditada)
-    const [isManualProduct, setIsManualProduct] = useState(false);
-    const [manualProductDescription, setManualProductDescription] = useState('');
-    const [manualProductCost, setManualProductCost] = useState('');
-    const [manualProductGroup, setManualProductGroup] = useState('');
-    const [isSearchingProduct, setIsSearchingProduct] = useState(false);
-    // Debounce code: estado atualizado 300ms após a última digitação
+    // Codigo confirmado para busca (atualizado so no Enter - sem busca enquanto digita)
     const [postAdjustmentCodeDebounced, setPostAdjustmentCodeDebounced] = useState('');
-    const postAdjSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // Produto encontrado no cadastro base (nao na auditoria) apos Enter
+    const [baseProductFromCadastro, setBaseProductFromCadastro] = useState<{
+        productName: string;
+        unitCost: number;
+        stockQty: number;
+        groupId: string;
+        groupName: string;
+        deptId: string;
+        deptName: string;
+        catId: string;
+        catName: string;
+        barcode: string;
+        reducedCode: string;
+    } | null>(null);
+    // Indice local do cadastro base (estoque + arquivos de grupo) para lookup offline rapido
+    type CadastroBaseEntry = {
+        productName: string;
+        unitCost: number;
+        stockQty: number;
+        groupId: string;
+        groupName: string;
+        deptId: string;
+        deptName: string;
+        catId: string;
+        catName: string;
+        barcode: string;
+        reducedCode: string;
+    };
+    const cadastroBaseIndexRef = useRef<Map<string, CadastroBaseEntry>>(new Map());
+    const cadastroBaseIndexReadyRef = useRef(false);
     const postAuditAdjustmentsRef = useRef<PostAuditAdjustment[]>([]);
     const postAdjustmentSyncQueueRef = useRef<Promise<void>>(Promise.resolve());
     const postAdjustmentQueuedTokensRef = useRef<Set<string>>(new Set());
@@ -2394,6 +2417,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const auditLookupInputRef = useRef<HTMLInputElement | null>(null);
     const postAdjustmentCodeInputRef = useRef<HTMLInputElement | null>(null);
     const postAdjustmentQtyInputRef = useRef<HTMLInputElement | null>(null);
+    const postAdjustmentNoteInputRef = useRef<HTMLTextAreaElement | null>(null);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
     useEffect(() => { dataRef.current = data; }, [data]);
     const [selectedEmpresa, setSelectedEmpresa] = useState(() => String(initialCompanyName || "Drogaria Cidade"));
@@ -4868,7 +4892,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const shouldPrepareBarcodeAliases =
         auditLookupOpen ||
         !!auditLookup.trim() ||
-        !!postAdjustmentCode.trim();
+        !!postAdjustmentCodeDebounced.trim();
 
     useEffect(() => {
         if (!globalStockFile) {
@@ -4943,6 +4967,162 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         void loadCadastroAliases();
         return () => { cancelled = true; };
     }, [globalGroupFiles, shouldPrepareBarcodeAliases]);
+
+    // Constroi indice local do cadastro base em background (estoque + arquivos de grupo)
+    // Roda somente quando os arquivos mudam — NAO bloqueia a UI
+    useEffect(() => {
+        const stockFile = globalStockFile;
+        const groupFiles = GROUP_UPLOAD_IDS
+            .map(groupId => ({ groupId, file: globalGroupFiles[groupId] }))
+            .filter((entry): entry is { groupId: GroupUploadId; file: File } => !!entry.file);
+
+        if (!stockFile && groupFiles.length === 0) {
+            cadastroBaseIndexRef.current = new Map();
+            cadastroBaseIndexReadyRef.current = false;
+            return;
+        }
+
+        let cancelled = false;
+        const buildIndex = async () => {
+            cadastroBaseIndexReadyRef.current = false;
+            const index = new Map<string, CadastroBaseEntry>();
+            const addEntry = (
+                code: string,
+                entry: Omit<CadastroBaseEntry, 'reducedCode' | 'barcode'> & { reducedCode?: string; barcode?: string }
+            ) => {
+                const key = normalizeProductLookupCode(code);
+                if (!key) return;
+                if (!index.has(key)) {
+                    index.set(key, {
+                        ...entry,
+                        reducedCode: entry.reducedCode || '',
+                        barcode: entry.barcode || '',
+                    });
+                }
+            };
+
+            try {
+                // 1. Indexa do estoque: reduzido -> {nome, custo, qty, grupoId}
+                if (stockFile) {
+                    const stockRows = await readExcel(stockFile);
+                    if (cancelled) return;
+                    const stockAcc: Record<string, {
+                        q: number; costAmount: number; costUnit: number; name: string;
+                        groupId: string; barcode: string;
+                    }> = {};
+                    stockRows.forEach(row => {
+                        if (!row) return;
+                        const reduced = normalizeBarcode(row[1]); // B = reduzido
+                        if (!reduced) return;
+                        const qty = parseStockNumber(row[14]); // O = quantidade
+                        let cost = parseStockNumber(row[15]); // P = custo
+                        // Fix for items without explicit cost but in the file
+                        if (cost <= 0 && qty > 0 && row[16]) cost = parseStockNumber(row[16]);
+                        // Don't skip 0 qty items! They might have the base cost!
+                        const name = String(row[2] ?? row[4] ?? '').trim();
+                        const groupId = String(parseSheetNumericCode(row[6]) ?? ''); // G = grupo
+                        const barcode = collectProductCodeCandidates(row, 12)
+                            .find(c => c && c !== reduced && normalizeProductLookupCode(c).length >= 8) || '';
+                        const prev = stockAcc[reduced] || { q: 0, costAmount: 0, costUnit: 0, name, groupId, barcode };
+                        stockAcc[reduced] = {
+                            q: prev.q + qty,
+                            costUnit: cost > 0 ? cost : prev.costUnit,
+                            costAmount: prev.costAmount + (qty * cost),
+                            name: prev.name || name,
+                            groupId: prev.groupId || groupId,
+                            barcode: prev.barcode || barcode,
+                        };
+                    });
+                    await yieldToBrowser();
+                    if (cancelled) return;
+                    Object.entries(stockAcc).forEach(([reduced, acc]) => {
+                        const avgCost = (acc.q > 0 && acc.costAmount > 0) ? acc.costAmount / acc.q : acc.costUnit;
+                        const gId = normalizeScopeId(acc.groupId);
+                        const gName = GROUP_CONFIG_DEFAULTS[gId] || (gId ? `Grupo ${gId}` : 'Externo');
+                        const entry: CadastroBaseEntry = {
+                            productName: acc.name,
+                            unitCost: roundAuditMoney(avgCost),
+                            stockQty: acc.q,
+                            groupId: gId,
+                            groupName: gName,
+                            deptId: '',
+                            deptName: '',
+                            catId: '',
+                            catName: '',
+                            barcode: acc.barcode,
+                            reducedCode: reduced,
+                        };
+                        addEntry(reduced, entry);
+                        if (acc.barcode) addEntry(acc.barcode, { ...entry });
+                    });
+                }
+
+                // 2. Enriquece com info de dept/cat dos arquivos de cadastro de grupo
+                for (const { groupId: gUploadId, file } of groupFiles) {
+                    if (cancelled) return;
+                    const rows = await readExcel(file);
+                    if (cancelled) return;
+                    const gIdNorm = normalizeScopeId(gUploadId);
+                    const gName = GROUP_CONFIG_DEFAULTS[gIdNorm] || `Grupo ${gIdNorm}`;
+                    rows.forEach(row => {
+                        if (!row || row.length < 4) return;
+                        // col[2] = reduzido, col[11] = barcode, col[18] = dept, col[22] = cat
+                        const reduced = normalizeBarcode(row[2]);
+                        if (!reduced) return;
+                        const barcode = normalizeBarcode(row[11]);
+                        const deptRaw = String(row[18] ?? '').trim();
+                        const catRaw = String(row[22] ?? '').trim();
+                        if (!deptRaw && !catRaw) return;
+                        const deptParsed = parseHierarchyCells(row[18], row[19], 'DIVERSOS', ['GERAL']);
+                        const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS', ['GERAL']);
+
+                        const key = normalizeProductLookupCode(reduced);
+                        if (!key) return;
+                        const existing = index.get(key);
+                        if (existing) {
+                            // Enriquece com dept/cat do cadastro
+                            if (!existing.deptId && deptParsed.numericId) existing.deptId = normalizeScopeId(deptParsed.numericId);
+                            if (!existing.deptName && deptParsed.name) existing.deptName = deptParsed.name;
+                            if (!existing.catId && catParsed.numericId) existing.catId = normalizeScopeId(catParsed.numericId);
+                            if (!existing.catName && catParsed.name) existing.catName = catParsed.name;
+                            if (!existing.groupId) existing.groupId = gIdNorm;
+                            if (!existing.groupName) existing.groupName = gName;
+                            if (barcode && !existing.barcode) existing.barcode = barcode;
+                        } else {
+                            // Produto presente no cadastro mas nao no estoque
+                            const entry: CadastroBaseEntry = {
+                                productName: String(row[3] ?? row[4] ?? '').trim(),
+                                unitCost: 0,
+                                stockQty: 0,
+                                groupId: gIdNorm,
+                                groupName: gName,
+                                deptId: normalizeScopeId(deptParsed.numericId),
+                                deptName: deptParsed.name,
+                                catId: normalizeScopeId(catParsed.numericId),
+                                catName: catParsed.name,
+                                barcode: barcode || '',
+                                reducedCode: reduced,
+                            };
+                            addEntry(reduced, entry);
+                            if (barcode) addEntry(barcode, { ...entry });
+                        }
+                    });
+                    await yieldToBrowser();
+                }
+
+                if (!cancelled) {
+                    cadastroBaseIndexRef.current = index;
+                    cadastroBaseIndexReadyRef.current = true;
+                    console.log(`[AuditFlow] cadastroBaseIndex construido: ${index.size} entradas`);
+                }
+            } catch (err) {
+                console.warn('[AuditFlow] Falha ao construir cadastroBaseIndex:', err);
+            }
+        };
+
+        void buildIndex();
+        return () => { cancelled = true; };
+    }, [globalStockFile, globalGroupFiles]);
 
     const barcodeAliasToReduced = useMemo(() => {
         const next: Record<string, string> = {};
@@ -11119,31 +11299,64 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, [auditLookupIndex, normalizedAuditLookup, normalizedAuditLookupCode, barcodeAliasToReduced]);
     const normalizedPostAdjustmentCode = useMemo(() => normalizeProductLookupCode(postAdjustmentCodeDebounced), [postAdjustmentCodeDebounced]);
     const postAdjustmentProduct = useMemo(() => {
-        // Modo produto externo manual — constrói objeto sintético
-        if (isManualProduct) {
-            const desc = manualProductDescription.trim();
-            const cost = parseSignedAuditNumber(manualProductCost);
-            if (!desc || !Number.isFinite(cost) || cost <= 0) return null;
+        // Se produto vier do cadastro base (nao auditado), constroi objeto sintetico
+        if (baseProductFromCadastro && normalizedPostAdjustmentCode) {
             const codeRaw = postAdjustmentCodeDebounced.trim();
-            return {
-                groupId: manualProductGroup || 'EXT',
-                groupName: manualProductGroup || 'Externo',
-                deptId: '',
-                deptName: '',
-                catId: '',
-                catName: '',
-                deptCode: '',
-                catCode: '',
-                productName: desc,
-                barcode: codeRaw.length >= 8 ? codeRaw : '',
-                reducedCode: codeRaw.length < 8 ? codeRaw : '',
-                codeKeys: codeRaw ? [codeRaw] : [],
-                quantity: 0,
-                unitCost: roundAuditMoney(cost),
-                audited: false,
-                completedAt: null as string | null,
-                searchText: normalizeLookupText(`${codeRaw} ${desc}`)
-            };
+            // Verifica se nao foi encontrado no indice de auditoria
+            const foundInAudit = auditLookupIndex.some(item =>
+                item.codeKeys.includes(normalizedPostAdjustmentCode) ||
+                normalizeProductLookupCode(item.reducedCode) === normalizedPostAdjustmentCode
+            );
+            if (!foundInAudit) {
+                // Tenta resolver IDs vazios comparando nomes com os dados da base de grupos local
+                let resolvedGroupId = baseProductFromCadastro.groupId;
+                let resolvedDeptId = baseProductFromCadastro.deptId;
+                let resolvedCatId = baseProductFromCadastro.catId;
+
+                const normText = (s: string) => String(s || '').trim().toUpperCase();
+                
+                if (data && data.groups && (!resolvedDeptId || !resolvedCatId)) {
+                    for (const g of data.groups) {
+                        const gNameMatch = normText(g.name) === normText(baseProductFromCadastro.groupName);
+                        if (!resolvedGroupId && gNameMatch) resolvedGroupId = String(g.id);
+                        const matchGroup = gNameMatch || resolvedGroupId === String(g.id);
+                        if (!matchGroup) continue;
+
+                        for (const d of (g.departments || [])) {
+                            const dNameMatch = normText(d.name) === normText(baseProductFromCadastro.deptName);
+                            if (!resolvedDeptId && dNameMatch) resolvedDeptId = String(d.id);
+                            const matchDept = dNameMatch || resolvedDeptId === String(d.id);
+                            if (!matchDept) continue;
+
+                            for (const c of (d.categories || [])) {
+                                if (normText(c.name) === normText(baseProductFromCadastro.catName)) {
+                                    if (!resolvedCatId) resolvedCatId = String(c.id);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                return {
+                    groupId: resolvedGroupId || 'EXT',
+                    groupName: baseProductFromCadastro.groupName || 'Externo',
+                    deptId: resolvedDeptId,
+                    deptName: baseProductFromCadastro.deptName,
+                    catId: resolvedCatId,
+                    catName: baseProductFromCadastro.catName,
+                    deptCode: resolvedDeptId,
+                    catCode: resolvedCatId,
+                    productName: baseProductFromCadastro.productName,
+                    barcode: baseProductFromCadastro.barcode || (codeRaw.length >= 8 ? codeRaw : ''),
+                    reducedCode: baseProductFromCadastro.reducedCode || (codeRaw.length < 8 ? codeRaw : ''),
+                    codeKeys: [normalizedPostAdjustmentCode],
+                    quantity: baseProductFromCadastro.stockQty,
+                    unitCost: roundAuditMoney(baseProductFromCadastro.unitCost),
+                    audited: false,
+                    completedAt: null as string | null,
+                    searchText: normalizeLookupText(`${codeRaw} ${baseProductFromCadastro.productName}`)
+                };
+            }
         }
         if (normalizedPostAdjustmentCode) {
             const resolvedLookupCodes = Array.from(new Set([
@@ -11174,7 +11387,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const text = normalizeLookupText(postAdjustmentCodeDebounced);
         if (!text) return null;
         return auditLookupIndex.find(item => item.searchText.includes(text)) || null;
-    }, [auditLookupIndex, normalizedPostAdjustmentCode, postAdjustmentCodeDebounced, barcodeAliasToReduced, isManualProduct, manualProductDescription, manualProductCost, manualProductGroup]);
+    }, [auditLookupIndex, normalizedPostAdjustmentCode, postAdjustmentCodeDebounced, barcodeAliasToReduced, baseProductFromCadastro, data]);
 
     const termAuditedProductItems = useMemo(() => {
         if (!postAdjustmentProduct) return [];
@@ -11509,12 +11722,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         if (isReadOnlyCompletedView) return;
         setPostAdjustmentError(null);
         const product = postAdjustmentProduct;
-        const inputQuantity = parseSignedAuditNumber(postAdjustmentQty);
+        const codeValue = (postAdjustmentCodeInputRef.current?.value || '').trim();
+        const qtyValue = (postAdjustmentQtyInputRef.current?.value || '').trim();
+        const noteValue = (postAdjustmentNoteInputRef.current?.value || '').trim();
+        const inputQuantity = parseSignedAuditNumber(qtyValue);
         if (!product) {
             setPostAdjustmentError('Produto não encontrado pelo reduzido, código de barras ou descrição.');
             return;
         }
-        if (!String(postAdjustmentQty || '').trim()) {
+        if (!qtyValue) {
             setPostAdjustmentError(postAdjustmentMode === 'replace'
                 ? 'Informe a quantidade correta auditada.'
                 : 'Informe uma quantidade diferente de zero.');
@@ -11529,8 +11745,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         let previousAuditedQty: number | undefined;
         let replacementQuantity: number | undefined;
         if (postAdjustmentMode === 'replace') {
-            if (!postAdjustmentAuditedSnapshot && !isManualProduct) {
-                setPostAdjustmentError('Não foi possível identificar a quantidade auditada atual deste produto.');
+            if (!postAdjustmentAuditedSnapshot) {
+                setPostAdjustmentError('Não foi possível identificar a quantidade auditada atual deste produto. Use modo Somar/Subtrair para produtos do cadastro base.');
                 return;
             }
             previousAuditedQty = Number(postAdjustmentAuditedSnapshot.currentAuditedQty || 0);
@@ -11545,12 +11761,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             return;
         }
         const unitCost = roundAuditMoney(product.unitCost || 0);
-        if (!unitCost || !Number.isFinite(unitCost)) {
-            if (!isManualProduct) {
-                setPostAdjustmentError('Produto sem custo unitário válido. Use "Informar manualmente" para inserir o custo.');
-                return;
-            }
-        }
+        // Permitimos custo unitario 0 se for do cadastro base e não tiver custo.
         const id = typeof crypto !== 'undefined' && 'randomUUID' in crypto
             ? crypto.randomUUID()
             : `adj_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -11559,7 +11770,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             branch: toAuditBranchValue(selectedFilial),
             auditNumber: nextAuditNumber,
             inventoryNumber: data?.inventoryNumber || inventoryNumber,
-            code: product.reducedCode || product.barcode || postAdjustmentCode.trim(),
+            code: product.reducedCode || product.barcode || codeValue,
             barcode: product.barcode || undefined,
             reducedCode: product.reducedCode || undefined,
             description: product.productName,
@@ -11575,7 +11786,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             deptName: product.deptName,
             catId: product.catCode || product.catId,
             catName: product.catName,
-            note: postAdjustmentNote.trim() || undefined,
+            note: noteValue || undefined,
             createdAt: new Date().toISOString(),
             createdBy: userEmail,
             createdByName: userName || undefined
@@ -11606,27 +11817,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                         mode: adjustment.mode
                     }
                 }).catch(() => { });
-                setPostAdjustmentCode('');
+                if (postAdjustmentCodeInputRef.current) postAdjustmentCodeInputRef.current.value = '';
+                if (postAdjustmentQtyInputRef.current) postAdjustmentQtyInputRef.current.value = '';
+                if (postAdjustmentNoteInputRef.current) postAdjustmentNoteInputRef.current.value = '';
                 setPostAdjustmentCodeDebounced('');
-                setPostAdjustmentQty('');
-                setPostAdjustmentNote('');
+                setBaseProductFromCadastro(null);
                 // Não reseta o modo — mantém delta/replace para próximo ajuste
                 lastAutoPostAdjustmentNoteRef.current = '';
                 setPostAdjustmentError(null);
-                // Limpa estado de produto manual
-                if (isManualProduct) {
-                    setIsManualProduct(false);
-                    setManualProductDescription('');
-                    setManualProductCost('');
-                    setManualProductGroup('');
-                }
             } else {
                 setPostAdjustmentError('Não foi possível salvar o ajuste.');
             }
         } finally {
             setIsSavingPostAdjustment(false);
         }
-    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentQty, postAdjustmentCode, postAdjustmentNote, postAdjustmentMode, postAdjustmentAuditedSnapshot, userEmail, userName, selectedCompany?.id, persistPostAuditAdjustments, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber, isManualProduct, setIsManualProduct, setManualProductDescription, setManualProductCost, setManualProductGroup]);
+    }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentMode, postAdjustmentAuditedSnapshot, userEmail, userName, selectedCompany?.id, persistPostAuditAdjustments, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
 
     const removePostAuditAdjustment = useCallback(async (id: string) => {
         if (isReadOnlyCompletedView) return;
@@ -12976,7 +13181,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                 setPostAdjustmentMode('replace');
                                                 setPostAdjustmentError(null);
                                             }}
-                                            disabled={isReadOnlyCompletedView || isSavingPostAdjustment || isManualProduct}
+                                            disabled={isReadOnlyCompletedView || isSavingPostAdjustment || (!!baseProductFromCadastro && !postAdjustmentProduct?.audited)}
                                             className={`h-9 rounded-xl border text-[9px] font-black uppercase tracking-widest transition-all ${postAdjustmentMode === 'replace'
                                                 ? 'bg-indigo-600 text-white border-indigo-600'
                                                 : 'bg-white text-slate-500 border-slate-200 hover:border-indigo-200 hover:text-indigo-600'} disabled:bg-slate-100 disabled:text-slate-300 disabled:border-slate-100`}
@@ -12987,31 +13192,38 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px] gap-2">
                                         <input
                                             ref={postAdjustmentCodeInputRef}
-                                            value={postAdjustmentCode}
+                                            defaultValue=""
                                             onChange={(event) => {
+                                                if (postAdjustmentError) setPostAdjustmentError(null);
                                                 const val = event.target.value;
-                                                setPostAdjustmentCode(val);
-                                                setPostAdjustmentError(null);
-                                                // Debounce: só busca produto 300ms após parar de digitar
-                                                if (postAdjSearchTimerRef.current) clearTimeout(postAdjSearchTimerRef.current);
-                                                setIsSearchingProduct(!!val.trim());
-                                                postAdjSearchTimerRef.current = setTimeout(() => {
-                                                    startTransition(() => {
-                                                        setPostAdjustmentCodeDebounced(val);
-                                                        setIsSearchingProduct(false);
-                                                    });
-                                                }, 300);
-                                                // Se user limpar o campo, sair do modo manual
-                                                if (!val.trim() && isManualProduct) {
-                                                    setIsManualProduct(false);
-                                                    setManualProductDescription('');
-                                                    setManualProductCost('');
-                                                    setManualProductGroup('');
+                                                if (!val.trim() && postAdjustmentCodeDebounced !== '') {
+                                                    setPostAdjustmentCodeDebounced('');
+                                                    setBaseProductFromCadastro(null);
                                                 }
                                             }}
                                             onKeyDown={(event) => {
                                                 if (event.key !== 'Enter') return;
                                                 event.preventDefault();
+                                                const val = (postAdjustmentCodeInputRef.current?.value || '').trim();
+                                                if (!val) return;
+                                                // Busca no auditLookupIndex primeiro
+                                                startTransition(() => {
+                                                    setPostAdjustmentCodeDebounced(val);
+                                                });
+                                                // Se nao achou na auditoria, tenta no cadastroBaseIndex
+                                                const normCode = normalizeProductLookupCode(val);
+                                                const foundInAudit = auditLookupIndex.some(item =>
+                                                    item.codeKeys.includes(normCode) ||
+                                                    normalizeProductLookupCode(item.reducedCode) === normCode
+                                                );
+                                                if (!foundInAudit && cadastroBaseIndexReadyRef.current) {
+                                                    const baseEntry = cadastroBaseIndexRef.current.get(normCode) ||
+                                                        cadastroBaseIndexRef.current.get(barcodeAliasToReduced[normCode] || '');
+                                                    if (baseEntry) {
+                                                        // Auto-preenche com dados do cadastro base
+                                                        setBaseProductFromCadastro(baseEntry);
+                                                    }
+                                                }
                                                 postAdjustmentQtyInputRef.current?.focus();
                                                 postAdjustmentQtyInputRef.current?.select();
                                             }}
@@ -13021,10 +13233,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         />
                                         <input
                                             ref={postAdjustmentQtyInputRef}
-                                            value={postAdjustmentQty}
+                                            defaultValue=""
                                             onChange={(event) => {
-                                                setPostAdjustmentQty(event.target.value);
-                                                setPostAdjustmentError(null);
+                                                if (postAdjustmentError) setPostAdjustmentError(null);
                                             }}
                                             onKeyDown={(event) => {
                                                 if (event.key === 'Enter') void addPostAuditAdjustment();
@@ -13035,81 +13246,54 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         />
                                     </div>
                                     <textarea
-                                        value={postAdjustmentNote}
-                                        onChange={(event) => setPostAdjustmentNote(event.target.value)}
+                                        ref={postAdjustmentNoteInputRef}
+                                        defaultValue=""
+                                        onChange={(event) => {
+                                            if (postAdjustmentError) setPostAdjustmentError(null);
+                                        }}
                                         disabled={isReadOnlyCompletedView || isSavingPostAdjustment}
                                         placeholder="Observação"
                                         rows={3}
                                         className="min-h-[72px] w-full resize-y rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-300 disabled:bg-slate-100 disabled:text-slate-400"
                                     />
 
-                                    {isSearchingProduct ? (
-                                        <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] font-bold text-slate-400">
-                                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                            Buscando produto...
-                                        </div>
-                                    ) : !postAdjustmentProduct && postAdjustmentCodeDebounced.trim() && !isManualProduct ? (
+                                    {!postAdjustmentProduct && postAdjustmentCodeDebounced.trim() && !baseProductFromCadastro ? (
                                         <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
                                             <p className="text-[10px] font-black uppercase text-amber-800 leading-tight">
-                                                Produto não encontrado na base auditada
+                                                Produto não encontrado
                                             </p>
                                             <p className="mt-1 text-[10px] font-semibold text-amber-700">
-                                                O código &quot;{postAdjustmentCodeDebounced.trim()}&quot; não consta nas contagens. Você pode informar manualmente para incluir no ajuste.
+                                                O código &quot;{postAdjustmentCodeDebounced.trim()}&quot; não consta nas contagens nem no cadastro base. Verifique o código e pressione Enter novamente.
                                             </p>
-                                            <button
-                                                type="button"
-                                                onClick={() => {
-                                                    setIsManualProduct(true);
-                                                    setPostAdjustmentMode('delta');
-                                                }}
-                                                className="mt-2 h-8 px-3 rounded-lg bg-amber-600 text-white text-[10px] font-black uppercase tracking-widest hover:bg-amber-700 transition-colors"
-                                            >
-                                                Informar manualmente
-                                            </button>
                                         </div>
-                                    ) : isManualProduct ? (
-                                        <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 space-y-2">
+                                    ) : baseProductFromCadastro && !postAdjustmentProduct ? (
+                                        <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 space-y-1.5">
                                             <div className="flex items-center justify-between">
-                                                <p className="text-[10px] font-black uppercase text-blue-800">Produto externo / não auditado</p>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        setIsManualProduct(false);
-                                                        setManualProductDescription('');
-                                                        setManualProductCost('');
-                                                        setManualProductGroup('');
-                                                    }}
-                                                    className="text-[10px] font-bold text-blue-500 hover:text-blue-700 underline"
-                                                >
-                                                    Cancelar
-                                                </button>
+                                                <p className="text-[10px] font-black uppercase text-blue-800 leading-tight">
+                                                    {baseProductFromCadastro.productName || 'Produto do Cadastro Base'}
+                                                </p>
+                                                <span className="text-[9px] font-black uppercase tracking-widest bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full">
+                                                    Cadastro Base
+                                                </span>
                                             </div>
-                                            <input
-                                                type="text"
-                                                value={manualProductDescription}
-                                                onChange={e => setManualProductDescription(e.target.value)}
-                                                placeholder="Descrição do produto *"
-                                                className="w-full h-9 rounded-lg border border-blue-200 bg-white px-2 text-[11px] font-bold text-slate-700 outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400"
-                                            />
-                                            <div className="grid grid-cols-2 gap-2">
-                                                <input
-                                                    type="text"
-                                                    value={manualProductCost}
-                                                    onChange={e => setManualProductCost(e.target.value)}
-                                                    placeholder="Custo unitário * (ex: 12,50)"
-                                                    className="h-9 rounded-lg border border-blue-200 bg-white px-2 text-[11px] font-bold text-slate-700 outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400"
-                                                />
-                                                <input
-                                                    type="text"
-                                                    value={manualProductGroup}
-                                                    onChange={e => setManualProductGroup(e.target.value)}
-                                                    placeholder="Grupo (opcional)"
-                                                    className="h-9 rounded-lg border border-blue-200 bg-white px-2 text-[11px] font-bold text-slate-700 outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400"
-                                                />
+                                            <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] font-bold text-blue-700/80">
+                                                <span>Red. {baseProductFromCadastro.reducedCode || postAdjustmentCodeDebounced}</span>
+                                                {baseProductFromCadastro.barcode && <span>Barras {baseProductFromCadastro.barcode}</span>}
+                                                {baseProductFromCadastro.unitCost > 0 && (
+                                                    <span>Custo {baseProductFromCadastro.unitCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                                                )}
+                                                {baseProductFromCadastro.stockQty > 0 && <span>Estoque {baseProductFromCadastro.stockQty.toLocaleString('pt-BR')}</span>}
                                             </div>
-                                            <p className="text-[9px] font-semibold text-blue-600">
-                                                ⚠ Apenas modo Somar/Subtrair disponível para produtos externos.
-                                            </p>
+                                            {(baseProductFromCadastro.groupName || baseProductFromCadastro.deptName || baseProductFromCadastro.catName) && (
+                                                <p className="text-[9px] font-semibold text-blue-600">
+                                                    {[baseProductFromCadastro.groupName, baseProductFromCadastro.deptName, baseProductFromCadastro.catName].filter(Boolean).join(' › ')}
+                                                </p>
+                                            )}
+                                            {!baseProductFromCadastro.unitCost && (
+                                                <p className="text-[9px] font-bold text-amber-600 mt-1">
+                                                    ⚠ Custo não disponível no cadastro. Apenas modo Somar/Subtrair disponível.
+                                                </p>
+                                            )}
                                         </div>
                                     ) : postAdjustmentProduct ? (
                                         <div className="rounded-xl border border-emerald-100 bg-emerald-50/70 p-3">
