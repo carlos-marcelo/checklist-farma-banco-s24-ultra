@@ -7783,11 +7783,16 @@ const App: React.FC = () => {
         if (existingRequest) return existingRequest;
 
         const request = (async () => {
-            const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates)).filter(Boolean);
+            const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates))
+                .filter(Boolean)
+                .filter(branch => !SupabaseService.isTechnicalArchivedAuditBranch(branch));
             const dashboardCacheKey = buildAuditDashboardCacheKey('open', queryBranches);
             const dashboardMetaKey = `${dashboardCacheKey}_meta`;
-            const cachedRows = CacheService.peek<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
+            const cachedRowsRaw = CacheService.peek<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
                 || await CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey);
+            const cachedRows = Array.isArray(cachedRowsRaw)
+                ? cachedRowsRaw.filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch))
+                : cachedRowsRaw;
 
             if (Array.isArray(cachedRows) && cachedRows.length > 0) {
                 startTransition(() => {
@@ -7820,7 +7825,8 @@ const App: React.FC = () => {
             const { data: metadataRowsRaw, error: metadataError } = await metadataQuery;
             if (metadataError) throw metadataError;
 
-            const metadataRows = (metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>;
+            const metadataRows = ((metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>)
+                .filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch));
             const scopedMetadata = (currentUser.role === 'MASTER' || currentUser.role === 'ADMINISTRATIVO')
                 ? metadataRows
                 : metadataRows.filter(session => {
@@ -7950,11 +7956,16 @@ const App: React.FC = () => {
         if (existingRequest) return existingRequest;
 
         const request = (async () => {
-            const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates)).filter(Boolean);
+            const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates))
+                .filter(Boolean)
+                .filter(branch => !SupabaseService.isTechnicalArchivedAuditBranch(branch));
             const dashboardCacheKey = buildAuditDashboardCacheKey('completed', queryBranches);
             const dashboardMetaKey = `${dashboardCacheKey}_meta`;
-            const cachedRows = CacheService.peek<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
+            const cachedRowsRaw = CacheService.peek<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
                 || await CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey);
+            const cachedRows = Array.isArray(cachedRowsRaw)
+                ? cachedRowsRaw.filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch))
+                : cachedRowsRaw;
 
             if (Array.isArray(cachedRows) && cachedRows.length > 0) {
                 startTransition(() => {
@@ -7987,7 +7998,8 @@ const App: React.FC = () => {
             const { data: metadataRowsRaw, error: metadataError } = await metadataQuery;
             if (metadataError) throw metadataError;
 
-            const metadataRows = (metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>;
+            const metadataRows = ((metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>)
+                .filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch));
             const scopedMetadata = (currentUser.role === 'MASTER' || currentUser.role === 'ADMINISTRATIVO')
                 ? metadataRows
                 : metadataRows.filter(session => {
@@ -8466,6 +8478,7 @@ const App: React.FC = () => {
 
         const latestByBranchAndNumber = new Map<string, SupabaseService.DbAuditSession>();
         dashboardAuditSessions.forEach(session => {
+            if (SupabaseService.isTechnicalArchivedAuditBranch(session.branch)) return;
             const branchLabel = normalizeBranchLabel(session.branch);
             const auditNumber = Number(session.audit_number || 0);
             const key = `${branchLabel}_${auditNumber}`;
@@ -9108,6 +9121,7 @@ const App: React.FC = () => {
 
         const latestByBranchAndNumber = new Map<string, SupabaseService.DbAuditSession>();
         dashboardCompletedAuditSessions.forEach(session => {
+            if (SupabaseService.isTechnicalArchivedAuditBranch(session.branch)) return;
             const branchLabel = normalizeBranchLabel(session.branch);
             const auditNumber = Number(session.audit_number || 0);
             const key = `${branchLabel}_${auditNumber}`;

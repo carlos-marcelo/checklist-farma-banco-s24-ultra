@@ -180,6 +180,8 @@ const normalizeFilterText = (value: unknown) => String(value ?? '')
     .toLocaleLowerCase('pt-BR');
 
 const EMPTY_AUDIT_CROSS_ROWS: AuditCrossRow[] = [];
+const isTechnicalArchivedAuditBranch = (branch: unknown) =>
+    /(?:^|[_-])archived(?:[_-]reset)?[_-]\d{4}[-_]\d{2}[-_]\d{2}t/i.test(String(branch ?? '').trim());
 
 const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     rows,
@@ -205,24 +207,28 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     const [flowView, setFlowView] = useState<'branch' | 'area' | 'city'>('branch');
     const [expandedSignal, setExpandedSignal] = useState<string | null>(null);
     const signalResultsRef = useRef<HTMLDivElement>(null);
-
-    const areas = useMemo(
-        () => Array.from(new Set(rows.map(row => row.area).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'pt-BR')),
+    const safeRows = useMemo(
+        () => rows.filter(row => !isTechnicalArchivedAuditBranch(row.branch)),
         [rows]
     );
+
+    const areas = useMemo(
+        () => Array.from(new Set(safeRows.map(row => row.area).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'pt-BR')),
+        [safeRows]
+    );
     const cities = useMemo(
-        () => Array.from(new Set(rows
+        () => Array.from(new Set(safeRows
             .filter(row => areaFilter === 'all' || row.area === areaFilter)
             .map(row => String(row.city || '').trim())
             .filter(Boolean)))
             .sort((a, b) => a.localeCompare(b, 'pt-BR')),
-        [areaFilter, rows]
+        [areaFilter, safeRows]
     );
     const statusCounts = useMemo(() => ({
-        all: rows.length,
-        open: rows.filter(row => row.status === 'open').length,
-        completed: rows.filter(row => row.status === 'completed').length
-    }), [rows]);
+        all: safeRows.length,
+        open: safeRows.filter(row => row.status === 'open').length,
+        completed: safeRows.filter(row => row.status === 'completed').length
+    }), [safeRows]);
 
     const filteredRows = useMemo(() => {
         const branchNumbers = new Set<string>();
@@ -244,7 +250,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             freeTerms.push(token);
         });
 
-        return rows
+        return safeRows
             .filter(row => statusFilter === 'all' || row.status === statusFilter)
             .filter(row => areaFilter === 'all' || row.area === areaFilter)
             .filter(row => cityFilter === 'all' || row.city === cityFilter)
@@ -264,12 +270,12 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                 if (a.status !== b.status) return a.status === 'open' ? -1 : 1;
                 return b.auditNumber - a.auditNumber;
             });
-    }, [areaFilter, cityFilter, rows, search, statusFilter]);
+    }, [areaFilter, cityFilter, safeRows, search, statusFilter]);
 
     const selectedRows = useMemo(() => {
         const selected = new Set(selectedKeys);
-        return rows.filter(row => selected.has(row.key));
-    }, [rows, selectedKeys]);
+        return safeRows.filter(row => selected.has(row.key));
+    }, [safeRows, selectedKeys]);
 
     const scopeRows = selectedRows.length > 0 ? selectedRows : filteredRows;
     const shouldAnalyzeSignals = expanded && panelView === 'signals';

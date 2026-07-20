@@ -495,7 +495,7 @@ const parseSignedAuditNumber = (value: unknown): number => {
 
 const normalizePostAuditAdjustments = (value: unknown): PostAuditAdjustment[] => {
     if (!Array.isArray(value)) return [];
-    return value
+    const normalized = value
         .map((item: any): PostAuditAdjustment | null => {
             const quantity = Number(item?.quantity || 0);
             const unitCost = roundPostAuditMoney(item?.unitCost);
@@ -503,7 +503,9 @@ const normalizePostAuditAdjustments = (value: unknown): PostAuditAdjustment[] =>
             if (!Number.isFinite(unitCost)) return null;
             const totalCost = roundPostAuditMoney(item?.totalCost ?? (quantity * unitCost));
             return {
-                id: String(item?.id || `${Date.now()}_${Math.random().toString(36).slice(2)}`),
+                // Registros legados sem ID precisam receber sempre a mesma chave. Um ID
+                // aleatório a cada leitura fazia o mesmo lançamento reaparecer/duplicar.
+                id: String(item?.id || `${item?.reducedCode || item?.code || item?.barcode || 'adj'}_${item?.createdAt || ''}_${item?.quantity || 0}_${item?.totalCost || 0}`),
                 branch: item?.branch ? toAuditBranchValue(item.branch) : undefined,
                 auditNumber: Number.isFinite(Number(item?.auditNumber)) ? Number(item.auditNumber) : undefined,
                 inventoryNumber: item?.inventoryNumber ? String(item.inventoryNumber).trim() : undefined,
@@ -535,6 +537,21 @@ const normalizePostAuditAdjustments = (value: unknown): PostAuditAdjustment[] =>
             };
         })
         .filter((item): item is PostAuditAdjustment => !!item);
+
+    const byId = new Map<string, PostAuditAdjustment>();
+    normalized.forEach(item => {
+        const current = byId.get(item.id);
+        byId.set(item.id, current ? {
+            ...current,
+            ...item,
+            trierAppliedAt: item.trierAppliedAt || current.trierAppliedAt,
+            trierAppliedBy: item.trierAppliedBy || current.trierAppliedBy,
+            trierAppliedByName: item.trierAppliedByName || current.trierAppliedByName,
+            syncStatus: item.syncStatus || current.syncStatus,
+            syncToken: item.syncToken || current.syncToken
+        } : item);
+    });
+    return Array.from(byId.values());
 };
 
 const isHierarchyPlaceholderName = (value: unknown, extraInvalid: string[] = []) => {
@@ -2372,7 +2389,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [auditLookup, setAuditLookup] = useState('');
     const [auditLookupOpen, setAuditLookupOpen] = useState(false);
     const [isAuditLookupIndexPrewarmed, setIsAuditLookupIndexPrewarmed] = useState(false);
-    const [postAdjustmentCode, setPostAdjustmentCode] = useState('');
     const [postAdjustmentQty, setPostAdjustmentQty] = useState('');
     const [postAdjustmentNote, setPostAdjustmentNote] = useState('');
     const [postAdjustmentMode, setPostAdjustmentMode] = useState<'delta' | 'replace'>('replace');
@@ -2413,6 +2429,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const postAuditAdjustmentsRef = useRef<PostAuditAdjustment[]>([]);
     const postAdjustmentSyncQueueRef = useRef<Promise<void>>(Promise.resolve());
     const postAdjustmentQueuedTokensRef = useRef<Set<string>>(new Set());
+    const postAdjustmentMutationInFlightRef = useRef(false);
     const lastAutoPostAdjustmentNoteRef = useRef('');
     const auditLookupInputRef = useRef<HTMLInputElement | null>(null);
     const postAdjustmentCodeInputRef = useRef<HTMLInputElement | null>(null);
@@ -11587,10 +11604,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const runSync = async () => {
             if (typeof navigator !== 'undefined' && !navigator.onLine) return;
 
+            // Envia somente o patch desta mutação. Mandar o snapshot inteiro permitia
+            // que uma aba sobrescrevesse ajustes recém-gravados por outra pessoa.
+            const changedAdjustments = normalizePostAuditAdjustments(snapshot.postAuditAdjustments)
+                .filter(item => item.syncToken === syncToken);
             const saved = await replaceAuditPostAdjustments({
                 branch,
                 auditNumber,
-                adjustments: normalizePostAuditAdjustments(snapshot.postAuditAdjustments),
+                adjustments: changedAdjustments,
                 deletedAdjustmentIds: snapshot.postAuditAdjustmentDeletedIds || [],
                 userEmail
             });
@@ -11614,10 +11635,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return;
             }
 
-            const syncedAdjustments = normalizePostAuditAdjustments(current.postAuditAdjustments).map(item => {
+            const remoteAdjustments = normalizePostAuditAdjustments(saved.data?.postAuditAdjustments).map(item => {
                 const { syncStatus: _syncStatus, syncToken: _syncToken, ...persistentItem } = item;
                 return persistentItem as PostAuditAdjustment;
             });
+            const deletedIds = new Set(current.postAuditAdjustmentDeletedIds || []);
+            const syncedAdjustments = remoteAdjustments.filter(item => !deletedIds.has(item.id));
             const syncedData: AuditData = {
                 ...current,
                 postAuditAdjustments: syncedAdjustments,
@@ -11842,6 +11865,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             nextAdjustments.push(adjustment);
         }
 
+        if (postAdjustmentMutationInFlightRef.current) return;
+        postAdjustmentMutationInFlightRef.current = true;
+        setIsSavingPostAdjustment(true);
         try {
             const saved = await persistPostAuditAdjustments(nextAdjustments, [idToSave]);
             if (saved) {
@@ -11854,7 +11880,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     app: 'auditoria',
                     event_type: 'post_audit_adjustment_created',
                     entity_type: 'audit_adjustment',
-                    entity_id: adjustment.id,
+                    entity_id: idToSave,
                     status: 'success',
                     success: true,
                     source: 'web',
@@ -11869,8 +11895,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     }
                 }).catch(() => { });
                 if (postAdjustmentCodeInputRef.current) postAdjustmentCodeInputRef.current.value = '';
-                if (postAdjustmentQtyInputRef.current) postAdjustmentQtyInputRef.current.value = '';
-                if (postAdjustmentNoteInputRef.current) postAdjustmentNoteInputRef.current.value = '';
+                setPostAdjustmentQty('');
+                setPostAdjustmentNote('');
                 setPostAdjustmentCodeDebounced('');
                 setBaseProductFromCadastro(null);
                 // Não reseta o modo — mantém delta/replace para próximo ajuste
@@ -11879,7 +11905,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             } else {
                 setPostAdjustmentError('Não foi possível salvar o ajuste.');
             }
+        } catch (error) {
+            console.error('[AuditFlow] Falha ao persistir ajuste após auditoria:', error);
+            setPostAdjustmentError('Não foi possível salvar o ajuste localmente. Os campos foram mantidos; tente novamente.');
         } finally {
+            postAdjustmentMutationInFlightRef.current = false;
             setIsSavingPostAdjustment(false);
         }
     }, [isReadOnlyCompletedView, postAdjustmentProduct, postAdjustmentMode, postAdjustmentAuditedSnapshot, userEmail, userName, selectedCompany?.id, persistPostAuditAdjustments, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
@@ -11898,6 +11928,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             `A exclusão aqui NÃO desfaz nem altera dados na Trier.\n\nTem certeza de que deseja excluir este ajuste?`
         );
         if (!confirmed) return;
+        if (postAdjustmentMutationInFlightRef.current) return;
+        postAdjustmentMutationInFlightRef.current = true;
+        setIsSavingPostAdjustment(true);
         setPostAdjustmentError(null);
         try {
             const saved = await persistPostAuditAdjustments(currentAdjustments.filter(item => item.id !== id), [], [id]);
@@ -11928,7 +11961,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     }
                 }).catch(() => { });
             }
+        } catch (error) {
+            console.error('[AuditFlow] Falha ao remover ajuste após auditoria:', error);
+            setPostAdjustmentError('Não foi possível remover o ajuste. Tente novamente.');
         } finally {
+            postAdjustmentMutationInFlightRef.current = false;
             setIsSavingPostAdjustment(false);
         }
     }, [isReadOnlyCompletedView, canUseAuditMasterTools, persistPostAuditAdjustments, selectedCompany?.id, selectedFilial, userEmail, userName, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
@@ -11939,6 +11976,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         const target = currentAdjustments.find(item => item.id === id);
         if (!target || target.trierAppliedAt) return;
         if (!window.confirm('Confirmar que este ajuste já foi realizado na Trier?')) return;
+        if (postAdjustmentMutationInFlightRef.current) return;
+        postAdjustmentMutationInFlightRef.current = true;
+        setIsSavingPostAdjustment(true);
 
         const confirmedAt = new Date().toISOString();
         const nextAdjustments = currentAdjustments.map(item => item.id === id
@@ -11951,34 +11991,42 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             : item
         );
         setPostAdjustmentError(null);
-        const saved = await persistPostAuditAdjustments(nextAdjustments, [id]);
-        if (!saved) {
-            setPostAdjustmentError('Não foi possível registrar a confirmação da Trier.');
-            return;
-        }
-
-        void insertAppEventLog({
-            company_id: selectedCompany?.id || null,
-            branch: toAuditBranchValue(selectedFilial) || null,
-            area: null,
-            user_email: userEmail,
-            user_name: userName || null,
-            app: 'auditoria',
-            event_type: 'post_audit_adjustment_trier_confirmed',
-            entity_type: 'audit_adjustment',
-            entity_id: id,
-            status: 'success',
-            success: true,
-            source: 'web',
-            event_meta: {
-                auditNumber: nextAuditNumber,
-                inventoryNumber: target.inventoryNumber || data?.inventoryNumber || inventoryNumber,
-                reducedCode: target.reducedCode || target.code,
-                quantity: target.quantity,
-                totalCost: target.totalCost,
-                confirmedAt
+        try {
+            const saved = await persistPostAuditAdjustments(nextAdjustments, [id]);
+            if (!saved) {
+                setPostAdjustmentError('Não foi possível registrar a confirmação da Trier.');
+                return;
             }
-        }).catch(() => { });
+
+            void insertAppEventLog({
+                company_id: selectedCompany?.id || null,
+                branch: toAuditBranchValue(selectedFilial) || null,
+                area: null,
+                user_email: userEmail,
+                user_name: userName || null,
+                app: 'auditoria',
+                event_type: 'post_audit_adjustment_trier_confirmed',
+                entity_type: 'audit_adjustment',
+                entity_id: id,
+                status: 'success',
+                success: true,
+                source: 'web',
+                event_meta: {
+                    auditNumber: nextAuditNumber,
+                    inventoryNumber: target.inventoryNumber || data?.inventoryNumber || inventoryNumber,
+                    reducedCode: target.reducedCode || target.code,
+                    quantity: target.quantity,
+                    totalCost: target.totalCost,
+                    confirmedAt
+                }
+            }).catch(() => { });
+        } catch (error) {
+            console.error('[AuditFlow] Falha ao confirmar ajuste na Trier:', error);
+            setPostAdjustmentError('Não foi possível registrar a confirmação da Trier. Tente novamente.');
+        } finally {
+            postAdjustmentMutationInFlightRef.current = false;
+            setIsSavingPostAdjustment(false);
+        }
     }, [isReadOnlyCompletedView, canUseAuditMasterTools, userEmail, userName, persistPostAuditAdjustments, selectedCompany?.id, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
     const termScopeInfo = useMemo(() => (termModal ? buildTermScopeInfo(termModal) : null), [termModal, data]);
     const canEditTerm = canUseAuditMasterTools && !isReadOnlyCompletedView;
@@ -13284,8 +13332,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                         />
                                         <input
                                             ref={postAdjustmentQtyInputRef}
-                                            defaultValue=""
+                                            value={postAdjustmentQty}
                                             onChange={(event) => {
+                                                setPostAdjustmentQty(event.target.value);
                                                 if (postAdjustmentError) setPostAdjustmentError(null);
                                             }}
                                             onKeyDown={(event) => {
@@ -13298,8 +13347,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                     </div>
                                     <textarea
                                         ref={postAdjustmentNoteInputRef}
-                                        defaultValue=""
+                                        value={postAdjustmentNote}
                                         onChange={(event) => {
+                                            setPostAdjustmentNote(event.target.value);
                                             if (postAdjustmentError) setPostAdjustmentError(null);
                                         }}
                                         disabled={isReadOnlyCompletedView || isSavingPostAdjustment}

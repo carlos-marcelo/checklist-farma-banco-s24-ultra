@@ -1121,6 +1121,12 @@ export interface DbAuditSession {
   updated_at?: string;
 }
 
+// Backups técnicos legados usam nomes como "3_archived_reset_<timestamp>_3"
+// ou "14_archived_<timestamp>". O timestamp torna o filtro estrito para não
+// ocultar uma filial real que eventualmente contenha a palavra "archived".
+export const isTechnicalArchivedAuditBranch = (branch: unknown): boolean =>
+  /(?:^|[_-])archived(?:[_-]reset)?[_-]\d{4}[-_]\d{2}[-_]\d{2}t/i.test(String(branch ?? '').trim());
+
 export interface DbAuditTermDraft {
   id?: string;
   branch: string;
@@ -1336,6 +1342,29 @@ export async function replaceAuditPostAdjustments(params: {
   if (!branch || !auditNumber) return null;
 
   try {
+    // Caminho atômico: a função bloqueia apenas a sessão alvo e aplica um patch
+    // por ID, sem regravar o restante do JSON da auditoria.
+    const { data: atomicData, error: atomicError } = await supabase.rpc('apply_audit_post_adjustments', {
+      p_branch: branch,
+      p_audit_number: auditNumber,
+      p_adjustments: normalizeAuditAdjustmentList(params.adjustments),
+      p_deleted_adjustment_ids: (params.deletedAdjustmentIds || []).map(String),
+      p_user_email: params.userEmail || null
+    });
+    if (!atomicError && atomicData) {
+      const atomicSession = (Array.isArray(atomicData) ? atomicData[0] : atomicData) as DbAuditSession | undefined;
+      if (atomicSession) return atomicSession;
+    }
+
+    const missingRpc = atomicError && (
+      atomicError.code === '42883' ||
+      atomicError.code === 'PGRST202' ||
+      /apply_audit_post_adjustments/i.test(String(atomicError.message || '')) &&
+      /not find|does not exist|schema cache/i.test(String(atomicError.message || ''))
+    );
+    if (atomicError && !missingRpc) throw atomicError;
+
+    // Compatibilidade temporária enquanto a migration ainda não foi aplicada.
     const existing = await fetchAuditSession(branch, auditNumber);
     if (!existing || existing.status === 'completed' || !existing.data) return null;
 
@@ -1383,7 +1412,7 @@ export async function fetchAuditsHistory(branch: string): Promise<DbAuditSession
       .order('audit_number', { ascending: false });
 
     if (error) throw error;
-    return data || [];
+    return (data || []).filter(session => !isTechnicalArchivedAuditBranch(session.branch));
   } catch (error) {
     console.error('Error fetching audit history:', error);
     return [];
