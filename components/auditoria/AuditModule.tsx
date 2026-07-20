@@ -3392,8 +3392,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
     }, [showCompletedAuditsModal]);
 
-    const handleManualSync = useCallback(async () => {
-        const local = await AuditStorage.loadLocalAuditSession();
+    const handleManualSync = useCallback(async (isAutoSync = false) => {
+        const local = dataRef.current || await AuditStorage.loadLocalAuditSession();
         if (!local?.pendingSync) return;
         
         try {
@@ -3438,7 +3438,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 setData(syncedLocal);
                 setDbSessionId(synced.id);
                 setLocalPendingAudit(null);
-                alert("Sincronização manual concluída com sucesso!");
+                if (!isAutoSync) alert("Sincronização manual concluída com sucesso!");
                 void loadAuditNum(true);
             }
         } catch (e) {
@@ -3448,6 +3448,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setIsSyncing(false);
         }
     }, [selectedFilial, dbSessionId, nextAuditNumber, userEmail, loadAuditNum]);
+
+
 
     // Network Connectivity monitoring
     useEffect(() => {
@@ -11707,13 +11709,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 ...(currentData.postAuditAdjustmentDeletedIds || []),
                 ...(deletedAdjustmentIds || [])
             ])),
-            pendingSync: true,
+            pendingSync: currentData.pendingSync,
             termDrafts: composeTermDraftsForPersist(((currentData as any).termDrafts || {}) as Record<string, TermForm>, termDrafts)
         } as AuditData;
         dataRef.current = nextData;
         postAuditAdjustmentsRef.current = pendingAdjustments;
         setData(nextData);
-        AuditStorage.scheduleLocalAuditSessionSave(nextData, true);
+        await AuditStorage.saveLocalAuditSession(nextData, true);
         syncPostAuditAdjustmentSnapshot(nextData);
         return true;
     }, [data, isReadOnlyCompletedView, composeTermDraftsForPersist, termDrafts, selectedFilial, nextAuditNumber, syncPostAuditAdjustmentSnapshot]);
@@ -11791,8 +11793,57 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             createdBy: userEmail,
             createdByName: userName || undefined
         };
+
+        let nextAdjustments = [...postAuditAdjustmentsRef.current];
+        let idToSave = adjustment.id;
+
+        // Procura por um ajuste PENDENTE para o MESMO produto
+        const existingIndex = nextAdjustments.findIndex(item => 
+            !item.trierAppliedAt && (
+                (product.reducedCode && item.reducedCode === product.reducedCode) ||
+                (product.barcode && item.barcode === product.barcode) ||
+                (item.code === adjustment.code)
+            )
+        );
+
+        if (existingIndex >= 0) {
+            const existing = nextAdjustments[existingIndex];
+            idToSave = existing.id;
+            
+            let newQuantity = existing.quantity + quantity;
+            let newReplacementQuantity: number | undefined = undefined;
+            let newPreviousAuditedQty = existing.previousAuditedQty;
+
+            if (postAdjustmentMode === 'replace') {
+                newReplacementQuantity = replacementQuantity;
+                newPreviousAuditedQty = previousAuditedQty;
+                newQuantity = quantity; // se for replace, o que vale é a quantidade calculada nova
+            } else if (existing.mode === 'replace') {
+                // Se era replace e agora estamos somando, a nova quantidade será a base anterior + a nova soma
+                newQuantity = existing.quantity + quantity;
+                newReplacementQuantity = (existing.replacementQuantity || 0) + quantity;
+            }
+
+            const newNote = noteValue ? (existing.note ? `${existing.note} | ${noteValue}` : noteValue) : existing.note;
+            
+            nextAdjustments[existingIndex] = {
+                ...existing,
+                mode: postAdjustmentMode === 'replace' ? 'replace' : existing.mode,
+                quantity: newQuantity,
+                replacementQuantity: newReplacementQuantity,
+                previousAuditedQty: newPreviousAuditedQty,
+                totalCost: roundAuditMoney(newQuantity * unitCost),
+                note: newNote,
+                createdAt: new Date().toISOString(), // Atualiza a data de alteração
+                createdBy: userEmail,
+                createdByName: userName || undefined
+            };
+        } else {
+            nextAdjustments.push(adjustment);
+        }
+
         try {
-            const saved = await persistPostAuditAdjustments([...postAuditAdjustmentsRef.current, adjustment], [adjustment.id]);
+            const saved = await persistPostAuditAdjustments(nextAdjustments, [idToSave]);
             if (saved) {
                 void insertAppEventLog({
                     company_id: selectedCompany?.id || null,
