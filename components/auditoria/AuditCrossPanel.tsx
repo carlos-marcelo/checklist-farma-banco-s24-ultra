@@ -179,6 +179,10 @@ const normalizeFilterText = (value: unknown) => String(value ?? '')
     .trim()
     .toLocaleLowerCase('pt-BR');
 
+const normalizeReducedCode = (value: unknown) => String(value ?? '')
+    .replace(/\D/g, '')
+    .replace(/^0+/, '');
+
 const EMPTY_AUDIT_CROSS_ROWS: AuditCrossRow[] = [];
 const isTechnicalArchivedAuditBranch = (branch: unknown) =>
     /(?:^|[_-])archived(?:[_-]reset)?[_-]\d{4}[-_]\d{2}[-_]\d{2}t/i.test(String(branch ?? '').trim());
@@ -197,6 +201,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     const [areaFilter, setAreaFilter] = useState('all');
     const [cityFilter, setCityFilter] = useState('all');
     const [search, setSearch] = useState('');
+    const [reducedLookup, setReducedLookup] = useState('');
     const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
     const [panelView, setPanelView] = useState<'audits' | 'signals'>('audits');
     const [signalView, setSignalView] = useState<AuditSignalView>('transfers');
@@ -231,6 +236,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     }), [safeRows]);
 
     const filteredRows = useMemo(() => {
+        const normalizedReducedLookup = normalizeReducedCode(reducedLookup);
         const branchNumbers = new Set<string>();
         const auditNumbers = new Set<string>();
         const freeTerms: string[] = [];
@@ -254,6 +260,9 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
             .filter(row => statusFilter === 'all' || row.status === statusFilter)
             .filter(row => areaFilter === 'all' || row.area === areaFilter)
             .filter(row => cityFilter === 'all' || row.city === cityFilter)
+            .filter(row => !normalizedReducedLookup || (row.items || []).some(item =>
+                normalizeReducedCode(item.reducedCode) === normalizedReducedLookup
+            ))
             .filter(row => {
                 const branchNumber = String(getBranchOrder(row.branch));
                 if (branchNumbers.size > 0 && !branchNumbers.has(branchNumber)) return false;
@@ -270,7 +279,63 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                 if (a.status !== b.status) return a.status === 'open' ? -1 : 1;
                 return b.auditNumber - a.auditNumber;
             });
-    }, [areaFilter, cityFilter, safeRows, search, statusFilter]);
+    }, [areaFilter, cityFilter, reducedLookup, safeRows, search, statusFilter]);
+
+    const normalizedReducedLookup = useMemo(() => normalizeReducedCode(reducedLookup), [reducedLookup]);
+    const reducedMatchesByRow = useMemo(() => {
+        const matches = new Map<string, {
+            reducedCode: string;
+            barcode?: string;
+            description: string;
+            sysQty: number;
+            countedQty: number;
+            diffQty: number;
+            diffCost: number;
+        }>();
+        if (!normalizedReducedLookup) return matches;
+
+        filteredRows.forEach(row => {
+            const rowItems = (row.items || []).filter(item =>
+                normalizeReducedCode(item.reducedCode) === normalizedReducedLookup
+            );
+            if (rowItems.length === 0) return;
+            matches.set(row.key, rowItems.reduce((summary, item) => ({
+                reducedCode: normalizedReducedLookup,
+                barcode: summary.barcode || item.barcode,
+                description: summary.description === 'PRODUTO SEM DESCRIÇÃO'
+                    ? (item.description || summary.description)
+                    : summary.description,
+                sysQty: summary.sysQty + Number(item.sysQty || 0),
+                countedQty: summary.countedQty + Number(item.countedQty || 0),
+                diffQty: summary.diffQty + Number(item.diffQty || 0),
+                diffCost: Math.round((summary.diffCost + Number(item.diffCost || 0)) * 100) / 100
+            }), {
+                reducedCode: normalizedReducedLookup,
+                barcode: undefined as string | undefined,
+                description: rowItems[0]?.description || 'PRODUTO SEM DESCRIÇÃO',
+                sysQty: 0,
+                countedQty: 0,
+                diffQty: 0,
+                diffCost: 0
+            }));
+        });
+        return matches;
+    }, [filteredRows, normalizedReducedLookup]);
+    const reducedLookupSummary = useMemo(() => Array.from(reducedMatchesByRow.values()).reduce((summary, item) => ({
+        occurrences: summary.occurrences + 1,
+        sysQty: summary.sysQty + item.sysQty,
+        countedQty: summary.countedQty + item.countedQty,
+        diffQty: summary.diffQty + item.diffQty,
+        diffCost: Math.round((summary.diffCost + item.diffCost) * 100) / 100,
+        description: summary.description || item.description
+    }), {
+        occurrences: 0,
+        sysQty: 0,
+        countedQty: 0,
+        diffQty: 0,
+        diffCost: 0,
+        description: ''
+    }), [reducedMatchesByRow]);
 
     const selectedRows = useMemo(() => {
         const selected = new Set(selectedKeys);
@@ -336,6 +401,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                 const diffQty = Number(item.diffQty || 0);
                 const diffCost = Number(item.diffCost || 0);
                 if (!reducedCode || (Math.abs(diffQty) <= 0.01 && Math.abs(diffCost) <= 0.01)) return;
+                if (normalizedReducedLookup && reducedCode !== normalizedReducedLookup) return;
 
                 const product = products.get(reducedCode) || {
                     reducedCode,
@@ -617,7 +683,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
 
     useEffect(() => {
         setProductVisibleLimit(30);
-    }, [deferredSignalRows, productFilter]);
+    }, [deferredSignalRows, normalizedReducedLookup, productFilter]);
 
     const showSignalDetails = (
         view: AuditSignalView,
@@ -892,6 +958,29 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                             </button>
                         )}
                     </label>
+                    <label className="relative col-span-2">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[9px] font-black uppercase tracking-wider text-indigo-300 pointer-events-none">
+                            Red.
+                        </span>
+                        <input
+                            value={reducedLookup}
+                            onChange={event => setReducedLookup(event.target.value)}
+                            inputMode="numeric"
+                            placeholder="Digite o reduzido para localizar a divergência"
+                            aria-label="Consultar divergências por código reduzido"
+                            className="h-10 w-full border border-indigo-400/30 bg-indigo-500/[0.08] pl-12 pr-9 text-xs font-black text-white placeholder:font-bold placeholder:text-slate-600 outline-none focus:border-indigo-300"
+                        />
+                        {reducedLookup && (
+                            <button
+                                type="button"
+                                onClick={() => setReducedLookup('')}
+                                className="absolute right-2 top-1/2 h-7 w-7 -translate-y-1/2 inline-flex items-center justify-center text-slate-500 hover:text-white cursor-pointer"
+                                title="Limpar reduzido"
+                            >
+                                <X className="h-3.5 w-3.5" />
+                            </button>
+                        )}
+                    </label>
                 </div>
 
                 <div className="mt-3 flex items-center gap-2">
@@ -917,6 +1006,50 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
 
                 {panelView === 'audits' && (
                     <>
+                {normalizedReducedLookup && (
+                    <div className={`mt-4 border p-3 ${reducedLookupSummary.occurrences > 0 ? 'border-indigo-400/30 bg-indigo-500/[0.08]' : 'border-amber-400/30 bg-amber-500/[0.06]'}`}>
+                        {reducedLookupSummary.occurrences > 0 ? (
+                            <>
+                                <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <p className="text-[8px] font-black uppercase tracking-[0.18em] text-indigo-300">Divergências do reduzido {normalizedReducedLookup}</p>
+                                        <p className="mt-1 truncate text-[10px] font-black text-white">{reducedLookupSummary.description}</p>
+                                    </div>
+                                    <span className="shrink-0 bg-indigo-500/15 px-2 py-1 text-[8px] font-black uppercase text-indigo-200">
+                                        {reducedLookupSummary.occurrences} local(is)
+                                    </span>
+                                </div>
+                                <div className="mt-3 grid grid-cols-3 border-t border-white/10 pt-2 text-center">
+                                    <div>
+                                        <p className="text-[8px] font-black uppercase text-slate-500">Sistema</p>
+                                        <p className="mt-1 text-[10px] font-black">{reducedLookupSummary.sysQty.toLocaleString('pt-BR')} un.</p>
+                                    </div>
+                                    <div className="border-x border-white/10">
+                                        <p className="text-[8px] font-black uppercase text-slate-500">Contado</p>
+                                        <p className="mt-1 text-[10px] font-black">{reducedLookupSummary.countedQty.toLocaleString('pt-BR')} un.</p>
+                                    </div>
+                                    <div>
+                                        <p className="text-[8px] font-black uppercase text-slate-500">Divergência</p>
+                                        <p className={`mt-1 text-[10px] font-black ${reducedLookupSummary.diffQty < 0 ? 'text-red-300' : reducedLookupSummary.diffQty > 0 ? 'text-emerald-300' : 'text-slate-300'}`}>
+                                            {formatSignedQuantity(reducedLookupSummary.diffQty)} un.
+                                        </p>
+                                    </div>
+                                </div>
+                                <div className={`mt-2 text-right text-[10px] font-black ${reducedLookupSummary.diffCost < 0 ? 'text-red-300' : reducedLookupSummary.diffCost > 0 ? 'text-emerald-300' : 'text-slate-300'}`}>
+                                    Impacto total {formatSignedCurrency(reducedLookupSummary.diffCost)}
+                                </div>
+                            </>
+                        ) : (
+                            <div className="flex items-start gap-2">
+                                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+                                <div>
+                                    <p className="text-[9px] font-black uppercase text-amber-200">Reduzido {normalizedReducedLookup} não localizado</p>
+                                    <p className="mt-1 text-[8px] font-bold leading-relaxed text-slate-500">Não há divergência para este código no status, área e cidade selecionados.</p>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
                 <div className="mt-4 grid grid-cols-3 border-y border-white/10 py-3 text-center">
                     <div>
                         <p className="text-[8px] font-black uppercase tracking-wider text-slate-500">Auditorias</p>
@@ -983,6 +1116,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                         </div>
                     ) : filteredRows.map(row => {
                         const selected = selectedKeys.includes(row.key);
+                        const reducedMatch = reducedMatchesByRow.get(row.key);
                         return (
                             <div key={row.key} className={`py-2.5 px-1 transition-colors ${selected ? 'bg-indigo-500/10' : ''}`}>
                                 <div className="flex items-start gap-2">
@@ -1014,6 +1148,23 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                                 {formatCurrency(row.diffCost)}
                                             </span>
                                         </div>
+                                        {reducedMatch && (
+                                            <div className="mt-2 border border-indigo-400/20 bg-indigo-500/[0.06] px-2 py-2">
+                                                <div className="flex items-center justify-between gap-2">
+                                                    <span className="truncate text-[8px] font-black uppercase text-indigo-200">Red. {reducedMatch.reducedCode} · {reducedMatch.description}</span>
+                                                    <span className={`shrink-0 text-[8px] font-black uppercase ${reducedMatch.diffQty < 0 ? 'text-red-300' : reducedMatch.diffQty > 0 ? 'text-emerald-300' : 'text-slate-300'}`}>
+                                                        {reducedMatch.diffQty < 0 ? 'Falta' : reducedMatch.diffQty > 0 ? 'Sobra' : 'Ajuste'}
+                                                    </span>
+                                                </div>
+                                                <div className="mt-1.5 grid grid-cols-3 gap-1 text-[8px] font-bold text-slate-400">
+                                                    <span>Sist. {reducedMatch.sysQty.toLocaleString('pt-BR')}</span>
+                                                    <span>Cont. {reducedMatch.countedQty.toLocaleString('pt-BR')}</span>
+                                                    <span className={`text-right ${reducedMatch.diffCost < 0 ? 'text-red-300' : reducedMatch.diffCost > 0 ? 'text-emerald-300' : 'text-slate-300'}`}>
+                                                        {formatSignedQuantity(reducedMatch.diffQty)} · {formatSignedCurrency(reducedMatch.diffCost)}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        )}
                                         <div className="mt-1.5 h-1 bg-slate-800 overflow-hidden">
                                             <div className={`h-full ${row.status === 'open' ? 'bg-blue-500' : 'bg-emerald-500'}`} style={{ width: `${Math.max(0, Math.min(100, row.progressPct))}%` }} />
                                         </div>
