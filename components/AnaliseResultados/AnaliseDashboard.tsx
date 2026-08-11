@@ -57,6 +57,129 @@ interface AnalysisParsedCache {
 
 const ANALYSIS_VENDAS_MODULE_KEY = 'analysis_vendas_totais';
 const ANALYSIS_PEDIDOS_MODULE_KEY = 'analysis_pedidos';
+const ANALYSIS_PARSER_VERSION = '2026-08-11-v2';
+
+type AnalysisVendasLayout = {
+    headerRowIndex: number;
+    groupColumn: string;
+    stockColumn: string;
+    volumeColumn: string;
+    costColumn: string;
+    grossColumn: string;
+    revenueColumn: string;
+    ticketColumn: string;
+    profitabilityColumn: string;
+    operationsColumn: string;
+    returnsColumn: string;
+};
+
+const normalizeAnalysisLabel = (value: any): string => String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9%/]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const parseAnalysisNumber = (value: any, integer = false): number => {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+
+    let normalized = String(value ?? '')
+        .replace(/[R$%*\s]/gi, '')
+        .trim();
+    if (!normalized) return 0;
+
+    const commaIndex = normalized.lastIndexOf(',');
+    const dotIndex = normalized.lastIndexOf('.');
+
+    if (commaIndex >= 0 && dotIndex >= 0) {
+        if (commaIndex > dotIndex) {
+            normalized = normalized.replace(/\./g, '').replace(',', '.');
+        } else {
+            normalized = normalized.replace(/,/g, '');
+        }
+    } else if (commaIndex >= 0) {
+        normalized = integer && /^-?\d{1,3}(,\d{3})+$/.test(normalized)
+            ? normalized.replace(/,/g, '')
+            : normalized.replace(',', '.');
+    } else if (dotIndex >= 0 && integer && /^-?\d{1,3}(\.\d{3})+$/.test(normalized)) {
+        normalized = normalized.replace(/\./g, '');
+    }
+
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const getAnalysisColumns = (row: any): string[] => Object.keys(row || {})
+    .filter(column => /^[A-Z]+$/.test(column))
+    .sort((a, b) => XLSX.utils.decode_col(a) - XLSX.utils.decode_col(b));
+
+const detectAnalysisVendasLayout = (rows: any[]): AnalysisVendasLayout => {
+    let headerRowIndex = 0;
+    let bestScore = -1;
+
+    rows.forEach((row, rowIndex) => {
+        const labels = getAnalysisColumns(row).map(column => normalizeAnalysisLabel(row[column]));
+        const score = labels.reduce((total, label) => {
+            if (!label) return total;
+            if ((label.includes('grupo') && label.includes('produto')) || label.includes('descr produto')) total += 4;
+            if (label.includes('venda') && label.includes('devol')) total += 4;
+            if (label.includes('ticket')) total += 3;
+            if (label.includes('vlr') && label.includes('venda')) total += 2;
+            if (label.includes('custo')) total += 1;
+            return total;
+        }, 0);
+
+        if (score > bestScore) {
+            bestScore = score;
+            headerRowIndex = rowIndex;
+        }
+    });
+
+    const header = rows[headerRowIndex] || {};
+    const columns = getAnalysisColumns(header);
+    const findColumn = (predicate: (label: string) => boolean): string =>
+        columns.find(column => predicate(normalizeAnalysisLabel(header[column]))) || '';
+
+    const combinedOperationsColumn = findColumn(label => label.includes('venda') && label.includes('devol'));
+    const explicitReturnsColumn = findColumn(label => label.includes('devol') && !label.includes('venda'));
+    const operationsColumn = combinedOperationsColumn || findColumn(label =>
+        (label.includes('qtd') || label.includes('quant'))
+        && label.includes('venda')
+        && !label.includes('vendida')
+    );
+
+    return {
+        headerRowIndex,
+        groupColumn: findColumn(label =>
+            (label.includes('grupo') && label.includes('produto'))
+            || label.includes('descr produto')
+            || label === 'grupo'
+        ),
+        stockColumn: findColumn(label => label.includes('estoq')),
+        volumeColumn: findColumn(label =>
+            (label.includes('qtd') || label.includes('quant'))
+            && (label.includes('vend') || label.includes('volume'))
+            && !label.includes('devol')
+        ),
+        costColumn: findColumn(label => label.includes('custo')),
+        grossColumn: findColumn(label => label.includes('bruto')),
+        revenueColumn: findColumn(label =>
+            label.includes('vlr')
+            && label.includes('vend')
+            && !label.includes('bruto')
+            && !label.includes('custo')
+            && !label.includes('descto')
+            && !label.includes('desconto')
+        ),
+        ticketColumn: findColumn(label => label.includes('ticket')),
+        profitabilityColumn: findColumn(label => label.includes('rent')),
+        operationsColumn,
+        returnsColumn: explicitReturnsColumn || (operationsColumn
+            ? XLSX.utils.encode_col(XLSX.utils.decode_col(operationsColumn) + 1)
+            : '')
+    };
+};
 
 const yieldAnalysisFrame = () => new Promise<void>(resolve => {
     if (typeof window === 'undefined') {
@@ -72,6 +195,7 @@ const buildAnalysisFileSignature = (
     files: Array<Partial<SupabaseService.DbGlobalBaseFile> | null | undefined>
 ) => [
     companyId || '',
+    ANALYSIS_PARSER_VERSION,
     companyAreasSignature,
     ...files
         .map(file => [
@@ -235,65 +359,33 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 await yieldAnalysisFrame();
                 const vendasWb = XLSX.read(vendasBuffer, { type: 'array' });
                 const vendasSheet = vendasWb.Sheets[vendasWb.SheetNames[0]];
-                const vendasRaw: any[] = XLSX.utils.sheet_to_json(vendasSheet, { defval: null });
                 const vendasRawAOA: any[] = XLSX.utils.sheet_to_json(vendasSheet, { header: 'A', defval: null });
+                const vendasLayout = detectAnalysisVendasLayout(vendasRawAOA);
 
                 const findVal = (row: any, keys: string[]) => {
                     for (const key of Object.keys(row)) {
                         if (keys.some(k => key.toLowerCase().includes(k.toLowerCase()))) {
-                            const val = row[key];
-                            if (typeof val === 'number') return val;
-                            if (typeof val === 'string') {
-                                const parsed = parseFloat(val.replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.'));
-                                return !isNaN(parsed) ? parsed : 0;
-                            }
+                            return parseAnalysisNumber(row[key]);
                         }
                     }
                     return 0;
-                };
-
-                const findValExclude = (row: any, includeKeys: string[], excludeKeys: string[]) => {
-                    for (const key of Object.keys(row)) {
-                        const kLow = key.toLowerCase();
-                        if (includeKeys.some(k => kLow.includes(k.toLowerCase())) && !excludeKeys.some(k => kLow.includes(k.toLowerCase()))) {
-                            const val = row[key];
-                            if (typeof val === 'number') return val;
-                            if (typeof val === 'string') {
-                                const parsed = parseFloat(val.replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.'));
-                                return !isNaN(parsed) ? parsed : 0;
-                            }
-                        }
-                    }
-                    return 0;
-                };
-
-                const findStr = (row: any, keys: string[]) => {
-                    for (const key of Object.keys(row)) {
-                        if (keys.some(k => key.toLowerCase().includes(k.toLowerCase()))) {
-                            return String(row[key] || '').trim();
-                        }
-                    }
-                    return '';
                 };
 
                 let parsedVendas: SalesGroupData[] = [];
                 let rawBranchTickets: Record<string, {tkt: number, count: number}> = {};
                 let rawBranchDevols: Record<string, number> = {};
+                const reportedBranchTickets: Record<string, number> = {};
                 let currentBranchStr = 'Matriz/Geral';
 
-                vendasRaw.forEach((row, idx) => {
-                    const rowAOA = vendasRawAOA[idx + 1] || {};
-                    const rawFValue = rowAOA['F'] ?? rowAOA['f'];
-
-                    const allVals = Object.values(row)
+                vendasRawAOA.slice(vendasLayout.headerRowIndex + 1).forEach(row => {
+                    const allVals = Object.values(row || {})
                         .filter(v => v !== null && v !== undefined)
                         .map(v => String(v).trim())
                         .filter(v => v && v.toLowerCase() !== 'null');
                     const wholeRowStr = allVals.join(' ');
-                    
                     const lowerRow = wholeRowStr.toLowerCase();
+
                     if ((lowerRow.includes('filial') || lowerRow.includes('loja') || lowerRow.includes('unidade')) && !lowerRow.includes('total')) {
-                        // Regex ganancioso para capturar a string inteira após a palavra-chave
                         const match = wholeRowStr.match(/(?:filial|loja|unidade)\s*:?\s*(.*)/i);
                         if (match && match[1]) {
                             const branchNameMatched = match[1].trim();
@@ -304,44 +396,33 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                         return; // It's just a header row
                     }
 
-                    if (wholeRowStr.toLowerCase().includes('total filial')) {
-                        // Extract global Branch Returns from exact Column F string mapped previously
-                        let totalBrDevol = 0;
-                        if (typeof rawFValue === 'number') totalBrDevol = Math.abs(rawFValue);
-                        else if (typeof rawFValue === 'string') {
-                            const parsed = parseFloat(rawFValue.replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.'));
-                            if (!isNaN(parsed)) totalBrDevol = Math.abs(parsed);
-                        }
+                    if (lowerRow.includes('total filial') || lowerRow.includes('total loja') || lowerRow.includes('total unidade')) {
+                        const totalBrDevol = Math.abs(parseAnalysisNumber(
+                            row[vendasLayout.returnsColumn],
+                            true
+                        ));
+                        const totalOperations = Math.abs(parseAnalysisNumber(
+                            row[vendasLayout.operationsColumn],
+                            true
+                        ));
+                        const reportedTicket = Math.abs(parseAnalysisNumber(row[vendasLayout.ticketColumn]));
+
                         rawBranchDevols[currentBranchStr] = totalBrDevol;
 
-                        // Extract Venda count (number of tickets) which is usually around column E or "Venda/Devol"
-                        for (const key of Object.keys(row)) {
-                            const kLow = key.toLowerCase();
-                            // Look for 'venda' but ignore 'vlr' or 'total' to avoid grabbing R$ amounts
-                            if ((kLow.includes('venda') || kLow.includes('devol') || kLow.includes('código')) && !kLow.includes('vlr') && !kLow.includes('bruto') && !kLow.includes('custo') && !kLow.includes('total')) {
-                                const rawVal = String(row[key]);
-                                if (rawVal.includes('*') || /^\d+(\.\d{3})*(,\d+)?\*?$/.test(rawVal.trim())) {
-                                    const cleaned = parseFloat(rawVal.replace(/[R$\s*]/g, '').replace(/\./g, '').replace(',', '.'));
-                                    if (!isNaN(cleaned) && cleaned > 0) {
-                                        const prev = rawBranchTickets[currentBranchStr] ? rawBranchTickets[currentBranchStr].tkt : 0;
-                                        rawBranchTickets[currentBranchStr] = {
-                                            tkt: Math.max(prev, cleaned),
-                                            count: 1
-                                        };
-                                    }
-                                }
-                            }
+                        if (totalOperations > 0) {
+                            rawBranchTickets[currentBranchStr] = { tkt: totalOperations, count: 1 };
                         }
+                        if (reportedTicket > 0) reportedBranchTickets[currentBranchStr] = reportedTicket;
                         return;
                     }
 
-                    const gp = findStr(row, ['grupo', 'produto', 'descrição']);
+                    const gp = String(row[vendasLayout.groupColumn] ?? '').trim();
                     if (!gp || gp.toLowerCase().includes('total')) return;
 
-                    const vlrVenda = findVal(row, ['total vlr. venda', 'vlr. venda', 'vlr venda']);
-                    const vlrCusto = findVal(row, ['custo']);
-                    const rVolVend = findVal(row, ['qtd', 'vend']);
-                    const rTicket = findVal(row, ['ticket']);
+                    const vlrVenda = parseAnalysisNumber(row[vendasLayout.revenueColumn]);
+                    const vlrCusto = parseAnalysisNumber(row[vendasLayout.costColumn]);
+                    const rVolVend = parseAnalysisNumber(row[vendasLayout.volumeColumn], true);
+                    const rTicket = parseAnalysisNumber(row[vendasLayout.ticketColumn]);
                     
                     if (rVolVend === 0 && vlrVenda === 0) return; // ignore completely empty groups
 
@@ -350,16 +431,30 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                         areaName: getAreaForBranch(currentBranchStr),
                         cityName: getCityForBranch(currentBranchStr),
                         name: gp,
-                        estoque: findVal(row, ['estoque']),
+                        estoque: parseAnalysisNumber(row[vendasLayout.stockColumn], true),
                         volumeVend: rVolVend,
                         vlrCusto: vlrCusto,
-                        vlrBruto: findVal(row, ['bruto']),
+                        vlrBruto: parseAnalysisNumber(row[vendasLayout.grossColumn]),
                         vlrVenda: vlrVenda,
                         ticket: rTicket > 0 ? rTicket : 0,
                         ticketCount: rTicket > 0 ? 1 : 0,
-                        rentabilidade: findVal(row, ['% rent', 'rentabilidade']),
+                        rentabilidade: parseAnalysisNumber(row[vendasLayout.profitabilityColumn]),
                         devolucoes: 0 // Retorno está sendo lido da matriz/filial e não por grupo
                     });
+                });
+
+                // Alguns layouts não trazem a quantidade de operações em uma coluna nomeada.
+                // Nesses casos, recompõe a quantidade líquida usando o ticket informado no total da filial.
+                Object.entries(reportedBranchTickets).forEach(([branchName, reportedTicket]) => {
+                    if (rawBranchTickets[branchName]?.tkt > 0 || reportedTicket <= 0) return;
+                    const branchRevenue = parsedVendas
+                        .filter(item => item.branchName === branchName)
+                        .reduce((total, item) => total + item.vlrVenda, 0);
+                    const returns = rawBranchDevols[branchName] || 0;
+                    const netOperations = Math.round(branchRevenue / reportedTicket);
+                    if (netOperations > 0) {
+                        rawBranchTickets[branchName] = { tkt: netOperations + returns, count: 1 };
+                    }
                 });
 
                 // Extract unique branches from Vendas to align E-commerce
