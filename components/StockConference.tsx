@@ -371,6 +371,126 @@ const safeParseFloat = (value: any): number => {
   return isNaN(parsed) ? 0 : parsed;
 };
 
+type StockExcelLayout = {
+  reducedColumn: string;
+  quantityColumn: string;
+  descriptionColumn: string;
+  headerRowIndex: number;
+};
+
+const normalizeExcelLabel = (value: any): string => String(value ?? '')
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase()
+  .trim();
+
+const isLikelyReducedCode = (value: any): boolean => {
+  const normalized = String(value ?? '').trim().replace(/\.0+$/, '');
+  return /^\d{1,20}$/.test(normalized);
+};
+
+const parseOptionalStockNumber = (value: any): number | null => {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+
+  const normalized = String(value ?? '').trim();
+  if (!normalized) return null;
+
+  const numericText = normalized
+    .replace(/\s/g, '')
+    .replace(/\.(?=\d{3}(?:\D|$))/g, '')
+    .replace(',', '.');
+
+  if (!/^-?\d+(?:\.\d+)?$/.test(numericText)) return null;
+  const parsed = Number(numericText);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const detectStockExcelLayout = (rows: any[], controlledStock: boolean): StockExcelLayout => {
+  const excelColumns = Array.from(new Set(
+    rows.flatMap(row => Object.keys(row || {}).filter(column => /^[A-Z]+$/.test(column)))
+  ));
+
+  let headerRowIndex = -1;
+  let reducedColumn = '';
+  let descriptionColumn = '';
+
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    for (const column of excelColumns) {
+      const label = normalizeExcelLabel(rows[rowIndex]?.[column]);
+      const isCodeHeader = label === 'codigo'
+        || label === 'cod'
+        || label === 'red'
+        || label.includes('reduzido');
+
+      if (isCodeHeader) {
+        headerRowIndex = rowIndex;
+        reducedColumn = column;
+        break;
+      }
+    }
+    if (reducedColumn) break;
+  }
+
+  const dataStartIndex = headerRowIndex >= 0 ? headerRowIndex + 1 : 0;
+
+  if (!reducedColumn) {
+    reducedColumn = excelColumns
+      .map(column => ({
+        column,
+        score: rows.slice(dataStartIndex).reduce(
+          (count, row) => count + (isLikelyReducedCode(row?.[column]) ? 1 : 0),
+          0
+        )
+      }))
+      .sort((a, b) => b.score - a.score)[0]?.column || (controlledStock ? 'B' : 'B');
+  }
+
+  if (headerRowIndex >= 0) {
+    descriptionColumn = excelColumns.find(column => {
+      const label = normalizeExcelLabel(rows[headerRowIndex]?.[column]);
+      return label.includes('desc') || label.includes('nome');
+    }) || '';
+  }
+
+  if (!descriptionColumn) {
+    const nextColumnIndex = XLSX.utils.decode_col(reducedColumn) + 1;
+    descriptionColumn = XLSX.utils.encode_col(nextColumnIndex);
+  }
+
+  const productRows = rows.slice(dataStartIndex).filter(row => isLikelyReducedCode(row?.[reducedColumn]));
+  const preferredQuantityColumns = controlledStock ? ['L', 'K', 'O', 'M'] : ['O', 'K', 'L', 'M'];
+
+  const quantityCandidates = excelColumns
+    .filter(column => column !== reducedColumn && column !== descriptionColumn)
+    .map(column => {
+      let numericValues = 0;
+      let implausiblyLargeValues = 0;
+
+      productRows.forEach(row => {
+        const parsed = parseOptionalStockNumber(row?.[column]);
+        if (parsed === null) return;
+        numericValues += 1;
+        if (Math.abs(parsed) >= 1_000_000_000) implausiblyLargeValues += 1;
+      });
+
+      const preferenceIndex = preferredQuantityColumns.indexOf(column);
+      return {
+        column,
+        score: (numericValues * 10)
+          - (implausiblyLargeValues * 20)
+          + (preferenceIndex >= 0 ? preferredQuantityColumns.length - preferenceIndex : 0)
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return {
+    reducedColumn,
+    quantityColumn: quantityCandidates[0]?.column || (controlledStock ? 'L' : 'O'),
+    descriptionColumn,
+    headerRowIndex
+  };
+};
+
 // --- Main Component ---
 
 export const StockConference: React.FC<StockConferenceProps> = ({ 
@@ -1078,21 +1198,28 @@ export const StockConference: React.FC<StockConferenceProps> = ({
 
         const iMap = new Map<string, StockItem>();
         const isStockExcel = stockFile.name.match(/\.(xls|xlsx)$/i);
+        const stockExcelLayout = isStockExcel
+          ? detectStockExcelLayout(sData, isControlledStock)
+          : null;
 
-        sData.forEach(row => {
+        if (stockExcelLayout) {
+          stockDebugLog('Layout do estoque detectado automaticamente:', stockExcelLayout);
+        }
+
+        sData.forEach((row, rowIndex) => {
           let reduced = '', qty = 0, stockDesc = '';
 
-          if (isStockExcel) {
-            reduced = String(row['B'] || '').trim();
-            // CONDITIONAL LOGIC FOR CONTROLLED PRODUCTS
-            const val = isControlledStock ? row['L'] : row['O'];
-            qty = safeParseFloat(val);
+          if (isStockExcel && stockExcelLayout) {
+            if (rowIndex <= stockExcelLayout.headerRowIndex) return;
 
-            if (row['C']) stockDesc = String(row['C']).trim();
+            reduced = String(row[stockExcelLayout.reducedColumn] ?? '').trim().replace(/\.0+$/, '');
+            qty = safeParseFloat(row[stockExcelLayout.quantityColumn]);
 
-            if (!/[0-9]/.test(reduced)) return;
-            if (reduced.length > 20) return;
-            if (reduced.toLowerCase().includes('cod')) return;
+            if (row[stockExcelLayout.descriptionColumn]) {
+              stockDesc = String(row[stockExcelLayout.descriptionColumn]).trim();
+            }
+
+            if (!isLikelyReducedCode(reduced)) return;
 
           } else {
             Object.keys(row).forEach(k => {
@@ -1134,7 +1261,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
         });
 
         if (pMap.size === 0) throw new Error("Sem produtos válidos. Verifique as colunas (C=Reduzido, K=Barras).");
-        if (iMap.size === 0) throw new Error("Sem estoque válido. Verifique as colunas (B=Reduzido, O=Qtd).");
+        if (iMap.size === 0) throw new Error("Sem estoque válido. Não foi possível identificar automaticamente as colunas de código e quantidade.");
 
         setMasterProducts(pMap);
         setBarcodeIndex(bMap);
@@ -1995,7 +2122,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
             </label>
           </div>
 
-          <p className="text-xs text-gray-500 text-center mb-4">Estoque (Excel: B=Red, {isControlledStock ? 'L' : 'O'}=Qtd)</p>
+          <p className="text-xs text-gray-500 text-center mb-4">Estoque (Excel: colunas de Red e Qtd detectadas automaticamente)</p>
           <label className={`cursor-pointer bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-4 py-2 rounded-lg text-sm transition ${pendingReportsCount > 0 ? 'pointer-events-none opacity-50' : ''}`}>
             {stockFile ? stockFile.name : 'Selecionar Arquivo'}
             <input 
