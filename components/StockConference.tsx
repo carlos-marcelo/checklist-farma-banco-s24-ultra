@@ -330,6 +330,123 @@ const parseExcel = async (file: File): Promise<any[]> => {
   return jsonData;
 };
 
+const normalizeProductCode = (value: any): string => {
+  const normalized = String(value ?? '').trim().replace(/\.0+$/, '');
+  if (/^\d+(?:\.\d+)?e\+?\d+$/i.test(normalized)) {
+    const numeric = Number(normalized);
+    if (Number.isSafeInteger(numeric)) return String(numeric);
+  }
+  return normalized;
+};
+
+const getBarcodeAliases = (value: any): string[] => {
+  const normalized = normalizeProductCode(value).replace(/\s+/g, '');
+  if (!normalized) return [];
+
+  const aliases = new Set<string>([normalized]);
+  if (/^\d+$/.test(normalized)) {
+    const withoutLeadingZeros = normalized.replace(/^0+(?=\d)/, '');
+    aliases.add(withoutLeadingZeros);
+  }
+  return Array.from(aliases).filter(Boolean);
+};
+
+const extractBarcodeValues = (value: any): string[] => {
+  if (value === null || value === undefined || value === '') return [];
+  if (typeof value === 'number') return getBarcodeAliases(value).slice(0, 1);
+
+  const raw = String(value).trim();
+  const separated = raw.split(/[;|/\n]+/).map(part => part.trim()).filter(Boolean);
+  return (separated.length ? separated : [raw])
+    .map(normalizeProductCode)
+    .filter(code => code && code.toLowerCase() !== 'undefined');
+};
+
+type ProductExcelLayout = {
+  reducedColumn: string;
+  barcodeColumn: string;
+  descriptionColumn: string;
+  headerRowIndex: number;
+};
+
+const detectProductExcelLayout = (rows: any[]): ProductExcelLayout => {
+  const excelColumns = Array.from(new Set(
+    rows.flatMap(row => Object.keys(row || {}).filter(column => /^[A-Z]+$/.test(column)))
+  )).sort((a, b) => XLSX.utils.decode_col(a) - XLSX.utils.decode_col(b));
+
+  let headerRowIndex = -1;
+  let bestHeaderScore = 0;
+  rows.slice(0, 50).forEach((row, rowIndex) => {
+    const score = excelColumns.reduce((total, column) => {
+      const label = normalizeExcelLabel(row?.[column]);
+      if (!label) return total;
+      if (label.includes('ean') || label.includes('gtin') || label.includes('barra')) return total + 4;
+      if (label.includes('reduz') || label === 'red' || label === 'codigo' || label === 'cod') return total + 3;
+      if (label.includes('desc') || label.includes('nome')) return total + 2;
+      return total;
+    }, 0);
+    if (score > bestHeaderScore) {
+      bestHeaderScore = score;
+      headerRowIndex = rowIndex;
+    }
+  });
+
+  const dataRows = rows.slice(headerRowIndex >= 0 ? headerRowIndex + 1 : 0);
+  const header = headerRowIndex >= 0 ? rows[headerRowIndex] : {};
+  const headerColumnFor = (predicate: (label: string) => boolean) => excelColumns.find(
+    column => predicate(normalizeExcelLabel(header?.[column]))
+  ) || '';
+
+  const reducedHeaderColumn = headerColumnFor(label =>
+    label.includes('reduz') || label === 'red' || label === 'codigo' || label === 'cod'
+  );
+  const barcodeHeaderColumn = headerColumnFor(label =>
+    label.includes('ean') || label.includes('gtin') || label.includes('barra')
+  );
+  const descriptionHeaderColumn = headerColumnFor(label =>
+    label.includes('desc') || label.includes('nome')
+  );
+
+  const headerProximityBonus = (column: string, headerColumn: string): number => {
+    if (!headerColumn) return 0;
+    const distance = Math.abs(XLSX.utils.decode_col(column) - XLSX.utils.decode_col(headerColumn));
+    if (distance === 0) return 100;
+    if (distance === 1) return 25; // relatórios com células mescladas podem deslocar o título
+    return 0;
+  };
+
+  const stats = excelColumns.map(column => {
+    let reducedValues = 0;
+    let barcodeValues = 0;
+    let descriptionValues = 0;
+
+    dataRows.forEach(row => {
+      const value = normalizeProductCode(row?.[column]);
+      if (!value) return;
+      if (/^\d{1,8}$/.test(value)) reducedValues += 1;
+      if (/^\d{8,14}$/.test(value)) barcodeValues += value.length === 13 ? 3 : 1;
+      if (/[a-zA-ZÀ-ÿ]/.test(value) && value.length >= 3) descriptionValues += 1;
+    });
+
+    return {
+      column,
+      reducedScore: reducedValues + headerProximityBonus(column, reducedHeaderColumn),
+      barcodeScore: barcodeValues + headerProximityBonus(column, barcodeHeaderColumn),
+      descriptionScore: descriptionValues + headerProximityBonus(column, descriptionHeaderColumn)
+    };
+  });
+
+  const reducedColumn = [...stats].sort((a, b) => b.reducedScore - a.reducedScore)[0]?.column || 'C';
+  const barcodeColumn = [...stats]
+    .filter(item => item.column !== reducedColumn)
+    .sort((a, b) => b.barcodeScore - a.barcodeScore)[0]?.column || 'K';
+  const descriptionColumn = [...stats]
+    .filter(item => item.column !== reducedColumn && item.column !== barcodeColumn)
+    .sort((a, b) => b.descriptionScore - a.descriptionScore)[0]?.column || 'D';
+
+  return { reducedColumn, barcodeColumn, descriptionColumn, headerRowIndex };
+};
+
 // More robust header normalization
 const normalizeHeader = (h: any) => {
   if (!h) return '';
@@ -750,7 +867,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
         description: prod.description || 'Sem descrição'
       });
       if (prod.barcode) {
-        barcodeMap.set(prod.barcode, prod.reduced_code);
+        getBarcodeAliases(prod.barcode).forEach(alias => barcodeMap.set(alias, prod.reduced_code));
       }
     });
 
@@ -1162,33 +1279,49 @@ export const StockConference: React.FC<StockConferenceProps> = ({
         const bMap = new Map<string, string>();
 
         const isProdExcel = productSourceFile.name.match(/\.(xls|xlsx)$/i);
+        const productExcelLayout = isProdExcel ? detectProductExcelLayout(pData) : null;
 
-        pData.forEach(row => {
+        if (productExcelLayout) {
+          stockDebugLog('Layout do cadastro de produtos detectado automaticamente:', productExcelLayout);
+        }
+
+        pData.forEach((row, rowIndex) => {
           let reduced = '', barcode = '', desc = '';
+          let barcodeValues: string[] = [];
 
-          if (isProdExcel) {
-            reduced = String(row['C'] || '').trim();
-            barcode = String(row['K'] || '').trim();
-            if (row['D']) desc = String(row['D']).trim();
-            else if (row['B']) desc = String(row['B']).trim();
-            else if (row['A']) desc = String(row['A']).trim();
+          if (isProdExcel && productExcelLayout) {
+            if (rowIndex <= productExcelLayout.headerRowIndex) return;
 
-            if (!/[0-9]/.test(reduced)) return;
-            if (reduced.toLowerCase().includes('reduz') || reduced.toLowerCase().includes('cod')) return;
+            reduced = normalizeProductCode(row[productExcelLayout.reducedColumn]);
+            barcodeValues = extractBarcodeValues(row[productExcelLayout.barcodeColumn]);
+            barcode = barcodeValues[0] || '';
+            desc = String(row[productExcelLayout.descriptionColumn] ?? '').trim();
+
+            if (!isLikelyReducedCode(reduced)) return;
 
           } else {
             Object.keys(row).forEach(k => {
               const norm = normalizeHeader(k);
               const val = row[k];
-              if (norm === 'reducedCode') reduced = String(val).trim();
-              if (norm === 'barcode') barcode = String(val).trim();
+              if (norm === 'reducedCode') reduced = normalizeProductCode(val);
+              if (norm === 'barcode') {
+                barcodeValues = extractBarcodeValues(val);
+                barcode = barcodeValues[0] || '';
+              }
               if (norm === 'description') desc = String(val).trim();
             });
           }
 
           if (reduced && reduced !== 'undefined' && reduced !== '') {
-            pMap.set(reduced, { reducedCode: reduced, barcode, description: desc || 'Sem descrição' });
-            if (barcode && barcode !== 'undefined' && barcode !== '') bMap.set(barcode, reduced);
+            const existing = pMap.get(reduced);
+            pMap.set(reduced, {
+              reducedCode: reduced,
+              barcode: barcode || existing?.barcode || '',
+              description: desc || existing?.description || 'Sem descrição'
+            });
+            barcodeValues.forEach(value => {
+              getBarcodeAliases(value).forEach(alias => bMap.set(alias, reduced));
+            });
           }
         });
 
@@ -1260,7 +1393,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
           }
         });
 
-        if (pMap.size === 0) throw new Error("Sem produtos válidos. Verifique as colunas (C=Reduzido, K=Barras).");
+        if (pMap.size === 0) throw new Error("Sem produtos válidos. Não foi possível identificar as colunas de reduzido, EAN e descrição.");
         if (iMap.size === 0) throw new Error("Sem estoque válido. Não foi possível identificar automaticamente as colunas de código e quantidade.");
 
         setMasterProducts(pMap);
@@ -1308,9 +1441,11 @@ export const StockConference: React.FC<StockConferenceProps> = ({
   // --- Handlers: Conference ---
 
   const findProduct = (code: string): Product | undefined => {
-    if (masterProducts.has(code)) return masterProducts.get(code);
-    if (barcodeIndex.has(code)) {
-      const reduced = barcodeIndex.get(code);
+    const normalizedCode = normalizeProductCode(code);
+    if (masterProducts.has(normalizedCode)) return masterProducts.get(normalizedCode);
+    for (const alias of getBarcodeAliases(normalizedCode)) {
+      if (!barcodeIndex.has(alias)) continue;
+      const reduced = barcodeIndex.get(alias);
       if (reduced) return masterProducts.get(reduced);
     }
     return undefined;
@@ -2077,7 +2212,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
         <div className={`border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center transition-colors ${effectiveProductFile ? 'border-green-500 bg-green-50' : 'border-gray-300 hover:border-blue-400'}`}>
           <FileSpreadsheet className={`w-10 h-10 mb-3 ${effectiveProductFile ? 'text-green-500' : 'text-gray-400'}`} />
           <h3 className="font-semibold text-gray-700 mb-1 text-sm">Arquivo de Produtos</h3>
-          <p className="text-[10px] text-gray-500 text-center mb-3">Base (Excel: C=Red, K=Barra, D=Desc)</p>
+          <p className="text-[10px] text-gray-500 text-center mb-3">Base (Excel: Red, EAN e descrição detectados automaticamente)</p>
           <label className={`cursor-pointer bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-3 py-2 rounded-lg text-xs font-bold transition ${pendingReportsCount > 0 ? 'pointer-events-none opacity-50' : ''}`}>
             {productFile ? productFile.name : effectiveProductFile ? effectiveProductFile.name : 'Selecionar Arquivo'}
             <input 
