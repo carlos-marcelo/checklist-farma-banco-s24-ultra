@@ -1218,13 +1218,14 @@ export async function fetchAuditSession(branch: string, auditNumber: number): Pr
 }
 
 export async function fetchLatestAudit(branch: string): Promise<DbAuditSession | null> {
-  // Use a targeted selection instead of * if possible, but for now we keep it to match existing usage
-  // until we verify where all properties are used.
+  // Uma sessão aberta tem prioridade, mesmo quando uma auditoria concluída possui
+  // número maior (caso legítimo de reabertura de um inventário anterior).
   try {
     const { data, error } = await supabase
       .from('audit_sessions')
       .select('*')
       .eq('branch', branch)
+      .order('status', { ascending: false }) // "open" antes de "completed"
       .order('audit_number', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -1240,12 +1241,13 @@ export async function fetchLatestAudit(branch: string): Promise<DbAuditSession |
 /**
  * Lightweight check for audit changes
  */
-export async function fetchLatestAuditMetadata(branch: string): Promise<{ id: string, updated_at: string, audit_number: number } | null> {
+export async function fetchLatestAuditMetadata(branch: string): Promise<{ id: string, updated_at: string, audit_number: number, status: 'open' | 'completed' } | null> {
   try {
     const { data, error } = await supabase
       .from('audit_sessions')
-      .select('id, updated_at, audit_number')
+      .select('id, updated_at, audit_number, status')
       .eq('branch', branch)
+      .order('status', { ascending: false })
       .order('audit_number', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -1258,7 +1260,10 @@ export async function fetchLatestAuditMetadata(branch: string): Promise<{ id: st
   }
 }
 
-export async function upsertAuditSession(session: DbAuditSession): Promise<DbAuditSession | null> {
+export async function upsertAuditSession(
+  session: DbAuditSession,
+  options: { allowReopen?: boolean } = {}
+): Promise<DbAuditSession | null> {
   try {
     let safeData = session.data ? JSON.parse(JSON.stringify(session.data)) : null;
     const replacePostAuditAdjustments = !!safeData?.[POST_AUDIT_ADJUSTMENTS_REPLACE_FLAG];
@@ -1279,13 +1284,22 @@ export async function upsertAuditSession(session: DbAuditSession): Promise<DbAud
       delete safeData.lastLocalUpdate;
     }
 
+    const { data: existing, error: existingError } = await supabase
+      .from('audit_sessions')
+      .select('id, status, data')
+      .eq('branch', String(session.branch))
+      .eq('audit_number', session.audit_number)
+      .maybeSingle();
+    if (existingError) throw existingError;
+
+    if (session.status === 'open' && existing?.status === 'completed' && !options.allowReopen) {
+      console.warn(
+        `[AuditFlow] Gravação aberta bloqueada: inventário Nº ${session.audit_number} da filial ${session.branch} já está concluído.`
+      );
+      return null;
+    }
+
     if (safeData) {
-      const { data: existing } = await supabase
-        .from('audit_sessions')
-        .select('data')
-        .eq('branch', String(session.branch))
-        .eq('audit_number', session.audit_number)
-        .maybeSingle();
 
       if (replacePostAuditAdjustments) {
         safeData.postAuditAdjustments = normalizeAuditAdjustmentList(safeData.postAuditAdjustments);
@@ -1311,14 +1325,30 @@ export async function upsertAuditSession(session: DbAuditSession): Promise<DbAud
       updated_at: new Date().toISOString()
     };
 
-    // If ID exists, we try to use it, but onConflict should handle the identity based on branch/number
-    if (session.id) {
-      payload.id = session.id;
+    if (existing?.id) {
+      // A condição de status faz a proteção no mesmo UPDATE. Se outra aba concluir
+      // entre a leitura acima e esta gravação, nenhuma linha será modificada.
+      let updateQuery = supabase
+        .from('audit_sessions')
+        .update(payload)
+        .eq('id', existing.id);
+      if (session.status === 'open' && !options.allowReopen) {
+        updateQuery = updateQuery.neq('status', 'completed');
+      }
+      const { data, error } = await updateQuery.select().maybeSingle();
+      if (error) throw error;
+      if (!data && session.status === 'open' && !options.allowReopen) {
+        console.warn(
+          `[AuditFlow] Gravação aberta cancelada: o inventário Nº ${session.audit_number} foi concluído durante a sincronização.`
+        );
+      }
+      return data;
     }
 
+    if (session.id) payload.id = session.id;
     const { data, error } = await supabase
       .from('audit_sessions')
-      .upsert(payload, { onConflict: 'branch,audit_number' })
+      .insert(payload)
       .select()
       .single();
 

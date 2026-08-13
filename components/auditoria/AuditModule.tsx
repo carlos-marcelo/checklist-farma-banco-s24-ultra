@@ -1616,13 +1616,33 @@ const getAppliedStockSignature = (sourceFiles: any): string => {
     });
 };
 
-const getAppliedStockTimestampRaw = (sourceFiles: any): string | null =>
-    String(
-        sourceFiles?.globalStockProcessedAt ||
-        sourceFiles?.stock?.syncedAt ||
-        sourceFiles?.lastStockUpdateAt ||
-        ''
-    ).trim() || null;
+const getAppliedStockTimestampRaw = (sourceFiles: any): string | null => {
+    const stockSource = String(sourceFiles?.stock?.source || '').trim().toLowerCase();
+    const canUseLastUpdateAsGlobalMarker =
+        stockSource === 'global_base' ||
+        !!sourceFiles?.globalStockSignature ||
+        !!sourceFiles?.globalStockProcessedAt;
+    const candidates = [
+        sourceFiles?.globalStockProcessedAt,
+        sourceFiles?.stock?.syncedAt,
+        sourceFiles?.stock?.uploaded_at,
+        sourceFiles?.stock?.uploadedAt,
+        // Em sessões antigas este era o único marcador atualizado após aplicar
+        // o estoque global. Usamos o mais recente, em vez do primeiro existente.
+        canUseLastUpdateAsGlobalMarker ? sourceFiles?.lastStockUpdateAt : null
+    ]
+        .map(value => String(value || '').trim())
+        .filter(Boolean);
+    if (candidates.length === 0) return null;
+
+    return candidates.reduce((latest, candidate) => {
+        const latestTs = Date.parse(latest);
+        const candidateTs = Date.parse(candidate);
+        if (!Number.isFinite(candidateTs)) return latest;
+        if (!Number.isFinite(latestTs) || candidateTs > latestTs) return candidate;
+        return latest;
+    });
+};
 
 const getGlobalStockTimestampRaw = (globalStockMeta: any): string | null =>
     String(globalStockMeta?.uploaded_at || globalStockMeta?.updated_at || '').trim() || null;
@@ -2296,10 +2316,11 @@ interface AuditModuleProps {
     initialCompanyName?: string | null;
     forceManualFilialSelection?: boolean;
     onAuditExited?: () => void;
+    onAuditSessionChanged?: (session: DbAuditSession) => void;
     onFilialSelected?: () => void;
 }
 
-const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, userCompanyId, userArea, userFilial, companies, initialFilial, initialArea, initialCompanyId, initialCompanyName, forceManualFilialSelection = false, onAuditExited, onFilialSelected }) => {
+const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, userCompanyId, userArea, userFilial, companies, initialFilial, initialArea, initialCompanyId, initialCompanyName, forceManualFilialSelection = false, onAuditExited, onAuditSessionChanged, onFilialSelected }) => {
     const isMaster = userRole === 'MASTER';
     const isAdmin = userRole === 'ADMINISTRATIVO';
     const canUseAuditMasterTools = isMaster || isAdmin;
@@ -2935,7 +2956,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             if (latest?.updated_at) {
                 lastAuditUpdateRef.current = latest.updated_at;
             }
-            if (silent && latest && dbSessionId === latest.id && latest.data) {
+            if (
+                silent &&
+                latest &&
+                latest.status !== 'completed' &&
+                !isReadOnlyCompletedView &&
+                dbSessionId === latest.id &&
+                latest.data
+            ) {
                 const canReuseNormalizedSnapshot = (latest as any)._clientNormalizedVersion === AUDIT_CLIENT_NORMALIZED_VERSION;
                 if (!canReuseNormalizedSnapshot) {
                     await yieldToBrowser();
@@ -4100,7 +4128,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     ? withAuditDataBranch(normalizedIncoming.data as AuditData, branch)
                     : incomingData) as any,
                 updated_at: baseUpdatedAt || undefined
-            });
+            }, { allowReopen });
             if (!saved) {
                 if (session.status === 'completed') return null;
                 if (options?.requireRemote) return null;
@@ -4315,55 +4343,46 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     user_email: userEmail
                 };
 
-                let savedSession: DbAuditSession | null = null;
-                
-                if (isOnlineNow) {
-                    try {
-                        savedSession = await persistAuditSession(sessionToPersist);
-                    } catch (syncErr) {
-                        console.error("Falha ao sincronizar finalização:", syncErr);
-                        // Se falhou mas salvou localmente como pendente (feito dentro do persistAuditSession)
-                        savedSession = null;
-                    }
-                } else {
-                    // Offline: salva localmente com flag
-                    if (data) {
-                        await AuditStorage.saveLocalAuditSession(data, true);
-                        setData(prev => prev ? { ...prev, pendingSync: true } : prev);
-                    }
-                    savedSession = null;
+                if (!isOnlineNow) {
+                    const pendingData = { ...(sessionToPersist.data as AuditData), pendingSync: true };
+                    await AuditStorage.saveLocalAuditSession(pendingData, true);
+                    setData(pendingData);
+                    alert(
+                        "Não foi possível encerrar a auditoria porque o servidor está offline.\n\n" +
+                        "O progresso foi preservado neste computador, mas a auditoria continua EM ABERTO. " +
+                        "Quando a conexão voltar e o indicador estiver LIVE, clique novamente em Finalizar."
+                    );
+                    return;
                 }
 
-                if (savedSession) {
-                    await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
-                    alert("Auditoria finalizada com sucesso e salva no servidor!");
-                } else {
-                    alert("AVISO: Auditoria finalizada LOCALMENTE.\n\nComo você está sem conexão estável, os dados foram salvos no seu computador. Eles serão enviados ao servidor automaticamente assim que a internet voltar.\n\nNÃO limpe o cache do navegador até ver o status 'LIVE' verde.");
+                const savedSession = await persistAuditSession(sessionToPersist, { requireRemote: true });
+                if (!savedSession || savedSession.status !== 'completed') {
+                    alert(
+                        "Não foi possível confirmar o encerramento no servidor.\n\n" +
+                        "A auditoria permanece EM ABERTO para evitar divergência de status. Tente novamente em instantes."
+                    );
+                    return;
                 }
 
-                // Se salvou no servidor, podemos limpar tudo. 
-                // Se ficou pendente, limpamos o estado da tela mas o persistAuditSession já garantiu o backup no IndexedDB.
-                // IMPORTANTE: Só limpamos o local se NÃO houver pendência de sync real (ou se o usuário confirmou que entendeu).
-                
-                if (savedSession || !isOnlineNow || data?.pendingSync) {
-                    sessionStorage.removeItem(CONFIRMED_SESSION_KEY);
-                    setData(null);
-                    setDbSessionId(undefined);
-                    setAllowActiveAuditAutoOpen(false);
-                    setSelectedFilial("");
-                    setGroupFiles(createInitialGroupFiles());
-                    setFileStock(null);
-                    setFileDeptIds(null);
-                    setFileCatIds(null);
-                    setInitialDoneUnits(0);
-                    setSessionStartTime(Date.now());
-                    setView({ level: 'groups' });
-                    onAuditExited?.();
-                    // Nota: AuditStorage.clearLocalAuditSession() NÃO deve ser chamado se estiver pendente.
-                    if (savedSession) {
-                        await AuditStorage.clearLocalAuditSession();
-                    }
-                }
+                await CacheService.set(`audit_session_${selectedFilial}`, savedSession as any);
+                alert("Auditoria finalizada com sucesso e salva no servidor!");
+                sessionStorage.removeItem(CONFIRMED_SESSION_KEY);
+                setData(null);
+                setDbSessionId(undefined);
+                setAllowActiveAuditAutoOpen(false);
+                setSelectedFilial("");
+                setGroupFiles(createInitialGroupFiles());
+                setFileStock(null);
+                setFileDeptIds(null);
+                setFileCatIds(null);
+                setInitialDoneUnits(0);
+                setSessionStartTime(Date.now());
+                setView({ level: 'groups' });
+                // Entrega a sessão confirmada ao dashboard antes de limpar a tela.
+                // Assim os totais mudam imediatamente, sem depender de recarregar a página.
+                onAuditSessionChanged?.(savedSession);
+                onAuditExited?.();
+                await AuditStorage.clearLocalAuditSession();
             } catch (err) {
                 console.error("Error finishing session:", err);
                 alert("Erro crítico ao finalizar auditoria. Verifique sua conexão e tente novamente.");
@@ -4470,6 +4489,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             setTermDrafts(((reconciled as any)?.termDrafts || {}) as Record<string, TermForm>);
             setView({ level: 'groups' });
             setShowCompletedAuditsModal(false);
+            onAuditSessionChanged?.(reopened);
             alert(`Inventário Nº ${targetAuditNumber} reaberto com sucesso.`);
             return true;
         } catch (error) {
@@ -5207,6 +5227,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             })),
             stock: effectiveStockFile ? {
                 ...toUploadedFileMeta(effectiveStockFile),
+                id: globalStockMeta?.id || null,
+                module_key: globalStockMeta?.module_key || buildSharedStockModuleKey(selectedFilial),
+                file_name: globalStockMeta?.file_name || effectiveStockFile.name,
+                file_size: globalStockMeta?.file_size ?? effectiveStockFile.size,
+                uploaded_at: globalStockMeta?.uploaded_at || null,
+                updated_at: globalStockMeta?.updated_at || null,
                 source: stockSource,
                 syncedAt: forcedStockSyncedAt || getGlobalStockTimestampRaw(globalStockMeta),
                 signature: stockSignature
@@ -5335,6 +5361,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             ...prevSourceFiles,
             stock: {
                 ...stockMeta,
+                ...(source === 'global_base' ? {
+                    id: globalStockMeta?.id || null,
+                    module_key: globalStockMeta?.module_key || buildSharedStockModuleKey(selectedFilial),
+                    file_name: globalStockMeta?.file_name || stockFile.name,
+                    file_size: globalStockMeta?.file_size ?? stockFile.size,
+                    uploaded_at: globalStockMeta?.uploaded_at || syncedAt,
+                    updated_at: globalStockMeta?.updated_at || null
+                } : {}),
                 source,
                 syncedAt,
                 signature: stockSignature

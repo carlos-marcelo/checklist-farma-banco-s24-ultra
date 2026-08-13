@@ -3244,6 +3244,8 @@ const App: React.FC = () => {
     const dashboardAuditLoadScheduledRef = useRef(false);
     const dashboardOpenAuditRequestRef = useRef<Promise<void> | null>(null);
     const dashboardCompletedAuditRequestRef = useRef<Promise<void> | null>(null);
+    const dashboardOpenAuditForceRefreshQueuedRef = useRef(false);
+    const dashboardCompletedAuditForceRefreshQueuedRef = useRef(false);
     const dashboardAuditBackoffRef = useRef({ failures: 0, retryAt: 0, lastLoggedAt: 0 });
     const [dashboardAuditRetryAt, setDashboardAuditRetryAt] = useState(0);
     const [dashboardClockMinute, setDashboardClockMinute] = useState(() => Date.now());
@@ -3668,6 +3670,7 @@ const App: React.FC = () => {
     const CACHE_KEY_TICKETS = 'tickets_list';
     const CACHE_KEY_CHECKLIST_DEFS = 'checklist_definitions';
     const CACHE_KEY_AUDIT_DASHBOARD_PREFIX = 'audit_dashboard_sessions';
+    const AUDIT_DASHBOARD_REVALIDATE_MS = 60 * 1000;
     const CACHE_KEY_USERS_META = 'users_list_meta_signature';
     const STATIC_REFERENCE_CACHE_MS = 15 * 60 * 1000;
     const HISTORY_BACKGROUND_CACHE_MS = 2 * 60 * 1000;
@@ -7780,7 +7783,14 @@ const App: React.FC = () => {
     const loadDashboardAuditSessions = useCallback((force = false): Promise<void> => {
         if (!currentUser) return Promise.resolve();
         const existingRequest = dashboardOpenAuditRequestRef.current;
-        if (existingRequest) return existingRequest;
+        if (existingRequest) {
+            if (!force || dashboardOpenAuditForceRefreshQueuedRef.current) return existingRequest;
+            dashboardOpenAuditForceRefreshQueuedRef.current = true;
+            return existingRequest.finally(() => {
+                dashboardOpenAuditForceRefreshQueuedRef.current = false;
+                return loadDashboardAuditSessions(true);
+            });
+        }
 
         const request = (async () => {
             const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates))
@@ -7953,7 +7963,14 @@ const App: React.FC = () => {
     const loadCompletedDashboardAuditSessions = useCallback((force = false): Promise<void> => {
         if (!currentUser) return Promise.resolve();
         const existingRequest = dashboardCompletedAuditRequestRef.current;
-        if (existingRequest) return existingRequest;
+        if (existingRequest) {
+            if (!force || dashboardCompletedAuditForceRefreshQueuedRef.current) return existingRequest;
+            dashboardCompletedAuditForceRefreshQueuedRef.current = true;
+            return existingRequest.finally(() => {
+                dashboardCompletedAuditForceRefreshQueuedRef.current = false;
+                return loadCompletedDashboardAuditSessions(true);
+            });
+        }
 
         const request = (async () => {
             const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates))
@@ -8165,14 +8182,19 @@ const App: React.FC = () => {
 
     useEffect(() => {
         if (!currentUser || isLoadingData) return;
+        const now = Date.now();
+        const openDataIsFresh = !!dashboardAuditsFetchedAt &&
+            now - (Date.parse(dashboardAuditsFetchedAt) || 0) < AUDIT_DASHBOARD_REVALIDATE_MS;
+        const completedDataIsFresh = !!completedDashboardAuditsFetchedAt &&
+            now - (Date.parse(completedDashboardAuditsFetchedAt) || 0) < AUDIT_DASHBOARD_REVALIDATE_MS;
         if (currentView === 'audit') {
-            if (dashboardAuditsFetchedAt && completedDashboardAuditsFetchedAt) return;
+            if (openDataIsFresh && completedDataIsFresh) return;
             if (auditCrossLoadScheduledRef.current) return;
             auditCrossLoadScheduledRef.current = true;
             scheduleBackgroundTask(() => {
                 void Promise.allSettled([
-                    dashboardAuditsFetchedAt ? Promise.resolve() : loadDashboardAuditSessions(),
-                    completedDashboardAuditsFetchedAt ? Promise.resolve() : loadCompletedDashboardAuditSessions()
+                    openDataIsFresh ? Promise.resolve() : loadDashboardAuditSessions(!!dashboardAuditsFetchedAt),
+                    completedDataIsFresh ? Promise.resolve() : loadCompletedDashboardAuditSessions(!!completedDashboardAuditsFetchedAt)
                 ]).finally(() => {
                     auditCrossLoadScheduledRef.current = false;
                 });
@@ -8180,14 +8202,14 @@ const App: React.FC = () => {
             return;
         }
         if (currentView !== 'dashboard') return;
-        // Os dados completos já carregados permanecem em memória ao navegar entre módulos.
-        // Uma nova consulta ocorre apenas no primeiro acesso ou pelo botão Atualizar.
-        if (dashboardAuditsFetchedAt && completedDashboardAuditsFetchedAt) return;
+        // Mantém a tela responsiva com o estado em memória, mas reconcilia periodicamente
+        // alterações feitas por outras máquinas/usuários sem exigir F5.
+        if (openDataIsFresh && completedDataIsFresh) return;
         if (dashboardAuditLoadScheduledRef.current) return;
         dashboardAuditLoadScheduledRef.current = true;
         void Promise.allSettled([
-            (dashboardAuditsFetchedAt || isLoadingDashboardAudits) ? Promise.resolve() : loadDashboardAuditSessions(),
-            (completedDashboardAuditsFetchedAt || isLoadingCompletedDashboardAudits) ? Promise.resolve() : loadCompletedDashboardAuditSessions()
+            (openDataIsFresh || isLoadingDashboardAudits) ? Promise.resolve() : loadDashboardAuditSessions(!!dashboardAuditsFetchedAt),
+            (completedDataIsFresh || isLoadingCompletedDashboardAudits) ? Promise.resolve() : loadCompletedDashboardAuditSessions(!!completedDashboardAuditsFetchedAt)
         ]).finally(() => {
             dashboardAuditLoadScheduledRef.current = false;
         });
@@ -8200,7 +8222,8 @@ const App: React.FC = () => {
         loadDashboardAuditSessions,
         loadCompletedDashboardAuditSessions,
         dashboardAuditsFetchedAt,
-        completedDashboardAuditsFetchedAt
+        completedDashboardAuditsFetchedAt,
+        dashboardClockMinute
     ]);
 
     useEffect(() => {
@@ -10636,6 +10659,58 @@ const App: React.FC = () => {
         setAuditJumpCompanyName('');
     }, [markAuditManualBranchSelectionRequired]);
 
+    const handleAuditSessionChanged = useCallback((changedSession: SupabaseService.DbAuditSession) => {
+        const changedBranch = normalizeBranchLabel(changedSession.branch);
+        const changedAuditNumber = Number(changedSession.audit_number || 0);
+        const isSameAudit = (session: SupabaseService.DbAuditSession) =>
+            (!!changedSession.id && String(session.id) === String(changedSession.id)) ||
+            (
+                normalizeBranchLabel(session.branch) === changedBranch &&
+                Number(session.audit_number || 0) === changedAuditNumber
+            );
+
+        // Atualização otimista e atômica nos dois sentidos: encerramento ou reabertura.
+        setDashboardAuditSessions(previous => changedSession.status === 'open'
+            ? [changedSession, ...previous.filter(session => !isSameAudit(session))]
+            : previous.filter(session => !isSameAudit(session))
+        );
+        setDashboardCompletedAuditSessions(previous => changedSession.status === 'completed'
+            ? [changedSession, ...previous.filter(session => !isSameAudit(session))]
+            : previous.filter(session => !isSameAudit(session))
+        );
+        const syncedAt = new Date().toISOString();
+        setDashboardAuditsFetchedAt(syncedAt);
+        setCompletedDashboardAuditsFetchedAt(syncedAt);
+        setDashboardAuditsError(null);
+        setCompletedDashboardAuditsError(null);
+
+        // Remove snapshots dos dois status e confirma a transição no servidor.
+        // Se houver uma carga em andamento, o loader agenda uma segunda leitura
+        // forçada para impedir que uma resposta antiga sobrescreva este estado.
+        const queryBranches = Array.from(new Set(dashboardAuditBranchCandidates))
+            .filter(Boolean)
+            .filter(branch => !SupabaseService.isTechnicalArchivedAuditBranch(branch));
+        const openCacheKey = buildAuditDashboardCacheKey('open', queryBranches);
+        const completedCacheKey = buildAuditDashboardCacheKey('completed', queryBranches);
+        void Promise.all([
+            CacheService.remove(openCacheKey),
+            CacheService.remove(`${openCacheKey}_meta`),
+            CacheService.remove(completedCacheKey),
+            CacheService.remove(`${completedCacheKey}_meta`)
+        ]).finally(() => {
+            void Promise.allSettled([
+                loadDashboardAuditSessions(true),
+                loadCompletedDashboardAuditSessions(true)
+            ]);
+        });
+    }, [
+        markAuditManualBranchSelectionRequired,
+        dashboardAuditBranchCandidates,
+        buildAuditDashboardCacheKey,
+        loadDashboardAuditSessions,
+        loadCompletedDashboardAuditSessions
+    ]);
+
     useEffect(() => {
         if (currentView !== 'audit' && auditJumpFilial) {
             setAuditJumpFilial('');
@@ -10956,6 +11031,7 @@ const App: React.FC = () => {
                                             initialCompanyName={auditJumpCompanyName || null}
                                             forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
                                             onAuditExited={handleAuditExited}
+                                            onAuditSessionChanged={handleAuditSessionChanged}
                                             onFilialSelected={clearAuditManualBranchSelectionRequired}
                                         />
                                     </div>
