@@ -97,6 +97,18 @@ interface StockItem {
   status: 'pending' | 'matched' | 'divergent';
 }
 
+const isConfirmedDivergence = (item: StockItem, recountTargets: Set<string>): boolean => {
+  if (item.status !== 'divergent' || item.lastUpdated === null) return false;
+
+  // A regular divergence is confirmed after it participates in the recount.
+  if (recountTargets.has(item.reducedCode)) return true;
+
+  // A physical quantity can never be negative. When the system balance is
+  // negative and the audit records zero or more units, that physical count is
+  // already a valid confirmation and must not prevent signatures/finalization.
+  return item.systemQty < 0 && item.countedQty >= 0;
+};
+
 type AppStep = 'setup' | 'conference' | 'divergence' | 'report';
 
 interface StockConferenceProps {
@@ -1825,6 +1837,37 @@ export const StockConference: React.FC<StockConferenceProps> = ({
     setTimeout(() => inputRef.current?.focus(), 100);
   };
 
+  const handleRecountItem = (item: StockItem, product?: Product) => {
+    const currentItem = inventory.get(item.reducedCode);
+    if (!currentItem) return;
+
+    const updatedInventory = new Map(inventory);
+    updatedInventory.set(item.reducedCode, {
+      ...currentItem,
+      countedQty: 0,
+      status: 'pending',
+      lastUpdated: null
+    });
+
+    const updatedRecountTargets = new Set(recountTargets);
+    updatedRecountTargets.add(item.reducedCode);
+
+    setInventory(updatedInventory);
+    setRecountTargets(updatedRecountTargets);
+    setIsDirty(true);
+    setLastScanned(null);
+    setActiveItem(product || masterProducts.get(item.reducedCode) || null);
+    setScanInput('');
+    setCountInput('');
+    setStep('conference');
+    void persistSession({
+      inventoryOverride: updatedInventory,
+      step: 'conference',
+      recountOverride: updatedRecountTargets
+    });
+    setTimeout(() => countRef.current?.focus(), 100);
+  };
+
   const handleFinalize = async () => {
     // 1. Strict Check: Phase 1 Completion (No Pending items allowed)
     const pendingCount = Array.from(inventory.values()).filter((i: StockItem) => i.status === 'pending').length;
@@ -1835,12 +1878,15 @@ export const StockConference: React.FC<StockConferenceProps> = ({
       return;
     }
 
-    // 2. Strict Check: Phase 2 Requirement (If Divergences exist, Recount must have been initiated)
-    const divergentCount = Array.from(inventory.values()).filter((i: StockItem) => i.status === 'divergent').length;
+    // 2. Divergences may remain after the recount. They only block when they have
+    // not yet been included and completed in the second audit.
+    const unverifiedDivergences = Array.from(inventory.values()).filter((item: StockItem) =>
+      item.status === 'divergent' && !isConfirmedDivergence(item, recountTargets)
+    );
 
-    if (divergentCount > 0 && !stats.isRecount) {
+    if (unverifiedDivergences.length > 0) {
       playSound('error');
-      alert("Ação Bloqueada!\n\nForam encontradas divergências após a contagem inicial.\n\nRegra: É obrigatório iniciar e concluir a recontagem (2ª Fase) das divergências antes de finalizar.\n\nClique em 'Recontar Todas as Divergências' para prosseguir.");
+      alert(`Ação Bloqueada!\n\nExistem ${unverifiedDivergences.length} divergências ainda não confirmadas na segunda auditoria.\n\nReconte esses itens para registrar a quantidade física real. Divergências confirmadas, inclusive contra estoque negativo, podem permanecer no relatório e não impedem a finalização.`);
       return;
     }
 
@@ -2622,10 +2668,18 @@ export const StockConference: React.FC<StockConferenceProps> = ({
       }));
 
     const pendingItems = allStockItems.filter(i => i.status === 'pending');
+    const unverifiedDivergentItems = divergentItems.filter(({ item }) =>
+      !isConfirmedDivergence(item, recountTargets)
+    );
+    const verifiedDivergentCodes = new Set(
+      divergentItems
+        .filter(({ item }) => isConfirmedDivergence(item, recountTargets))
+        .map(({ item }) => item.reducedCode)
+    );
 
     // Determine blocking state for Finalize
     const isPendingBlocking = pendingItems.length > 0;
-    const isRecountBlocking = divergentItems.length > 0 && !stats.isRecount;
+    const isRecountBlocking = unverifiedDivergentItems.length > 0;
     const isFinalizeBlocked = isPendingBlocking || isRecountBlocking;
 
     const handleReturnToConference = () => {
@@ -2713,11 +2767,19 @@ export const StockConference: React.FC<StockConferenceProps> = ({
                       {divergentItems.map(({ item, product }) => {
                         const diff = item.countedQty - item.systemQty;
                         const isPositive = diff > 0;
+                        const isVerified = verifiedDivergentCodes.has(item.reducedCode);
                         return (
                           <tr key={item.reducedCode} className="hover:bg-gray-50">
                             <td className="p-4">
                               <div className="font-semibold text-gray-800">{product?.description || 'Item Desconhecido'}</div>
                               <div className="text-xs text-gray-400 font-mono">Red: {item.reducedCode}</div>
+                              {isVerified && (
+                                <div className="mt-1 text-[10px] font-bold uppercase tracking-wide text-emerald-700">
+                                  {item.systemQty < 0 && item.countedQty >= 0
+                                    ? 'Estoque negativo auditado — liberado para finalizar'
+                                    : 'Divergência confirmada na recontagem'}
+                                </div>
+                              )}
                             </td>
                             <td className="p-4 text-center font-mono">{item.systemQty}</td>
                             <td className={`p-4 text-center font-mono font-bold ${isPositive ? 'text-blue-600' : 'text-red-600'}`}>{item.countedQty}</td>
@@ -2727,21 +2789,15 @@ export const StockConference: React.FC<StockConferenceProps> = ({
                             <td className="p-4 text-right">
                               <button
                                 onClick={() => {
-                                  // Can only allow individual recount if phase 1 complete, or just let them count?
-                                  // User logic implies strictness, but individual manual fix might be ok.
-                                  // Let's stick to global rule for simplicity or check pending.
                                   if (pendingItems.length > 0) {
                                     alert("Atenção: Finalize os itens pendentes antes de recontar.");
                                     return;
                                   }
-                                  setActiveItem(product || null);
-                                  setScanInput('');
-                                  setStep('conference');
-                                  setTimeout(() => countRef.current?.focus(), 100);
+                                  handleRecountItem(item, product);
                                 }}
                                 className="text-blue-600 hover:text-blue-800 font-medium text-xs border border-blue-200 px-3 py-1 rounded hover:bg-blue-50"
                               >
-                                Recontar
+                                {isVerified ? 'Recontar novamente' : 'Recontar'}
                               </button>
                             </td>
                           </tr>
