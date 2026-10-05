@@ -4760,7 +4760,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         return s.replace(/\D/g, "").replace(/^0+/, "");
     };
 
-    const collectProductCodeCandidates = (row: any[], maxColumns = 12): string[] => {
+    const collectProductCodeCandidates = (row: any[], maxColumns = 12, reducedColIndex = 1): string[] => {
         const candidates = new Set<string>();
         const add = (index: number) => {
             if (!row || index < 0 || index >= row.length) return;
@@ -4773,9 +4773,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     : /^\d+(?:-\d+)?(?:[.,]0+)?$/.test(text) || /[Ee+]/.test(text);
             if (!looksNumericCode) return;
             const code = normalizeBarcode(raw);
-            const isReducedCodeColumn = index === 1;
+            const isReducedCodeColumn = index === reducedColIndex;
             if (!code || code.length < (isReducedCodeColumn ? 1 : 3)) return;
-            if (GROUP_UPLOAD_IDS.includes(code as GroupUploadId) && index !== 1) return;
+            if (GROUP_UPLOAD_IDS.includes(code as GroupUploadId) && index !== reducedColIndex) return;
             candidates.add(code);
         };
 
@@ -4802,6 +4802,137 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             .toLowerCase()
             .replace(/\s+/g, ' ')
             .trim();
+
+    interface StockColumnsInfo {
+        headerRowIndex: number;
+        codeCol: number;      // 0 (A) in new format (>= 01/10), 1 (B) in old format (<= 30/09)
+        nameCol: number;      // 1 (B) in new format, 2 (C) in old format
+        labCol: number;       // 2 (C) in new format, 3 (D) in old format
+        groupCol: number;     // 3 (D) in new format, 4 (E) in old format
+        qtyCol: number;       // 13 (N) in new format, 14 (O) in old format
+        costCol: number;      // 14 (O) in new format, 15 (P) in old format
+        isNewFormat: boolean; // true if columns start at A
+    }
+
+    const detectStockColumns = (rows: any[][]): StockColumnsInfo => {
+        const maxScan = Math.min(rows.length, 35);
+        let headerRowIndex = -1;
+        let codeCol = -1;
+        let nameCol = -1;
+        let labCol = -1;
+        let groupCol = -1;
+        let qtyCol = -1;
+        let costCol = -1;
+
+        // 1. Scan for header row (e.g. row 12 where 'Cód.' appears)
+        for (let i = 0; i < maxScan; i++) {
+            const row = rows[i];
+            if (!Array.isArray(row) || row.length < 2) continue;
+
+            for (let c = 0; c <= 2; c++) {
+                const cell = normalizeHeaderText(row[c]);
+                if (cell && (cell === 'cod.' || cell === 'cod' || cell === 'codigo' || cell.startsWith('cod.')) && !cell.includes('barra')) {
+                    const nextCell = normalizeHeaderText(row[c + 1]);
+                    if (nextCell && (nextCell.includes('descr') || nextCell.includes('prod'))) {
+                        headerRowIndex = i;
+                        codeCol = c;
+                        nameCol = c + 1;
+                        break;
+                    }
+                }
+            }
+            if (headerRowIndex >= 0) break;
+        }
+
+        // Search for specific column headers in the header row
+        if (headerRowIndex >= 0) {
+            const headerRow = rows[headerRowIndex] || [];
+            for (let c = 0; c < headerRow.length; c++) {
+                const text = normalizeHeaderText(headerRow[c]);
+                if (!text) continue;
+                if (c > nameCol && labCol < 0 && (text.includes('laborat') || text === 'lab')) {
+                    labCol = c;
+                } else if (c > nameCol && groupCol < 0 && (text.includes('grup') || text === 'gr.')) {
+                    groupCol = c;
+                } else if (c > nameCol && qtyCol < 0 && (text === 'estq.' || text === 'estq' || text === 'estoq' || text === 'estoque' || text === 'saldo') && !text.includes('min') && !text.includes('crit') && !text.includes('dem')) {
+                    qtyCol = c;
+                } else if (c > nameCol && costCol < 0 && (text.includes('custo') || text.includes('p. custo') || text.includes('p.custo')) && !text.includes('total')) {
+                    costCol = c;
+                }
+            }
+        }
+
+        // 2. Fallback / verification by inspecting product data rows
+        let isNewFormat = codeCol === 0;
+        if (codeCol < 0) {
+            let newVotes = 0;
+            let oldVotes = 0;
+            const startScan = headerRowIndex >= 0 ? headerRowIndex + 1 : 11;
+            for (let i = startScan; i < Math.min(startScan + 15, rows.length); i++) {
+                const row = rows[i];
+                if (!row) continue;
+                const cell0 = String(row[0] ?? '').trim();
+                const cell1 = String(row[1] ?? '').trim();
+                const cell2 = String(row[2] ?? '').trim();
+                if (/^\d{1,8}$/.test(cell0) && /[a-zA-Z]{3,}/.test(cell1)) {
+                    newVotes++;
+                } else if (!cell0 && /^\d{1,8}$/.test(cell1) && /[a-zA-Z]{3,}/.test(cell2)) {
+                    oldVotes++;
+                }
+            }
+
+            // Check date in top metadata rows (>= 01/10/2026 indicates new format)
+            let dateVoteNew = false;
+            for (let i = 0; i < Math.min(rows.length, 6); i++) {
+                const rowText = (rows[i] || []).join(' ');
+                const match = rowText.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+                if (match) {
+                    const [, , month, year] = match;
+                    const m = parseInt(month, 10);
+                    const y = parseInt(year, 10);
+                    if (y > 2026 || (y === 2026 && m >= 10)) {
+                        dateVoteNew = true;
+                    }
+                }
+            }
+
+            if (newVotes > oldVotes || (newVotes === oldVotes && dateVoteNew)) {
+                isNewFormat = true;
+                codeCol = 0;
+                nameCol = 1;
+            } else {
+                isNewFormat = false;
+                codeCol = 1;
+                nameCol = 2;
+            }
+        } else {
+            isNewFormat = codeCol === 0;
+        }
+
+        if (isNewFormat) {
+            return {
+                headerRowIndex,
+                codeCol: 0,
+                nameCol: nameCol >= 0 ? nameCol : 1,
+                labCol: labCol >= 0 ? labCol : 2,
+                groupCol: groupCol >= 0 ? groupCol : 3,
+                qtyCol: qtyCol >= 0 ? qtyCol : 13,
+                costCol: costCol >= 0 ? costCol : 14,
+                isNewFormat: true
+            };
+        } else {
+            return {
+                headerRowIndex,
+                codeCol: 1,
+                nameCol: nameCol >= 0 ? nameCol : 2,
+                labCol: labCol >= 0 ? labCol : 3,
+                groupCol: groupCol >= 0 ? groupCol : 4,
+                qtyCol: qtyCol >= 0 ? qtyCol : 14,
+                costCol: costCol >= 0 ? costCol : 15,
+                isNewFormat: false
+            };
+        }
+    };
 
     const detectTermComparisonColumns = (rows: any[][]) => {
         const hasAny = (header: string, terms: string[]) => terms.some(term => header.includes(term));
@@ -4944,16 +5075,19 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             try {
                 const rows = await readExcel(globalStockFile);
                 if (cancelled) return;
+                const stockCols = detectStockColumns(rows);
                 const next: Record<string, string[]> = {};
-                rows.forEach(row => {
-                    if (!row) return;
-                    const reduced = normalizeBarcode(row[1]);
-                    if (!reduced) return;
-                    const aliases = collectProductCodeCandidates(row, 12)
+                const startRow = stockCols.headerRowIndex >= 0 ? stockCols.headerRowIndex + 1 : 0;
+                for (let r = startRow; r < rows.length; r++) {
+                    const row = rows[r];
+                    if (!row) continue;
+                    const reduced = normalizeBarcode(row[stockCols.codeCol]);
+                    if (!reduced) continue;
+                    const aliases = collectProductCodeCandidates(row, 12, stockCols.codeCol)
                         .filter(code => code && code !== reduced);
-                    if (aliases.length === 0) return;
+                    if (aliases.length === 0) continue;
                     next[reduced] = Array.from(new Set([...(next[reduced] || []), ...aliases]));
-                });
+                }
                 setStockCodeAliasesByReduced(next);
             } catch (error) {
                 console.warn('Falha ao indexar códigos de barras do estoque para ajustes:', error);
@@ -5045,22 +5179,27 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 if (stockFile) {
                     const stockRows = await readExcel(stockFile);
                     if (cancelled) return;
+                    const stockCols = detectStockColumns(stockRows);
                     const stockAcc: Record<string, {
                         q: number; costAmount: number; costUnit: number; name: string;
                         groupId: string; barcode: string;
                     }> = {};
-                    stockRows.forEach(row => {
-                        if (!row) return;
-                        const reduced = normalizeBarcode(row[1]); // B = reduzido
-                        if (!reduced) return;
-                        const qty = parseStockNumber(row[14]); // O = quantidade
-                        let cost = parseStockNumber(row[15]); // P = custo
+                    const startRow = stockCols.headerRowIndex >= 0 ? stockCols.headerRowIndex + 1 : 0;
+                    for (let r = startRow; r < stockRows.length; r++) {
+                        const row = stockRows[r];
+                        if (!row) continue;
+                        const reduced = normalizeBarcode(row[stockCols.codeCol]);
+                        if (!reduced) continue;
+                        const qty = parseStockNumber(row[stockCols.qtyCol]);
+                        let cost = parseStockNumber(row[stockCols.costCol]);
                         // Fix for items without explicit cost but in the file
-                        if (cost <= 0 && qty > 0 && row[16]) cost = parseStockNumber(row[16]);
+                        if (cost <= 0 && qty > 0 && row[stockCols.costCol + 1]) cost = parseStockNumber(row[stockCols.costCol + 1]);
                         // Don't skip 0 qty items! They might have the base cost!
-                        const name = String(row[2] ?? row[4] ?? '').trim();
-                        const groupId = String(parseSheetNumericCode(row[6]) ?? ''); // G = grupo
-                        const barcode = collectProductCodeCandidates(row, 12)
+                        const name = String(row[stockCols.nameCol] ?? row[stockCols.nameCol + 2] ?? '').trim();
+                        const groupRaw = row[stockCols.groupCol] ?? row[stockCols.isNewFormat ? 3 : 4] ?? row[6];
+                        const groupNum = parseSheetNumericCode(groupRaw) ?? parseSheetNumericCode(row[6]);
+                        const groupId = groupNum !== null ? String(groupNum) : '';
+                        const barcode = collectProductCodeCandidates(row, 12, stockCols.codeCol)
                             .find(c => c && c !== reduced && normalizeProductLookupCode(c).length >= 8) || '';
                         const prev = stockAcc[reduced] || { q: 0, costAmount: 0, costUnit: 0, name, groupId, barcode };
                         stockAcc[reduced] = {
@@ -5071,7 +5210,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                             groupId: prev.groupId || groupId,
                             barcode: prev.barcode || barcode,
                         };
-                    });
+                    }
                     await yieldToBrowser();
                     if (cancelled) return;
                     Object.entries(stockAcc).forEach(([reduced, acc]) => {
@@ -5282,20 +5421,23 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             : [];
 
         const rowsStock = await readExcel(stockFile);
+        const stockCols = detectStockColumns(rowsStock);
         const stockAcc: Record<string, { q: number; costAmount: number }> = {};
-        rowsStock.forEach(row => {
-            if (!row) return;
-            const reduced = normalizeBarcode(row[1]); // B (reduzido)
-            if (!reduced) return;
-            const q = parseStockNumber(row[14]); // O
-            const c = parseStockNumber(row[15]); // P
-            if (q <= 0) return;
+        const startRow = stockCols.headerRowIndex >= 0 ? stockCols.headerRowIndex + 1 : 0;
+        for (let r = startRow; r < rowsStock.length; r++) {
+            const row = rowsStock[r];
+            if (!row) continue;
+            const reduced = normalizeBarcode(row[stockCols.codeCol]);
+            if (!reduced) continue;
+            const q = parseStockNumber(row[stockCols.qtyCol]);
+            const c = parseStockNumber(row[stockCols.costCol]);
+            if (q <= 0) continue;
             const prev = stockAcc[reduced] || { q: 0, costAmount: 0 };
             stockAcc[reduced] = {
                 q: prev.q + q,
                 costAmount: prev.costAmount + (q * c)
             };
-        });
+        }
         const stockMap: Record<string, { q: number; c: number }> = {};
         Object.entries(stockAcc).forEach(([reduced, acc]) => {
             stockMap[reduced] = {
@@ -6118,19 +6260,23 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
 
             rebuildFallbackScopes();
 
+            const stockCols = detectStockColumns(rowsStock);
             const stockAcc: Record<string, { q: number; costAmount: number; name: string; groupId: string; barcodeAliases: string[] }> = {};
             const groupsMap: Record<string, Group> = {};
-            rowsStock.forEach((row) => {
-                if (!row) return;
-                const reduced = normalizeBarcode(row[1]); // B
-                if (!reduced) return;
-                const barcodeAliases = collectProductCodeCandidates(row, 12).filter(code => code && code !== reduced);
-                const productName = row[2]?.toString() || row[4]?.toString() || "Sem Descrição";
-                const stockQty = parseStockNumber(row[14]); // O
-                const stockCost = parseStockNumber(row[15]); // P
-                const stockGroupNum = parseSheetNumericCode(row[6]); // G
+            const startRow = stockCols.headerRowIndex >= 0 ? stockCols.headerRowIndex + 1 : 0;
+            for (let r = startRow; r < rowsStock.length; r++) {
+                const row = rowsStock[r];
+                if (!row) continue;
+                const reduced = normalizeBarcode(row[stockCols.codeCol]);
+                if (!reduced) continue;
+                const barcodeAliases = collectProductCodeCandidates(row, 12, stockCols.codeCol).filter(code => code && code !== reduced);
+                const productName = row[stockCols.nameCol]?.toString() || row[stockCols.nameCol + 2]?.toString() || "Sem Descrição";
+                const stockQty = parseStockNumber(row[stockCols.qtyCol]);
+                const stockCost = parseStockNumber(row[stockCols.costCol]);
+                const groupRaw = row[stockCols.groupCol] ?? row[stockCols.isNewFormat ? 3 : 4] ?? row[6];
+                const stockGroupNum = parseSheetNumericCode(groupRaw) ?? parseSheetNumericCode(row[6]);
                 const stockGroupId = stockGroupNum !== null ? String(stockGroupNum) : '';
-                if (stockQty <= 0) return;
+                if (stockQty <= 0) continue;
 
                 const prev = stockAcc[reduced] || { q: 0, costAmount: 0, name: productName, groupId: stockGroupId, barcodeAliases: [] };
                 stockAcc[reduced] = {
@@ -6140,7 +6286,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     groupId: prev.groupId || stockGroupId,
                     barcodeAliases: Array.from(new Set([...prev.barcodeAliases, ...barcodeAliases]))
                 };
-            });
+            }
 
             const UNCLASSIFIED_GROUP_ID = '99999';
             const UNCLASSIFIED_GROUP_NAME = 'NAO CLASSIFICADO (SEM GRUPO)';

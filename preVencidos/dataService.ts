@@ -760,7 +760,7 @@ export const parseInventoryXLSX = async (file: File): Promise<InventoryCostRecor
           );
           const foundBarcode = lowerRow.findIndex(val => val.includes("barras") || val.includes("ean") || val.includes("cod.barras") || val.includes("gtiin"));
           const foundCost = lowerRow.findIndex(val => val.includes("custo") || val.includes("vlr.custo") || val.includes("preço custo") || val.includes("preco custo"));
-          const foundStock = lowerRow.findIndex(val => val.includes("estoque") || val.includes("saldo") || val.includes("qtde") || val.includes("quantidade"));
+          const foundStock = lowerRow.findIndex(val => val.includes("estoque") || val.includes("estq") || val.includes("saldo") || val.includes("qtde") || val.includes("quantidade"));
           const foundName = lowerRow.findIndex(val => val.includes("descrição") || val.includes("descricao") || val.includes("produto") || val.includes("item"));
 
           // Só aceita cabeçalho quando a coluna de código reduzido foi realmente identificada.
